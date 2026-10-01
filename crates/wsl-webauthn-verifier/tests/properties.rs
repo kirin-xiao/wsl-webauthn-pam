@@ -4,9 +4,13 @@
 
 mod common;
 
+use std::sync::LazyLock;
+
 use ciborium::value::Value;
 use proptest::prelude::*;
-use wsl_webauthn_verifier::testing;
+use wsl_webauthn_verifier::{
+    AttestationPolicy, EnrollCheck, testing, verify_attestation_with_anchor,
+};
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
@@ -92,6 +96,203 @@ proptest! {
             prop_assert!(!testing::parse_tpm_pub_area(&pa[..cut]));
         }
     }
+
+    /// Arbitrary bytes fed as the whole `attestationObject` must never panic the
+    /// **full** enrollment verifier under either policy — the property the
+    /// parser-only coverage lacked (L14-1). `Ok` is still only reachable when all
+    /// checks genuinely pass.
+    #[test]
+    fn random_attestation_never_panics(data in proptest::collection::vec(any::<u8>(), 0..4096)) {
+        let challenge = [0x42u8; 32];
+        let client_data_json =
+            common::client_data(wsl_webauthn_protocol::ClientDataKind::Create, &challenge);
+        let check = EnrollCheck::new(&challenge, &data, &client_data_json, b"prop-credential");
+        let anchor = [0u8; 32];
+        let _ = verify_attestation_with_anchor(&check, &AttestationPolicy::Strict, &anchor);
+        let _ = verify_attestation_with_anchor(&check, &AttestationPolicy::AllowUnattested, &anchor);
+    }
+
+    /// Arbitrary bytes framed as an `attStmt` behind a structurally valid
+    /// `authenticatorData`/`clientDataJSON`, so the chain walker actually parses
+    /// the arbitrary DER (`x509_cert::Certificate::from_der`) instead of the input
+    /// being rejected at the `authData` step. Both the `packed`/x5c and `tpm`
+    /// statement shapes are exercised, under both policies.
+    #[test]
+    fn random_att_stmt_never_panics(
+        cert_blob in proptest::collection::vec(any::<u8>(), 0..2048),
+        tail in proptest::collection::vec(any::<u8>(), 0..512),
+        alg in any::<i64>(),
+        tpm_style in any::<bool>(),
+    ) {
+        let challenge = [0x33u8; 32];
+        let client_data_json =
+            common::client_data(wsl_webauthn_protocol::ClientDataKind::Create, &challenge);
+        let credential_id = b"prop-credible".to_vec();
+        let key = common::es256();
+        let attested = common::AttestedData {
+            aaguid: common::AAGUID_ALLOWED,
+            credential_id: credential_id.clone(),
+            cose_public_key: key.cose.clone(),
+        };
+        let auth_data = common::build_auth_data(
+            wsl_webauthn_protocol::RP_ID,
+            0x01 | 0x04,
+            0,
+            Some(&attested),
+        );
+        let x5c = vec![cert_blob];
+        let att_stmt = if tpm_style {
+            common::tpm_att_stmt("2.0", alg, &tail, &tail, &tail, &x5c)
+        } else {
+            common::packed_att_stmt(alg, &tail, Some(&x5c))
+        };
+        let fmt = if tpm_style { "tpm" } else { "packed" };
+        let obj = common::attestation_object(fmt, &auth_data, att_stmt);
+        let check = EnrollCheck::new(&challenge, &obj, &client_data_json, &credential_id);
+        let anchor = [0u8; 32];
+        let _ = verify_attestation_with_anchor(&check, &AttestationPolicy::Strict, &anchor);
+        let _ = verify_attestation_with_anchor(&check, &AttestationPolicy::AllowUnattested, &anchor);
+    }
+
+    /// Randomly replace the leaf or intermediate certificate of an otherwise valid,
+    /// anchored `packed` chain. The anchor still matches, so the chain walker runs
+    /// the leaf-shape state machine (OU, AAGUID extension, BasicConstraints,
+    /// validity, link signatures) over arbitrary DER.
+    #[test]
+    fn mutated_packed_chain_never_panics(
+        replacement in proptest::collection::vec(any::<u8>(), 0..2048),
+        slot in any::<bool>(),
+    ) {
+        let base = &*PACKED_BASE;
+        let obj = rebuild_x5c_entry(&base.attestation_object, slot as usize, &replacement);
+        let check =
+            EnrollCheck::new(&base.challenge, &obj, &base.client_data_json, &base.credential_id);
+        let _ = verify_attestation_with_anchor(
+            &check,
+            &AttestationPolicy::Strict,
+            &base.root_fingerprint,
+        );
+        let _ = verify_attestation_with_anchor(
+            &check,
+            &AttestationPolicy::AllowUnattested,
+            &base.root_fingerprint,
+        );
+    }
+
+    /// Arbitrary `certInfo`/`pubArea` bytes against a valid, anchored TPM chain.
+    /// Each `certInfo` is re-signed with the fixture's AIK so the AIK signature step
+    /// passes and the TPM `certInfo`/`pubArea` semantic checks are actually reached
+    /// with randomized input (the coverage L14-1 calls out).
+    #[test]
+    fn random_tpm_cert_info_never_panics(
+        cert_info in proptest::collection::vec(any::<u8>(), 0..512),
+        pub_area in proptest::collection::vec(any::<u8>(), 0..512),
+    ) {
+        let base = &*TPM_BASE;
+        let sig = base.sig_scheme.sign(&base.aik, &cert_info);
+        let obj = rebuild_tpm_fields(&base.enr.attestation_object, &pub_area, &cert_info, &sig);
+        let check = EnrollCheck::new(
+            &base.enr.challenge,
+            &obj,
+            &base.enr.client_data_json,
+            &base.enr.credential_id,
+        );
+        let _ = verify_attestation_with_anchor(
+            &check,
+            &AttestationPolicy::Strict,
+            &base.enr.root_fingerprint,
+        );
+        let _ = verify_attestation_with_anchor(
+            &check,
+            &AttestationPolicy::AllowUnattested,
+            &base.enr.root_fingerprint,
+        );
+    }
+}
+
+/// A valid, anchored `packed` enrollment built once and reused (mutations are
+/// applied to clones of its bytes).
+static PACKED_BASE: LazyLock<common::EnrolledPacked> =
+    LazyLock::new(|| common::packed_enrollment(&common::es256()));
+
+/// A valid, anchored `tpm` enrollment plus the AIK needed to re-sign mutated
+/// `certInfo` values.
+struct TpmBase {
+    enr: common::TpmEnrollment,
+    aik: rsa::RsaPrivateKey,
+    sig_scheme: common::TpmSig,
+}
+
+static TPM_BASE: LazyLock<TpmBase> = LazyLock::new(|| {
+    let credential = common::es256();
+    let aik = common::rsa_aik();
+    let aik_test_key = common::TestKey {
+        cose: Vec::new(),
+        alg: -257,
+        signer: common::Signer::Rs256(Box::new(rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(
+            aik.clone(),
+        ))),
+    };
+    let chain = common::build_tpm_chain(&aik_test_key, &common::ChainOptions::default());
+    let enr = common::tpm_enrollment(
+        &credential,
+        &aik,
+        &chain,
+        common::TpmSig::Rs1,
+        common::tpm_alg::SHA1,
+    );
+    TpmBase {
+        enr,
+        aik,
+        sig_scheme: common::TpmSig::Rs1,
+    }
+});
+
+/// Replace the certificate at `slot` in a `packed` attestation object's `x5c`
+/// array, preserving everything else (authData, signature, anchor).
+fn rebuild_x5c_entry(obj: &[u8], slot: usize, replacement: &[u8]) -> Vec<u8> {
+    let value: Value = ciborium::from_reader(obj).expect("base object decodes");
+    let mut map = value.as_map().expect("base object is a map").clone();
+    for (k, v) in map.iter_mut() {
+        if k.as_text() == Some("attStmt") {
+            let mut stmt = v.as_map().expect("attStmt is a map").clone();
+            for (sk, sv) in stmt.iter_mut() {
+                if sk.as_text() == Some("x5c")
+                    && let Some(arr) = sv.as_array_mut()
+                    && let Some(entry) = arr.get_mut(slot)
+                {
+                    *entry = Value::Bytes(replacement.to_vec());
+                }
+            }
+            *v = Value::Map(stmt);
+        }
+    }
+    let mut out = Vec::new();
+    ciborium::into_writer(&Value::Map(map), &mut out).expect("re-encode");
+    out
+}
+
+/// Replace a `tpm` attestation object's `pubArea`/`certInfo`/`sig` fields.
+fn rebuild_tpm_fields(obj: &[u8], pub_area: &[u8], cert_info: &[u8], sig: &[u8]) -> Vec<u8> {
+    let value: Value = ciborium::from_reader(obj).expect("base object decodes");
+    let mut map = value.as_map().expect("base object is a map").clone();
+    for (k, v) in map.iter_mut() {
+        if k.as_text() == Some("attStmt") {
+            let mut stmt = v.as_map().expect("attStmt is a map").clone();
+            for (sk, sv) in stmt.iter_mut() {
+                match sk.as_text() {
+                    Some("pubArea") => *sv = Value::Bytes(pub_area.to_vec()),
+                    Some("certInfo") => *sv = Value::Bytes(cert_info.to_vec()),
+                    Some("sig") => *sv = Value::Bytes(sig.to_vec()),
+                    _ => {}
+                }
+            }
+            *v = Value::Map(stmt);
+        }
+    }
+    let mut out = Vec::new();
+    ciborium::into_writer(&Value::Map(map), &mut out).expect("re-encode");
+    out
 }
 
 /// A reasonably rich CBOR value strategy.

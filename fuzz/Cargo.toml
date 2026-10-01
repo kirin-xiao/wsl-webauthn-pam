@@ -20,10 +20,18 @@ wsl-webauthn-verifier = { path = "../crates/wsl-webauthn-verifier" }
 wsl-webauthn-protocol = { path = "../crates/wsl-webauthn-protocol" }
 p256 = { version = "0.13.2", features = ["ecdsa"] }
 ciborium = "0.2.2"
+sha2 = "0.10.9"
 
 [[bin]]
 name = "attestation_object"
 path = "fuzz_targets/attestation_object.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "attestation"
+path = "fuzz_targets/attestation.rs"
 test = false
 doc = false
 bench = false
