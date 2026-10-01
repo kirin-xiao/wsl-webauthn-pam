@@ -17,6 +17,8 @@
 //! * `err=<taxonomy>` — answer `{"op":"*","ok":false,"error":"<taxonomy>"}` with exit 0.
 //! * `echo=1` — when the op is `assert`, echo the request `client_data_json`.
 //! * `pidline=1` — print `PID <pid>\n` as the first stderr line before responding.
+//! * `hresult=<hex>` — write an HRESULT diagnostic line to stderr (e.g.
+//!   `hresult=0x80070005`), mimicking the real bridge's `hr=0x…` error line.
 //! * `sleep=<ms>` — read the request, then sleep before responding (`sleep=0` + no
 //!   response exercises the timeout path). Combine with `pidline=1` to test escalation.
 //! * `noread=1` — do not read the request (write path only).
@@ -47,6 +49,7 @@ struct Opts {
     err: Option<String>,
     echo: bool,
     pidline: bool,
+    hresult: Option<String>,
     sleep_ms: u64,
     noread: bool,
     closestdin: bool,
@@ -69,6 +72,7 @@ impl Default for Opts {
             err: None,
             echo: false,
             pidline: false,
+            hresult: None,
             sleep_ms: 0,
             noread: false,
             closestdin: false,
@@ -99,6 +103,7 @@ fn parse_args() -> Opts {
             "err" => opts.err = Some(value.to_string()),
             "echo" => opts.echo = value == "1",
             "pidline" => opts.pidline = value == "1",
+            "hresult" => opts.hresult = Some(value.to_string()),
             "sleep" => opts.sleep_ms = value.parse().unwrap_or(0),
             "noread" => opts.noread = value == "1",
             "closestdin" => opts.closestdin = value == "1",
@@ -176,6 +181,11 @@ fn main() -> ExitCode {
     if opts.noisy {
         eprintln!("fake-bridge mode={} (log line)", opts.mode);
         eprintln!("another log line that is not the PID line");
+    }
+    if let Some(hr) = &opts.hresult {
+        // Mimic the real bridge's Windows-side diagnostic (ffi::log_error):
+        // `<context>: hr=0x… <name>`.
+        eprintln!("WebAuthNGetAssertion: hr={hr} FakeErrorName");
     }
 
     if let Some(n) = opts.stderr_flood {
