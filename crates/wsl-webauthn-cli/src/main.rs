@@ -118,7 +118,7 @@ COMMANDS:
                    --win-mnt <PATH>      Windows mount root (else config, else /mnt/c)
     unregister   Remove one user's credential record (root, per-user only)
                    --user <NAME>         target user (default: SUDO_USER or current)
-                   --yes                 skip the confirmation prompt
+                   --yes, -y             skip the confirmation prompt
     probe        Report interop / Hello availability and the bridge pin
                    --bridge <PATH>       bridge exe path (else config, else required)
                    --win-mnt <PATH>      Windows mount root (else config, else /mnt/c)
@@ -131,19 +131,29 @@ COMMANDS:
                    --win-mnt <PATH>       override the Windows mount root
                    --allow-unattested     admit self/`none` attestation at enroll
                    --skip-enroll          do not offer enrollment at the end
-                   --yes                  answer yes to every prompt
+                   --yes, -y              answer yes to every prompt
                    --non-interactive      never read stdin; use question defaults
     uninstall    Remove a credential or all components (root)
                    --user <NAME>         remove one user's record (default)
                    --all                 remove profile, module, config, bridge
                    --module-dir <DIR>     override the PAM security directory
                    --win-mnt <PATH>       override the Windows mount root
-                   --yes                 skip confirmations
+                   --yes, -y              skip confirmations
                    --non-interactive     never read stdin; use question defaults
 
 GLOBAL:
     -h, --help       Print this help
     -V, --version    Print the version
+
+NOTE:
+    A value that begins with `-` must use the `--flag=value` form; in the
+    `--flag value` form a `-`-prefixed token is read as the next flag.
+
+EXIT CODES:
+    0   success
+    1   operational failure; in `status` list mode this includes one or more
+        unreadable/corrupt credential records (re-run as root to read them)
+    2   usage error (missing values, unknown/empty flags, misplaced flags)
 ";
 
 // ---------------------------------------------------------------------------
@@ -443,32 +453,55 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
                 seen.push(Flag::ArtifactDir);
                 artifact_dir = Some(PathBuf::from(take_value(args, &mut i, "--artifact-dir")?));
             }
-            other if other.starts_with("--user=") => {
-                seen.push(Flag::User);
-                user = Some(other["--user=".len()..].to_string());
+            // There are no positional arguments; `--` is accepted only as a trailing
+            // no-op terminator, and anything after it is a usage error.
+            "--" => {
+                if i + 1 != args.len() {
+                    return Err(format!("`{name}` accepts no positional arguments"));
+                }
             }
-            other if other.starts_with("--bridge=") => {
-                seen.push(Flag::Bridge);
-                bridge = Some(PathBuf::from(&other["--bridge=".len()..]));
+            other => {
+                // `--flag=value` inline form. An empty or unknown flag is a usage error;
+                // this keeps `--user=` from silently producing an empty username. The flag
+                // is still recorded in `seen` so the allow-list below rejects a misplaced
+                // inline flag exactly like its spaced form (e.g. `verify --user=x`).
+                let Some((flag, value)) = other.split_once('=') else {
+                    return Err(format!("unknown argument {other:?} for `{name}`"));
+                };
+                let value = require_value(flag, value)?;
+                match flag {
+                    "--user" => {
+                        seen.push(Flag::User);
+                        user = Some(value.to_string());
+                    }
+                    "--bridge" => {
+                        seen.push(Flag::Bridge);
+                        bridge = Some(PathBuf::from(value));
+                    }
+                    "--win-mnt" => {
+                        seen.push(Flag::WinMnt);
+                        win_mnt = Some(PathBuf::from(value));
+                    }
+                    "--module-dir" => {
+                        seen.push(Flag::ModuleDir);
+                        module_dir = Some(PathBuf::from(value));
+                    }
+                    "--artifact-dir" => {
+                        seen.push(Flag::ArtifactDir);
+                        artifact_dir = Some(PathBuf::from(value));
+                    }
+                    _ => return Err(format!("unknown argument {other:?} for `{name}`")),
+                }
             }
-            other if other.starts_with("--win-mnt=") => {
-                seen.push(Flag::WinMnt);
-                win_mnt = Some(PathBuf::from(&other["--win-mnt=".len()..]));
-            }
-            other if other.starts_with("--module-dir=") => {
-                seen.push(Flag::ModuleDir);
-                module_dir = Some(PathBuf::from(&other["--module-dir=".len()..]));
-            }
-            other if other.starts_with("--artifact-dir=") => {
-                seen.push(Flag::ArtifactDir);
-                artifact_dir = Some(PathBuf::from(&other["--artifact-dir=".len()..]));
-            }
-            other => return Err(format!("unknown argument {other:?} for `{name}`")),
         }
         i += 1;
     }
 
     // Enforce the allow-list once the whole vector parsed, so `--help` anywhere still wins.
+    // This is the single source of truth for "does subcommand X accept flag Y": every
+    // recognised flag is recorded in `seen` as it is parsed (both the spaced and the
+    // `--flag=value` forms) and checked here, so a misplaced flag is a usage error
+    // (exit `2`) for *every* subcommand and *every* flag, matching the `EXIT CODES` help.
     for &flag in &seen {
         reject(flag)?;
     }
@@ -514,16 +547,30 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
     Ok(Parsed::Run(cmd))
 }
 
-/// Consume the value for a flag, supporting both `--flag value` and `--flag=value`.
+/// Consume the value for a flag in the `--flag value` form.
+///
+/// The value must be present and must not itself look like a flag: `--user --replace`
+/// is a usage error, never `user="--replace"`. Use `--flag=value` to pass a value that
+/// begins with `-`.
 fn take_value<'a>(args: &'a [String], i: &mut usize, flag: &str) -> Result<&'a str, String> {
-    let current = args[*i].as_str();
-    if let Some(split) = current.split_once('=') {
-        return Ok(split.1);
-    }
-    *i += 1;
-    args.get(*i)
+    let next = *i + 1;
+    let value = args
+        .get(next)
         .map(String::as_str)
-        .ok_or_else(|| format!("{flag} requires a value"))
+        .ok_or_else(|| format!("{flag} requires a value"))?;
+    if value.starts_with('-') {
+        return Err(format!("{flag} requires a value (got flag-like {value:?})"));
+    }
+    *i = next;
+    Ok(value)
+}
+
+/// Validate that the inline `--flag=value` form carries a non-empty value.
+fn require_value<'a>(flag: &str, value: &'a str) -> Result<&'a str, String> {
+    if value.is_empty() {
+        return Err(format!("{flag} requires a non-empty value"));
+    }
+    Ok(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -1315,8 +1362,15 @@ fn cmd_probe(bridge: Option<PathBuf>, win_mnt: Option<PathBuf>) -> anyhow::Resul
 
 /// `status [--user NAME]` — list enrolled users and the config summary.
 fn cmd_status(user: Option<String>) -> anyhow::Result<i32> {
-    let store = Store::system();
+    status_with_store(&Store::system(), user)
+}
 
+/// Implementation of `status` against an explicit store (tempdir-backed in tests).
+///
+/// Both modes share one policy: an unreadable/corrupt record is an operational failure
+/// (exit `1`), so a scripted `if status; then …` cannot mistake a broken store for a
+/// healthy one. `--user` bails, the list mode counts and returns [`EXIT_FAIL`].
+fn status_with_store(store: &Store, user: Option<String>) -> anyhow::Result<i32> {
     // Config summary (readable only as root by default).
     match store.load_config() {
         Ok(config) => {
@@ -1347,7 +1401,7 @@ fn cmd_status(user: Option<String>) -> anyhow::Result<i32> {
     println!();
 
     if let Some(name) = user {
-        return cmd_status_one(&store, &name);
+        return cmd_status_one(store, &name);
     }
 
     let users = match store.list() {
@@ -1364,11 +1418,24 @@ fn cmd_status(user: Option<String>) -> anyhow::Result<i32> {
     }
 
     println!("Enrolled users ({}):", users.len());
+    let mut unreadable = 0usize;
     for name in &users {
         match store.load(name) {
             Ok(record) => println!("  {}", summarize_record(&record)),
-            Err(error) => println!("  {name}: UNREADABLE ({error})"),
+            Err(error) => {
+                unreadable += 1;
+                println!("  {name}: UNREADABLE ({error})");
+            }
         }
+    }
+    if unreadable > 0 {
+        eprintln!(
+            "error: {unreadable} of {} credential record(s) under {} are unreadable; \
+             re-run as root to read them",
+            users.len(),
+            store.credentials_dir().display()
+        );
+        return Ok(EXIT_FAIL);
     }
     Ok(EXIT_OK)
 }
@@ -1889,6 +1956,47 @@ mod tests {
         assert!(parse(&args(&["enroll", "--user"])).is_err());
     }
 
+    /// L11-6: empty and flag-like values are usage errors, not silent misparses.
+    #[test]
+    fn parse_rejects_empty_and_flag_like_values() {
+        // Empty inline value.
+        assert!(parse(&args(&["enroll", "--user="])).is_err());
+        // The next token is another flag, never a value.
+        assert!(parse(&args(&["enroll", "--user", "--replace"])).is_err());
+        assert!(parse(&args(&["status", "--user", "-x"])).is_err());
+        // The `--flag=value` form may carry a value that begins with `-`.
+        assert_eq!(
+            parse(&args(&["enroll", "--user=-weird"])).unwrap(),
+            Parsed::Run(Command::Enroll {
+                replace: false,
+                allow_unattested: false,
+                user: Some("-weird".into()),
+                bridge: None,
+                win_mnt: None,
+            })
+        );
+    }
+
+    /// L11-6: `--` is a trailing no-op; anything after it is a positional argument,
+    /// and no subcommand accepts those.
+    #[test]
+    fn parse_double_dash_is_trailing_noop_only() {
+        assert!(parse(&args(&["enroll", "--"])).is_ok());
+        assert!(parse(&args(&["enroll", "--", "extra"])).is_err());
+    }
+
+    /// L11-6: `-y` is the documented short alias for `--yes`.
+    #[test]
+    fn parse_dash_y_is_yes() {
+        assert_eq!(
+            parse(&args(&["unregister", "-y"])).unwrap(),
+            Parsed::Run(Command::Unregister {
+                user: None,
+                yes: true,
+            })
+        );
+    }
+
     #[test]
     fn parse_unknown_flag_is_error() {
         assert!(parse(&args(&["enroll", "--nope"])).is_err());
@@ -1915,6 +2023,36 @@ mod tests {
         assert!(parse(&args(&["uninstall", "--allow-unattested"])).is_err());
         // `--user` and `--all` are mutually exclusive.
         assert!(parse(&args(&["uninstall", "--user", "a", "--all"])).is_err());
+        // Every other subcommand rejects flags outside its own documented set (the
+        // `EXIT CODES` help text promises exit `2` for a misplaced flag).
+        for flag in ["--yes", "--all", "--skip-enroll", "--non-interactive"] {
+            assert!(
+                parse(&args(&["enroll", flag])).is_err(),
+                "enroll must reject {flag}"
+            );
+        }
+        assert!(parse(&args(&["enroll", "--module-dir", "/x"])).is_err());
+        assert!(parse(&args(&["enroll", "--artifact-dir", "/x"])).is_err());
+        for flag in ["--skip-enroll", "--non-interactive"] {
+            assert!(
+                parse(&args(&["unregister", flag])).is_err(),
+                "unregister must reject {flag}"
+            );
+        }
+        assert!(parse(&args(&["unregister", "--module-dir", "/x"])).is_err());
+        assert!(parse(&args(&["unregister", "--artifact-dir", "/x"])).is_err());
+        assert!(parse(&args(&["probe", "--skip-enroll"])).is_err());
+        assert!(parse(&args(&["probe", "--non-interactive"])).is_err());
+        assert!(parse(&args(&["status", "--module-dir", "/x"])).is_err());
+        assert!(parse(&args(&["status", "--artifact-dir", "/x"])).is_err());
+        assert!(parse(&args(&["status", "--non-interactive"])).is_err());
+        for flag in ["--skip-enroll", "--non-interactive"] {
+            assert!(
+                parse(&args(&["verify", flag])).is_err(),
+                "verify must reject {flag}"
+            );
+        }
+        assert!(parse(&args(&["verify", "--module-dir", "/x"])).is_err());
     }
 
     /// A misplaced flag must not hide `--help`: help wins whenever it is reached, exactly
@@ -2653,6 +2791,35 @@ mod tests {
         store
             .save_atomic(&sample_record("alice", 1000), true)
             .unwrap();
+    }
+
+    /// L11-3: an unreadable record makes `status` list mode exit non-zero, matching the
+    /// `status --user` policy, so a broken store is not mistaken for a healthy one.
+    #[test]
+    fn status_list_reports_unreadable_records_as_failure() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_dir, store) = tempdir_store();
+        store
+            .save_atomic(&sample_record("alice", 1000), false)
+            .unwrap();
+        // A store whose records all load cleanly is healthy: exit 0.
+        assert_eq!(
+            status_with_store(&store, None).unwrap(),
+            EXIT_OK,
+            "a healthy store must still exit 0"
+        );
+        // A record whose name is a valid username but whose content is not JSON.
+        let bad = store.credentials_dir().join("bob.json");
+        std::fs::write(&bad, b"not a credential record").unwrap();
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert_eq!(
+            status_with_store(&store, None).unwrap(),
+            EXIT_FAIL,
+            "an unreadable record must make list mode fail"
+        );
+        // `--user` bails (exit 1 via `main`) for the same bad-record state.
+        assert!(status_with_store(&store, Some("bob".into())).is_err());
     }
 
     /// SR-20: removing one user never touches another user's record.

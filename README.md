@@ -341,7 +341,7 @@ wsl-webauthn-pam <COMMAND> [OPTIONS]
                  --win-mnt <PATH>      Windows mount root (else config, else /mnt/c)
   unregister   Remove one user's credential record (root, per-user only)
                  --user <NAME>         target user (default: SUDO_USER or current)
-                 --yes                 skip the confirmation prompt
+                 --yes, -y             skip the confirmation prompt
   probe        Report interop / Hello availability and the bridge pin
                  --bridge <PATH>       bridge exe path (else config, else required)
                  --win-mnt <PATH>      Windows mount root (else config, else /mnt/c)
@@ -354,23 +354,33 @@ wsl-webauthn-pam <COMMAND> [OPTIONS]
                  --win-mnt <PATH>      override the Windows mount root
                  --allow-unattested    admit self/none attestation at enroll
                  --skip-enroll         do not offer enrollment at the end
-                 --yes                 answer yes to every prompt
+                 --yes, -y             answer yes to every prompt
                  --non-interactive     never read stdin; use question defaults
   uninstall    Remove a credential or all components (root)
                  --user <NAME>         remove one user's record (default)
                  --all                 remove profile, module, config, bridge
                  --module-dir <DIR>    override the PAM security directory
                  --win-mnt <PATH>      override the Windows mount root
-                 --yes                 skip confirmations
+                 --yes, -y             skip confirmations
                  --non-interactive     never read stdin; use question defaults
+
+  NOTE:
+    A value that begins with `-` must use the `--flag=value` form; in the
+    `--flag value` form a `-`-prefixed token is read as the next flag.
+
+  EXIT CODES:
+    0   success
+    1   operational failure; in `status` list mode this includes one or more
+        unreadable/corrupt credential records (re-run as root to read them)
+    2   usage error (missing values, unknown/empty flags, misplaced flags)
 ```
 
-`enroll`, `unregister`, `install`, `uninstall`, and `status` require root.
-`status` reads the `0600` root-owned config for its summary and the `0700`
-credential store for its records, so a non-root run prints
-`Config: unavailable (…); re-run as root` and cannot list users. Only `probe`
-and `verify` run unprivileged. Exit codes: `0` success, `1` operational
-failure, `2` usage error.
+`enroll`, `unregister`, `install`, and `uninstall` require root. `probe` and
+`verify` run unprivileged. `status` also runs unprivileged, but its inputs are
+the `0600` root-owned config and the `0700` credential store, so a non-root run
+prints `Config: unavailable (…); re-run as root` and cannot read the records;
+list mode reports any unreadable record and exits `1` (see the `EXIT CODES`
+help). Exit codes: `0` success, `1` operational failure, `2` usage error.
 
 ---
 
