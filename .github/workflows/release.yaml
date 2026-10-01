@@ -1,0 +1,185 @@
+name: Release
+
+# Release workflow (plan §11, acceptance 7 / SR-22).
+#
+# Trigger: pushing a tag matching `v*` (e.g. v0.1.0). The whole workflow builds
+# from the *tag* ref (actions/checkout defaults to the triggering ref), so the
+# artifacts are exactly the tagged commit.
+#
+# Every `uses:` is pinned to a full 40-char commit SHA (see ci.yaml header).
+#
+# Runner choice for aarch64: we use the native GitHub-hosted ARM runners
+# (`ubuntu-24.04-arm`, `windows-11-arm`) rather than cross-compiling. This
+# matches what the legacy project used and avoids shipping a cross-linked
+# libpam0g-dev/CRT. If those labels are ever unavailable on a plan, replace the
+# matrix `runner` values with an x86_64 runner + `cross`/`cargo-zigbuild`.
+#
+# Release layout (per architecture):
+#   wsl-webauthn-pam-<version>-<arch>.tar.gz
+#     ├── pam_wsl_webauthn.so        (Linux PAM module, renamed from lib…)
+#     ├── wsl-webauthn-pam           (CLI)
+#     ├── WSLWebAuthnBridge.exe      (Windows bridge for the same arch)
+#     ├── install.sh
+#     ├── pam-config
+#     └── README.md
+#   SHA256SUMS                       (checksums for all tarballs)
+#
+# Both the Linux module and the matching Windows bridge ship in the same
+# tarball because install.sh copies the bridge onto the Windows side (plan D11).
+
+on:
+  push:
+    tags: ["v*"]
+
+# The release job needs write access to create the GitHub Release; build jobs
+# explicitly drop back to read-only below.
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "2"
+
+jobs:
+  build-linux:
+    name: linux ${{ matrix.arch }} (.so + CLI)
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install libpam0g-dev
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+
+      - name: Cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: build module + CLI (locked)
+        run: >
+          cargo build --release --locked
+          -p wsl-webauthn-pam
+          -p wsl-webauthn-cli
+
+      - name: checksums
+        run: |
+          sha256sum target/release/libpam_wsl_webauthn.so
+          sha256sum target/release/wsl-webauthn-pam
+
+      - name: upload linux artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-${{ matrix.arch }}
+          path: |
+            target/release/libpam_wsl_webauthn.so
+            target/release/wsl-webauthn-pam
+          if-no-files-found: error
+          retention-days: 7
+
+  build-windows:
+    name: windows ${{ matrix.arch }} (msvc exe)
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: windows-latest
+          - arch: aarch64
+            runner: windows-11-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+
+      - name: Cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: build bridge (locked)
+        run: cargo build --release --locked -p wsl-webauthn-bridge
+
+      - name: checksum
+        shell: bash
+        run: sha256sum target/release/WSLWebAuthnBridge.exe
+
+      - name: upload windows artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-${{ matrix.arch }}
+          path: target/release/WSLWebAuthnBridge.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish release
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: download all build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+
+      - name: assemble per-arch tarballs + SHA256SUMS
+        run: |
+          set -eu
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist/out
+          for arch in x86_64 aarch64; do
+            dir="wsl-webauthn-pam-${VERSION}-${arch}"
+            mkdir -p "dist/out/${dir}"
+            cp dist/linux-${arch}/libpam_wsl_webauthn.so "dist/out/${dir}/pam_wsl_webauthn.so"
+            cp dist/linux-${arch}/wsl-webauthn-pam          "dist/out/${dir}/"
+            cp dist/windows-${arch}/WSLWebAuthnBridge.exe   "dist/out/${dir}/"
+            cp install.sh pam-config README.md              "dist/out/${dir}/"
+            tar -czf "dist/${dir}.tar.gz" -C dist/out "${dir}"
+          done
+          cd dist
+          sha256sum wsl-webauthn-pam-*.tar.gz > SHA256SUMS
+          echo '--- SHA256SUMS ---'
+          cat SHA256SUMS
+
+      - name: guard tag vs Cargo.toml version
+        run: |
+          set -eu
+          tag_version="${GITHUB_REF_NAME#v}"
+          # strip pre-release suffix for the comparison (e.g. 0.1.0-rc1 -> 0.1.0)
+          base="${tag_version%%-*}"
+          manifest="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "${base}" != "${manifest}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match workspace version ${manifest}"
+            exit 1
+          fi
+
+      - name: publish GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: |
+            dist/wsl-webauthn-pam-*.tar.gz
+            dist/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          # Tags carrying a pre-release suffix (vX.Y.Z-rc1) publish as pre-releases.
+          prerelease: ${{ contains(github.ref_name, '-') }}

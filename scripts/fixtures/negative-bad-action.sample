@@ -1,0 +1,9 @@
+# NEGATIVE FIXTURE: a bracket value that is neither a keyword action nor an
+# integer jump.  The control *key* (auth_err) is valid, the value is not.
+# here are the per-package modules (the "Primary" block)
+auth	[success=1 auth_err=maybe default=ignore]	pam_wsl_webauthn.so
+auth	[success=1 default=ignore]	pam_unix.so nullok try_first_pass
+# here's the fallback if no module succeeds
+auth	requisite			pam_deny.so
+auth	required			pam_permit.so
+# end of pam-auth-update config
