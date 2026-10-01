@@ -1,0 +1,9 @@
+# NEGATIVE FIXTURE: the pam-auth-update `end` idiom was never expanded.
+# A literal `end` in a deployed common-auth is not a valid libpam action.
+# here are the per-package modules (the "Primary" block)
+auth	[success=end default=ignore]	pam_wsl_webauthn.so
+auth	[success=1 default=ignore]	pam_unix.so nullok try_first_pass
+# here's the fallback if no module succeeds
+auth	requisite			pam_deny.so
+auth	required			pam_permit.so
+# end of pam-auth-update config

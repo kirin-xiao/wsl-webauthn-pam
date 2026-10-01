@@ -1,0 +1,8 @@
+# NEGATIVE FIXTURE: a token key that is not a libpam return-value name.
+# here are the per-package modules (the "Primary" block)
+auth	[success=1 not_a_return_value=ok default=ignore]	pam_wsl_webauthn.so
+auth	[success=1 default=ignore]	pam_unix.so nullok try_first_pass
+# here's the fallback if no module succeeds
+auth	requisite			pam_deny.so
+auth	required			pam_permit.so
+# end of pam-auth-update config
