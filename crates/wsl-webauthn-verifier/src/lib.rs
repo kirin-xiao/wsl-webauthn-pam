@@ -29,10 +29,10 @@
 //! | clientData | `type` exact (`webauthn.get`/`create`); `challenge` compared on **decoded** bytes; `origin` byte-equal to [`wsl_webauthn_protocol::ORIGIN`]; UTF-8 |
 //! | authData | `rpIdHash == SHA-256(RP_ID)`; `UP=1`; `UV=1`; attested-credential-data length bounds |
 //! | credential id | enrolled (assertion) / reported-vs-attested (enrollment) must match |
-//! | COSE key | allow-list `{-7, -257, -8}`; P-256 uncompressed point-on-curve; RSA `n` 2048..=4096; Ed25519 `x` 32 B |
+//! | COSE key | allow-list `{-7, -257, -8}`; P-256 uncompressed point-on-curve; RSA `n` 2048..=4096 with `e` ∈ {3, 65537}; Ed25519 `x` 32 B |
 //! | signature | ES256 DER; RS256 PKCS#1 v1.5; EdDSA `verify_strict` (raw 64 B) |
 //! | packed/x5c | chain to pinned root; leaf v3 + `CA=false` + `OU="Authenticator Attestation"` + `id-fido-gen-ce-aaguid` == authData AAGUID; `attStmt.alg` == leaf key alg |
-//! | tpm | §8.3: `ver=="2.0"`; `certInfo` magic `TPM_GENERATED` / type `TPM_ST_ATTEST_CERTIFY`; `extraData == H_alg(authData‖clientDataHash)`; attested `name == nameAlg‖H_nameAlg(pubArea)`; AIK `sig` over raw `certInfo`; `pubArea` key == credential key; AIK leaf v3 + empty Subject + `CA=false` + TCG AIK EKU (`2.23.133.8.3`) + KeyUsage permitting `digitalSignature` |
+//! | tpm | §8.3: `ver=="2.0"`; `certInfo` magic `TPM_GENERATED` / type `TPM_ST_ATTEST_CERTIFY`; `extraData == H_verified(authData‖clientDataHash)` (the digest that verified the AIK signature); attested `name == nameAlg‖H_nameAlg(pubArea)`; AIK `sig` over raw `certInfo`; `pubArea` key (and, for RSA, declared `keyBits`) == credential key; AIK leaf v3 + empty Subject + `CA=false` + TCG AIK EKU (`2.23.133.8.3`) + KeyUsage permitting `digitalSignature` |
 //! | policy | `tpm`/`packed`+x5c accepted under both policies; self/`none` only under [`AttestationPolicy::AllowUnattested`] |
 //! | AAGUID | authData AAGUID must be one of [`STRICT_AAGUIDS`] on every verified **attestation** path (assertions do not enforce an AAGUID allow-list); enforced before format dispatch, so no arm can bypass it |
 //!
@@ -65,8 +65,9 @@
 //!   §8.3's explicit note. SHA-1/256/384/512 are accepted as `nameAlg` (TPM2 defines
 //!   all four; Windows Hello uses SHA-256).
 //! * The bundled root is trusted only through the [`MS_TPM_ROOT_2014_SHA256`] pin; the
-//!   `#[doc(hidden)]` [`verify_attestation_with_anchor`] seam exists solely so the test
-//!   suite can substitute a synthetic root and cannot weaken production.
+//!   `#[doc(hidden)]` `verify_attestation_with_anchor` seam (compiled only under the
+//!   `test-anchor` feature) exists solely so the test suite can substitute a synthetic
+//!   root and cannot weaken production.
 //!
 //! # Wave B consumer notes
 //!
@@ -124,8 +125,9 @@ use std::time::SystemTime;
 /// The verifier trusts this fingerprint, not a certificate: the matching certificate
 /// either appears as the topmost element of an attestation `x5c` chain, or is
 /// completed from the bundled copy in [`crate::ms_root`] (whose bytes are asserted to
-/// hash to this value). Overriding this is only possible through the `#[doc(hidden)]`
-/// [`verify_attestation_with_anchor`] test seam.
+/// hash to this value). Overriding this is only possible through the test-only
+/// `verify_attestation_with_anchor` seam, which is compiled only with the
+/// `test-anchor` feature.
 pub const MS_TPM_ROOT_2014_SHA256: [u8; 32] = [
     0x87, 0x0C, 0x7A, 0x35, 0xCE, 0xAB, 0x3D, 0x59, 0x97, 0x9F, 0x2C, 0x6A, 0x52, 0x40, 0x42, 0xD4,
     0x04, 0xCB, 0x71, 0x51, 0x80, 0x04, 0x35, 0x09, 0x25, 0xFB, 0x2C, 0xED, 0x79, 0xA9, 0x99, 0xDA,
@@ -327,21 +329,31 @@ pub fn verify_assertion(check: &AssertionCheck) -> Result<AssertionOutcome, Veri
 
 /// Verify a WebAuthn registration (enrollment) against `policy`.
 ///
-/// Uses [`MS_TPM_ROOT_2014_SHA256`] as the chain trust anchor. Tests substitute a
-/// synthetic root via [`verify_attestation_with_anchor`]. Never panics.
+/// Uses [`MS_TPM_ROOT_2014_SHA256`] as the chain trust anchor; the fingerprint is a
+/// compile-time constant and cannot be overridden by callers. Never panics.
 pub fn verify_attestation(
     check: &EnrollCheck,
     policy: &AttestationPolicy,
 ) -> Result<EnrollOutcome, VerifyError> {
-    verify_attestation_with_anchor(check, policy, &MS_TPM_ROOT_2014_SHA256)
+    attestation::verify(
+        check.attestation_object,
+        check.client_data_json,
+        check.expected_challenge,
+        check.reported_credential_id,
+        policy,
+        check.now,
+        &MS_TPM_ROOT_2014_SHA256,
+    )
 }
 
 /// Like [`verify_attestation`], but with an explicit trust-anchor fingerprint.
 ///
-/// This is the **test seam** that makes the chain logic exercisable: no test can
-/// forge a certificate that hashes to the real Microsoft root, so the synthesized
-/// mini-CA tests pass their own root's fingerprint here. Production callers must use
-/// [`verify_attestation`]; the anchor fingerprint is otherwise not operator-tunable.
+/// **Test-only.** No test can forge a certificate that hashes to the real Microsoft
+/// root, so the synthesized-vector suite substitutes its own root's fingerprint here.
+/// The function is compiled only when the `test-anchor` feature is enabled: production
+/// builds (and downstream crates, which never enable it) therefore cannot override the
+/// pinned anchor, even though the item is hidden from the docs.
+#[cfg(feature = "test-anchor")]
 #[doc(hidden)]
 pub fn verify_attestation_with_anchor(
     check: &EnrollCheck,

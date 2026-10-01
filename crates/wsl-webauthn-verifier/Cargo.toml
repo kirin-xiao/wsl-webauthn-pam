@@ -29,7 +29,21 @@ x509-cert = { workspace = true }
 der = { workspace = true }
 const-oid = { workspace = true }
 
+[features]
+# Compiles the `verify_attestation_with_anchor` trust-anchor injection seam. It is
+# intentionally off by default: a downstream crate that never enables it cannot
+# substitute an attacker-chosen anchor, so production verification always uses the
+# pinned `MS_TPM_ROOT_2014_SHA256`. The integration/fuzz suites need it to inject a
+# synthetic root (no test can forge a certificate hashing to the real Microsoft
+# root), so this crate enables it for its own test targets via the self dev-dependency
+# below.
+test-anchor = []
+
 [dev-dependencies]
+# Enable `test-anchor` for this crate's own integration/property tests. This is the
+# documented "self dev-dependency" pattern: production `cargo build` does not build
+# dev-dependencies, so the seam stays unavailable to downstream crates.
+wsl-webauthn-verifier = { path = ".", features = ["test-anchor"] }
 proptest = { workspace = true }
 # Randomness for the synthesized test suite (key generation, nonces).
 rand = { workspace = true }

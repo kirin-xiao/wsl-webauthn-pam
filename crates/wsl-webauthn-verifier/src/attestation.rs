@@ -38,8 +38,8 @@ use wsl_webauthn_protocol::ClientDataKind;
 /// Verify a registration ceremony and return the enrollment outcome.
 ///
 /// `anchor_fingerprint` is the SHA-256 of the trusted root certificate; the public
-/// entry point supplies [`crate::MS_TPM_ROOT_2014_SHA256`], while tests inject a
-/// synthetic root through [`crate::verify_attestation_with_anchor`].
+/// entry point supplies [`crate::MS_TPM_ROOT_2014_SHA256`], while the (feature-gated)
+/// test seam `crate::verify_attestation_with_anchor` injects a synthetic root.
 pub(crate) fn verify(
     attestation_object: &[u8],
     client_data_json: &[u8],
@@ -65,9 +65,14 @@ pub(crate) fn verify(
             reason: "attestationObject is not a CBOR map",
         })?;
 
-    let fmt = map_get_text(map, "fmt").ok_or(VerifyError::MissingAttestationField)?;
-    let auth_data = map_get_bytes(map, "authData").ok_or(VerifyError::MissingAttestationField)?;
-    let att_stmt = map_get(map, "attStmt")
+    let fmt = map_get_unique(map, "fmt")?
+        .and_then(Value::as_text)
+        .ok_or(VerifyError::MissingAttestationField)?;
+    let auth_data = map_get_unique(map, "authData")?
+        .and_then(Value::as_bytes)
+        .map(Vec::as_slice)
+        .ok_or(VerifyError::MissingAttestationField)?;
+    let att_stmt = map_get_unique(map, "attStmt")?
         .and_then(Value::as_map)
         .ok_or(VerifyError::InvalidAttestationStatement)?;
 
@@ -103,42 +108,52 @@ pub(crate) fn verify(
     };
 
     let (mode, leaf_sha256) = match fmt {
-        "packed" => match map_get(att_stmt, "x5c") {
-            Some(x5c) => {
-                let certs = parse_x5c(x5c)?;
-                let info = chain::verify_chain(
-                    &certs,
-                    &attested.aaguid,
-                    now,
-                    anchor_fingerprint,
-                    ChainProfile::Packed,
-                    None,
-                )?;
-                let attestation_key = chain::cose_key_from_spki(&info.leaf_spki)?;
-                let alg = att_stmt_alg(att_stmt)?;
-                if alg != attestation_key.alg() {
-                    return Err(VerifyError::AlgorithmMismatch);
+        "packed" => {
+            // §8.2: a packed statement carries only `alg`, `sig`, and (AttCA) `x5c`.
+            reject_unknown_att_stmt_keys(att_stmt, &["alg", "sig", "x5c"])?;
+            match map_get_unique(att_stmt, "x5c")? {
+                Some(x5c) => {
+                    let certs = parse_x5c(x5c)?;
+                    let info = chain::verify_chain(
+                        &certs,
+                        &attested.aaguid,
+                        now,
+                        anchor_fingerprint,
+                        ChainProfile::Packed,
+                        None,
+                    )?;
+                    let attestation_key = chain::cose_key_from_spki(&info.leaf_spki)?;
+                    let alg = att_stmt_alg(att_stmt)?;
+                    if alg != attestation_key.alg() {
+                        return Err(VerifyError::AlgorithmMismatch);
+                    }
+                    let sig = att_stmt_sig(att_stmt)?;
+                    attestation_key.verify(&signed, sig)?;
+                    (AttestationMode::StrictVerified, Some(info.leaf_sha256))
                 }
-                let sig = att_stmt_sig(att_stmt)?;
-                attestation_key.verify(&signed, sig)?;
-                (AttestationMode::StrictVerified, Some(info.leaf_sha256))
+                None => {
+                    if !matches!(policy, AttestationPolicy::AllowUnattested) {
+                        return Err(VerifyError::AttestationNotAllowed);
+                    }
+                    let alg = att_stmt_alg(att_stmt)?;
+                    if alg != credential_key.alg() {
+                        return Err(VerifyError::AlgorithmMismatch);
+                    }
+                    let sig = att_stmt_sig(att_stmt)?;
+                    credential_key.verify(&signed, sig)?;
+                    (AttestationMode::SelfAttested, None)
+                }
             }
-            None => {
-                if !matches!(policy, AttestationPolicy::AllowUnattested) {
-                    return Err(VerifyError::AttestationNotAllowed);
-                }
-                let alg = att_stmt_alg(att_stmt)?;
-                if alg != credential_key.alg() {
-                    return Err(VerifyError::AlgorithmMismatch);
-                }
-                let sig = att_stmt_sig(att_stmt)?;
-                credential_key.verify(&signed, sig)?;
-                (AttestationMode::SelfAttested, None)
-            }
-        },
+        }
         "tpm" => {
             // `tpm` is AttCA; it is always fully verified and needs no policy opt-in.
-            let x5c = map_get(att_stmt, "x5c").ok_or(VerifyError::InvalidAttestationStatement)?;
+            // §8.3: allowed members are `ver`, `alg`, `sig`, `x5c`, `certInfo`, `pubArea`.
+            reject_unknown_att_stmt_keys(
+                att_stmt,
+                &["ver", "alg", "sig", "x5c", "certInfo", "pubArea"],
+            )?;
+            let x5c =
+                map_get_unique(att_stmt, "x5c")?.ok_or(VerifyError::InvalidAttestationStatement)?;
             let certs = parse_x5c(x5c)?;
             // The anchor must be the pinned root; when `x5c` omits it (as Windows
             // Hello does) the compiled-in public root completes the chain, still
@@ -204,7 +219,7 @@ fn parse_x5c(value: &Value) -> Result<Vec<Vec<u8>>, VerifyError> {
 
 /// Read `attStmt["alg"]` as an integer.
 fn att_stmt_alg(att_stmt: &[(Value, Value)]) -> Result<i64, VerifyError> {
-    map_get(att_stmt, "alg")
+    map_get_unique(att_stmt, "alg")?
         .and_then(Value::as_integer)
         .and_then(|i| i64::try_from(i).ok())
         .ok_or(VerifyError::InvalidAttestationStatement)
@@ -212,7 +227,7 @@ fn att_stmt_alg(att_stmt: &[(Value, Value)]) -> Result<i64, VerifyError> {
 
 /// Read `attStmt["sig"]` as a byte string.
 fn att_stmt_sig(att_stmt: &[(Value, Value)]) -> Result<&[u8], VerifyError> {
-    map_get(att_stmt, "sig")
+    map_get_unique(att_stmt, "sig")?
         .and_then(Value::as_bytes)
         .map(Vec::as_slice)
         .ok_or(VerifyError::InvalidAttestationStatement)
@@ -225,13 +240,19 @@ fn verify_tpm(
     att_to_be_signed: &[u8],
     aik_spki: &x509_cert::spki::SubjectPublicKeyInfoOwned,
 ) -> Result<(), VerifyError> {
-    let ver = map_get_text(att_stmt, "ver").ok_or(VerifyError::InvalidAttestationStatement)?;
+    let ver = map_get_unique(att_stmt, "ver")?
+        .and_then(Value::as_text)
+        .ok_or(VerifyError::InvalidAttestationStatement)?;
     let alg = att_stmt_alg(att_stmt)?;
     let sig = att_stmt_sig(att_stmt)?;
-    let cert_info =
-        map_get_bytes(att_stmt, "certInfo").ok_or(VerifyError::InvalidAttestationStatement)?;
-    let pub_area =
-        map_get_bytes(att_stmt, "pubArea").ok_or(VerifyError::InvalidAttestationStatement)?;
+    let cert_info = map_get_unique(att_stmt, "certInfo")?
+        .and_then(Value::as_bytes)
+        .map(Vec::as_slice)
+        .ok_or(VerifyError::InvalidAttestationStatement)?;
+    let pub_area = map_get_unique(att_stmt, "pubArea")?
+        .and_then(Value::as_bytes)
+        .map(Vec::as_slice)
+        .ok_or(VerifyError::InvalidAttestationStatement)?;
 
     tpm::verify(&tpm::TpmCheck {
         ver,
@@ -245,20 +266,43 @@ fn verify_tpm(
     })
 }
 
-/// Fetch a map value by a text key.
-fn map_get<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
-    map.iter()
-        .find_map(|(k, v)| (k.as_text() == Some(key)).then_some(v))
+/// Fetch a map value by a text key, rejecting a repeated key.
+///
+/// CBOR maps may technically carry duplicate keys; a first-wins lookup (`find_map`)
+/// would silently ignore the later value and let a duplicate `fmt`/`attStmt` shadow
+/// a stricter one. Any repeated key is a malformed attestation object here.
+fn map_get_unique<'a>(
+    map: &'a [(Value, Value)],
+    key: &str,
+) -> Result<Option<&'a Value>, VerifyError> {
+    let mut found: Option<&'a Value> = None;
+    for (k, v) in map {
+        if k.as_text() == Some(key) {
+            if found.is_some() {
+                return Err(VerifyError::MalformedAttestationObject {
+                    reason: "duplicate CBOR map key",
+                });
+            }
+            found = Some(v);
+        }
+    }
+    Ok(found)
 }
 
-/// Fetch a text value by a text key.
-fn map_get_text<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a str> {
-    map_get(map, key).and_then(Value::as_text)
-}
-
-/// Fetch a byte-string value by a text key.
-fn map_get_bytes<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a [u8]> {
-    map_get(map, key)
-        .and_then(Value::as_bytes)
-        .map(Vec::as_slice)
+/// Reject any `attStmt` member outside the per-format allow-set.
+///
+/// Each WebAuthn statement format defines the exact members it may carry. An
+/// unexpected (or non-text) key means the statement is not well-formed, so it is
+/// rejected rather than silently ignored.
+fn reject_unknown_att_stmt_keys(
+    att_stmt: &[(Value, Value)],
+    allowed: &[&str],
+) -> Result<(), VerifyError> {
+    for (k, _) in att_stmt {
+        match k.as_text() {
+            Some(key) if allowed.contains(&key) => {}
+            _ => return Err(VerifyError::InvalidAttestationStatement),
+        }
+    }
+    Ok(())
 }
