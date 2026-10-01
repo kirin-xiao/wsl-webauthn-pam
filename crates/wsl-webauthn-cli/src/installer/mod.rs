@@ -43,7 +43,7 @@
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, anyhow, bail};
 
@@ -91,6 +91,12 @@ pub(crate) const DEFAULT_WIN_MNT: &str = "/mnt/c";
 const LOCALAPPDATA_DEADLINE: Duration = Duration::from_secs(5);
 /// Deadline for the install-time `whoami.exe` interop sanity check (plan §10.2).
 const WHOAMI_DEADLINE: Duration = Duration::from_secs(5);
+/// Hard cap on a Linux helper invocation (`pam-auth-update`). It is generous because an
+/// *interactive* debconf run still needs the operator, but it guarantees a helper can
+/// never block the installer forever (the `--non-interactive` hang this was added for).
+const HELPER_TIMEOUT: Duration = Duration::from_secs(300);
+/// The environment variable that makes debconf clients (`pam-auth-update`) non-blocking.
+const DEBIAN_FRONTEND: &str = "DEBIAN_FRONTEND";
 
 const EXIT_OK: i32 = 0;
 const EXIT_FAIL: i32 = 1;
@@ -115,7 +121,8 @@ pub(crate) struct InstallPaths {
     pub pam_configs: PathBuf,
     /// `/etc/pam_wsl_hello` (legacy config dir; never removed by uninstall).
     pub legacy_config_dir: PathBuf,
-    /// Roots scanned for `<root>/<triplet>/security/pam_unix.so` (`/usr/lib`, `/lib`).
+    /// Roots scanned for `<root>/security` and `<root>/<triplet>/security`
+    /// (`/usr/lib`, `/usr/lib64`, `/lib`, `/lib64`).
     pub module_search_roots: Vec<PathBuf>,
     /// Expected owner uid of installed files (0 in production).
     pub owner_uid: u32,
@@ -130,7 +137,12 @@ impl InstallPaths {
             pam_d: PathBuf::from("/etc/pam.d"),
             pam_configs: PathBuf::from("/usr/share/pam-configs"),
             legacy_config_dir: PathBuf::from("/etc/pam_wsl_hello"),
-            module_search_roots: vec![PathBuf::from("/usr/lib"), PathBuf::from("/lib")],
+            module_search_roots: vec![
+                PathBuf::from("/usr/lib"),
+                PathBuf::from("/usr/lib64"),
+                PathBuf::from("/lib"),
+                PathBuf::from("/lib64"),
+            ],
             owner_uid: 0,
         }
     }
@@ -200,22 +212,79 @@ pub(crate) struct CommandStatus {
 /// Runs a Linux helper program with an argument array (no shell).
 pub(crate) trait CommandRunner {
     /// Run `program` with `args`.
-    fn run(&self, program: &str, args: &[&str]) -> Result<CommandStatus, String>;
+    ///
+    /// When `non_interactive` is set the implementation must not let the helper prompt on
+    /// the terminal: it applies `DEBIAN_FRONTEND=noninteractive` and a hard timeout, so a
+    /// debconf client such as `pam-auth-update` can never block the installer.
+    fn run(
+        &self,
+        program: &str,
+        args: &[&str],
+        non_interactive: bool,
+    ) -> Result<CommandStatus, String>;
+
+    /// Whether `program` can be executed (found on `PATH`).
+    ///
+    /// The installer uses this up front to decide between driving `pam-auth-update` and
+    /// printing first-class manual `/etc/pam.d` instructions.
+    fn available(&self, program: &str) -> bool;
 }
 
 /// Production command runner.
 pub(crate) struct RealCommands;
 
+/// Build the child command for a Linux helper, applying `DEBIAN_FRONTEND=noninteractive`
+/// when the installer is non-interactive.
+fn helper_command(program: &str, args: &[&str], non_interactive: bool) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    if non_interactive {
+        command.env(DEBIAN_FRONTEND, "noninteractive");
+    }
+    command
+}
+
 impl CommandRunner for RealCommands {
-    fn run(&self, program: &str, args: &[&str]) -> Result<CommandStatus, String> {
-        let status = std::process::Command::new(program)
-            .args(args)
-            .status()
+    fn run(
+        &self,
+        program: &str,
+        args: &[&str],
+        non_interactive: bool,
+    ) -> Result<CommandStatus, String> {
+        let mut child = helper_command(program, args, non_interactive)
+            .spawn()
             .map_err(|e| format!("could not run {program}: {e}"))?;
-        Ok(CommandStatus {
-            success: status.success(),
-            code: status.code(),
-        })
+        let deadline = Instant::now() + HELPER_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    return Ok(CommandStatus {
+                        success: status.success(),
+                        code: status.code(),
+                    });
+                }
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(format!(
+                            "{program} did not finish within {}s and was killed; run it by \
+                             hand once the terminal is interactive",
+                            HELPER_TIMEOUT.as_secs()
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => return Err(format!("could not wait for {program}: {e}")),
+            }
+        }
+    }
+
+    fn available(&self, program: &str) -> bool {
+        let Ok(path) = std::env::var("PATH") else {
+            return false;
+        };
+        std::env::split_paths(&path).any(|dir| dir.join(program).is_file())
     }
 }
 
@@ -297,6 +366,11 @@ pub(crate) struct InstallOptions {
     /// Explicit artifact directory (`--artifact-dir`), else `$WSL_WEBAUTHN_ARTIFACTS`,
     /// else a search around the executable.
     pub artifact_dir: Option<PathBuf>,
+    /// `--dry-run`: resolve everything and print the planned mutations, writing nothing.
+    pub dry_run: bool,
+    /// `--non-interactive`: pass `DEBIAN_FRONTEND=noninteractive` to helper processes so
+    /// a debconf prompt cannot block.
+    pub non_interactive: bool,
 }
 
 /// Options for [`uninstall_all`].
@@ -306,6 +380,8 @@ pub(crate) struct UninstallOptions {
     pub win_mnt: Option<PathBuf>,
     /// Override the module directory (skip detection).
     pub module_dir: Option<PathBuf>,
+    /// `--non-interactive`: pass `DEBIAN_FRONTEND=noninteractive` to helper processes.
+    pub non_interactive: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -582,7 +658,12 @@ fn resolve_module_dir(paths: &InstallPaths, explicit: Option<&Path>) -> anyhow::
     if let Some(detected) = detect_module_dir(&paths.module_search_roots) {
         return Ok(detected);
     }
-    for fallback in ["/usr/lib/security", "/lib/security"] {
+    for fallback in [
+        "/usr/lib/security",
+        "/usr/lib64/security",
+        "/lib/security",
+        "/lib64/security",
+    ] {
         let dir = Path::new(fallback);
         if dir.is_dir() {
             return Ok(dir.to_path_buf());
@@ -1149,22 +1230,33 @@ fn migrate_remove_legacy(
     legacy: &Legacy,
     commands: &dyn CommandRunner,
     prompter: &dyn Prompter,
+    pam_auth_update: bool,
+    non_interactive: bool,
 ) -> anyhow::Result<()> {
-    if legacy.profile.is_some()
-        && prompter.confirm(
+    if legacy.profile.is_some() {
+        if !pam_auth_update {
+            println!(
+                "  `pam-auth-update` not found; deregister the legacy profile by removing \
+                 its file below (or by hand)."
+            );
+        } else if prompter.confirm(
             "Run `pam-auth-update --remove wsl-hello` to deregister the legacy profile?",
             true,
-        )?
-    {
-        match commands.run("pam-auth-update", &["--remove", LEGACY_PROFILE_NAME]) {
-            Ok(status) if status.success => {
-                println!("  pam-auth-update --remove wsl-hello: done");
+        )? {
+            match commands.run(
+                "pam-auth-update",
+                &["--remove", LEGACY_PROFILE_NAME],
+                non_interactive,
+            ) {
+                Ok(status) if status.success => {
+                    println!("  pam-auth-update --remove wsl-hello: done");
+                }
+                Ok(status) => eprintln!(
+                    "warning: pam-auth-update --remove wsl-hello exited {:?}",
+                    status.code
+                ),
+                Err(e) => eprintln!("warning: {e}"),
             }
-            Ok(status) => eprintln!(
-                "warning: pam-auth-update --remove wsl-hello exited {:?}",
-                status.code
-            ),
-            Err(e) => eprintln!("warning: {e}"),
         }
     }
     if let Some(profile) = &legacy.profile
@@ -1208,14 +1300,54 @@ fn migrate_remove_legacy(
 // Post-install guidance
 // ---------------------------------------------------------------------------
 
+/// The manual enable instructions (one line per element), used when `pam-auth-update`
+/// is not installed (e.g. RHEL/Fedora). Kept as data so the flow and tests agree.
+fn manual_enable_steps(paths: &InstallPaths) -> Vec<String> {
+    vec![
+        "`pam-auth-update` was not found on this system; enable the module by hand:".to_string(),
+        "  add this line to /etc/pam.d/common-auth (Debian/Ubuntu) or to the relevant".to_string(),
+        "  service (e.g. /etc/pam.d/sudo, /etc/pam.d/su), above any password line:".to_string(),
+        "      auth sufficient pam_wsl_webauthn.so".to_string(),
+        format!(
+            "  (the profile installed at {} documents the same line)",
+            paths.profile_path().display()
+        ),
+    ]
+}
+
+/// Print [`manual_enable_steps`].
+fn print_manual_enable_steps(paths: &InstallPaths) {
+    for line in manual_enable_steps(paths) {
+        println!("{line}");
+    }
+}
+
 /// Offer to enable the profile (default **no** — the profile is `Default: no`).
-fn offer_enable(commands: &dyn CommandRunner, prompter: &dyn Prompter) -> anyhow::Result<()> {
+///
+/// When `pam-auth-update` is absent this is not a bare warning: the operator gets
+/// first-class manual `/etc/pam.d` instructions instead, so "install" never appears to
+/// succeed while silently never becoming active.
+fn offer_enable(
+    paths: &InstallPaths,
+    commands: &dyn CommandRunner,
+    prompter: &dyn Prompter,
+    pam_auth_update: bool,
+    non_interactive: bool,
+) -> anyhow::Result<()> {
+    if !pam_auth_update {
+        print_manual_enable_steps(paths);
+        return Ok(());
+    }
     let enable = prompter.confirm(
         "Enable the wsl-webauthn PAM profile now (`pam-auth-update --enable wsl-webauthn`)?",
         false,
     )?;
     if enable {
-        match commands.run("pam-auth-update", &["--enable", PROFILE_NAME]) {
+        match commands.run(
+            "pam-auth-update",
+            &["--enable", PROFILE_NAME],
+            non_interactive,
+        ) {
             Ok(status) if status.success => {
                 println!("pam-auth-update --enable wsl-webauthn: done");
             }
@@ -1232,6 +1364,9 @@ fn offer_enable(commands: &dyn CommandRunner, prompter: &dyn Prompter) -> anyhow
 }
 
 /// Print the lockout guidance required by plan §10.8 / R5.
+///
+/// WSL has no virtual console to fall back to, so the recovery path is a Windows-side
+/// root shell; for non-WSL Linux the classic TTY route is offered too.
 fn print_lockout_guidance() {
     println!();
     println!("Lockout safety:");
@@ -1240,7 +1375,55 @@ fn print_lockout_guidance() {
     println!("    select \"WSL WebAuthn authentication\" when you are ready.");
     println!("  * Manual alternative (add to /etc/pam.d/common-auth above the password line):");
     println!("        auth sufficient pam_wsl_webauthn.so");
-    println!("  * If sudo breaks, sign in on another TTY/console and remove that line.");
+    println!("  * If sudo/su breaks, recover WITHOUT relying on the broken login:");
+    println!("      WSL: from a Windows terminal, open a root shell for this distro and");
+    println!("           remove the module line:");
+    println!("             wsl.exe -d <distro> -u root");
+    println!("             # then edit /etc/pam.d/* (or run");
+    println!("             #   pam-auth-update --remove wsl-webauthn)");
+    println!("      Other Linux: sign in on another TTY/console (Ctrl-Alt-F2) and");
+    println!("           remove that line.");
+}
+
+/// Print the planned mutations for `--dry-run` without touching the system.
+fn print_dry_run(paths: &InstallPaths, module_dir: &Path, pam_auth_update: bool) {
+    println!("Dry run: resolved everything; nothing will be written.");
+    println!(
+        "  bridge:      %LOCALAPPDATA%\\Programs\\wsl-webauthn-pam\\{BRIDGE_EXE} (would copy)"
+    );
+    println!("  config:      {} (0600)", paths.config_path().display());
+    println!(
+        "  credentials: {} (0700)",
+        paths.credentials_dir().display()
+    );
+    println!(
+        "  module:      {} (0644)",
+        module_dir.join(MODULE_NAME).display()
+    );
+    println!("  profile:     {} (0644)", paths.profile_path().display());
+
+    let legacy = detect_legacy(paths);
+    if legacy.is_present() {
+        println!("  legacy cleanup would be offered (old credentials are never imported):");
+        for module in &legacy.modules {
+            println!("    remove {}", module.display());
+        }
+        if let Some(dir) = &legacy.config_dir {
+            println!("    remove {}", dir.display());
+        }
+        if let Some(profile) = &legacy.profile {
+            println!("    deregister/remove {}", profile.display());
+        }
+        println!("    rewrite pam_wsl_hello -> pam_wsl_webauthn in /etc/pam.d (per file)");
+    } else {
+        println!("  legacy cleanup: none detected");
+    }
+
+    if pam_auth_update {
+        println!("  enable step: `pam-auth-update --enable {PROFILE_NAME}` (offered afterwards)");
+    } else {
+        print_manual_enable_steps(paths);
+    }
 }
 
 /// Print what the operator must do next.
@@ -1278,6 +1461,15 @@ pub(crate) fn install_with(
     println!("  module src:  {}", artifacts.module.display());
     println!("  bridge src:  {}", artifacts.bridge.display());
     println!();
+
+    // Detect `pam-auth-update` up front (it may be absent on RHEL/Fedora), so the flow
+    // can print manual `/etc/pam.d` steps instead of a bare warning.
+    let pam_auth_update = commands.available("pam-auth-update");
+
+    if opts.dry_run {
+        print_dry_run(paths, &module_dir, pam_auth_update);
+        return Ok(EXIT_OK);
+    }
 
     let mut rollback = Rollback::new();
 
@@ -1325,7 +1517,13 @@ pub(crate) fn install_with(
             println!("Rewrote {rewritten} pam.d file(s).");
         }
         // (b)/(c) deregister the profile and remove the old module/config.
-        migrate_remove_legacy(&legacy, commands, prompter)?;
+        migrate_remove_legacy(
+            &legacy,
+            commands,
+            prompter,
+            pam_auth_update,
+            opts.non_interactive,
+        )?;
         println!();
         println!("Legacy cleanup complete. A FRESH enrollment is required (old credentials");
         println!("are not migrated): run `sudo wsl-webauthn-pam enroll`.");
@@ -1333,7 +1531,13 @@ pub(crate) fn install_with(
 
     // 6. Offer to enable the profile, print lockout guidance, then offer enrollment LAST.
     println!();
-    offer_enable(commands, prompter)?;
+    offer_enable(
+        paths,
+        commands,
+        prompter,
+        pam_auth_update,
+        opts.non_interactive,
+    )?;
     print_lockout_guidance();
 
     if opts.skip_enroll {
@@ -1648,7 +1852,11 @@ pub(crate) fn uninstall_all(
     let profile = paths.profile_path();
     if fsutil::lstat_opt(&profile)?.is_some() {
         if prompter.confirm("Run `pam-auth-update --remove wsl-webauthn`?", true)? {
-            match commands.run("pam-auth-update", &["--remove", PROFILE_NAME]) {
+            match commands.run(
+                "pam-auth-update",
+                &["--remove", PROFILE_NAME],
+                opts.non_interactive,
+            ) {
                 Ok(status) if status.success => {
                     println!("  pam-auth-update --remove wsl-webauthn: done");
                 }
@@ -1748,6 +1956,7 @@ pub(crate) fn cmd_uninstall(
         let opts = UninstallOptions {
             win_mnt,
             module_dir,
+            non_interactive,
         };
         uninstall_all(&paths, &RealInterop, &RealCommands, &prompter, &opts)
     } else {

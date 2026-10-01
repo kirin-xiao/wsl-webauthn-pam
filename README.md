@@ -275,7 +275,20 @@ sudo wsl-webauthn-pam install           # if the CLI is on PATH
 6. Offer to enable the profile now (**default no**, matching `Default: no`),
    print the lockout warning, and **last** offer to enroll the invoking user.
    Use `--skip-enroll` to stop before the enrollment offer, `--yes` to answer
-   yes to every prompt, and `--non-interactive` to never read stdin.
+   yes to every prompt, `--dry-run` to resolve and preview the whole plan without
+   writing anything, and `--non-interactive` to never read stdin (helper
+   processes such as `pam-auth-update` are then run with
+   `DEBIAN_FRONTEND=noninteractive` and a hard timeout, so a debconf prompt
+   cannot block).
+
+   The module directory is detected by locating `pam_unix.so`, including the
+   RHEL/Fedora `/usr/lib64/security` (and `/usr/lib/<triplet>/security`) layout.
+   If `pam-auth-update` is not installed (non-Debian systems), `install` prints
+   first-class manual `/etc/pam.d` instructions instead of a bare warning, so a
+   successful install is never silently inactive.
+
+   Run `sudo wsl-webauthn-pam install --dry-run` first if you want to see exactly
+   what would be written.
 
 Then, once:
 
@@ -293,7 +306,9 @@ sudo pam-auth-update --enable wsl-webauthn
 
 ### Manual installation (no installer)
 
-1. Copy `pam_wsl_webauthn.so` to e.g. `/usr/lib/x86_64-linux-gnu/security/`.
+1. Copy `pam_wsl_webauthn.so` to the PAM security directory: e.g.
+   `/usr/lib/x86_64-linux-gnu/security/` (Debian/Ubuntu) or
+   `/usr/lib64/security/` (RHEL/Fedora).
 2. Copy the bridge onto the Windows side (any path works; the config pins it).
 3. Write `/etc/wsl_webauthn/config` as root, mode `0600`:
 
@@ -322,9 +337,25 @@ module.** The module is **fail-closed**: any provisioning error (missing
 config, unreadable store, bridge transport failure, interop unavailable, pin
 mismatch, timeout) denies Hello for that PAM service and only falls through to
 the *next* method when the stack says so (under `sufficient`, or under
-`[success=end default=ignore]`). Keep a second TTY, a root shell, or the local
-password available, and test with a non-critical service first. The installer
-prints the same warning.
+`[success=end default=ignore]`). Keep a root shell or the local password
+available, and test with a non-critical service first. The installer prints the
+same warning.
+
+**If you do get locked out**, do not rely on the broken login. WSL has no
+virtual console (`Ctrl-Alt-F2`) to fall back to, so open a root shell from the
+Windows side and undo the change:
+
+```powershell
+wsl.exe -d <distro> -u root
+```
+
+```sh
+# then, inside that root shell:
+pam-auth-update --remove wsl-webauthn     # or: edit /etc/pam.d/* by hand
+```
+
+On a non-WSL Linux host the classic route still applies: switch to another
+TTY/console (`Ctrl-Alt-F2`, or serial/SSH) and remove the module line.
 
 ---
 
@@ -354,6 +385,7 @@ wsl-webauthn-pam <COMMAND> [OPTIONS]
                  --win-mnt <PATH>      override the Windows mount root
                  --allow-unattested    admit self/none attestation at enroll
                  --skip-enroll         do not offer enrollment at the end
+                 --dry-run             resolve and print the plan; write nothing
                  --yes, -y             answer yes to every prompt
                  --non-interactive     never read stdin; use question defaults
   uninstall    Remove a credential or all components (root)

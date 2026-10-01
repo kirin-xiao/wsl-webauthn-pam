@@ -131,6 +131,7 @@ COMMANDS:
                    --win-mnt <PATH>       override the Windows mount root
                    --allow-unattested     admit self/`none` attestation at enroll
                    --skip-enroll          do not offer enrollment at the end
+                   --dry-run              resolve and print the plan; write nothing
                    --yes, -y              answer yes to every prompt
                    --non-interactive      never read stdin; use question defaults
     uninstall    Remove a credential or all components (root)
@@ -250,6 +251,7 @@ enum Command {
     Install {
         allow_unattested: bool,
         skip_enroll: bool,
+        dry_run: bool,
         non_interactive: bool,
         yes: bool,
         module_dir: Option<PathBuf>,
@@ -286,6 +288,7 @@ enum Flag {
     Yes,
     All,
     SkipEnroll,
+    DryRun,
     NonInteractive,
     User,
     Bridge,
@@ -303,6 +306,7 @@ impl Flag {
             Flag::Yes => "--yes",
             Flag::All => "--all",
             Flag::SkipEnroll => "--skip-enroll",
+            Flag::DryRun => "--dry-run",
             Flag::NonInteractive => "--non-interactive",
             Flag::User => "--user",
             Flag::Bridge => "--bridge",
@@ -333,6 +337,7 @@ fn allowed_flags(subcommand: &str) -> Option<&'static [Flag]> {
         "install" => Some(&[
             Flag::AllowUnattested,
             Flag::SkipEnroll,
+            Flag::DryRun,
             Flag::NonInteractive,
             Flag::Yes,
             Flag::ModuleDir,
@@ -392,6 +397,7 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
     let mut yes = false;
     let mut all = false;
     let mut skip_enroll = false;
+    let mut dry_run = false;
     let mut non_interactive = false;
     let mut user: Option<String> = None;
     let mut bridge: Option<PathBuf> = None;
@@ -428,6 +434,10 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
             "--skip-enroll" => {
                 seen.push(Flag::SkipEnroll);
                 skip_enroll = true;
+            }
+            "--dry-run" => {
+                seen.push(Flag::DryRun);
+                dry_run = true;
             }
             "--non-interactive" => {
                 seen.push(Flag::NonInteractive);
@@ -522,6 +532,7 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
         "install" => Command::Install {
             allow_unattested,
             skip_enroll,
+            dry_run,
             non_interactive,
             yes,
             module_dir,
@@ -637,6 +648,7 @@ fn run(command: Command) -> anyhow::Result<i32> {
         Command::Install {
             allow_unattested,
             skip_enroll,
+            dry_run,
             non_interactive,
             yes,
             module_dir,
@@ -649,6 +661,8 @@ fn run(command: Command) -> anyhow::Result<i32> {
                 module_dir,
                 win_mnt,
                 artifact_dir,
+                dry_run,
+                non_interactive,
             },
             yes,
             non_interactive,
@@ -2021,6 +2035,13 @@ mod tests {
         assert!(parse(&args(&["uninstall", "--bridge", "/x"])).is_err());
         assert!(parse(&args(&["uninstall", "--replace"])).is_err());
         assert!(parse(&args(&["uninstall", "--allow-unattested"])).is_err());
+        // `--dry-run` is install-only.
+        assert!(parse(&args(&["uninstall", "--dry-run"])).is_err());
+        assert!(parse(&args(&["probe", "--dry-run"])).is_err());
+        assert!(parse(&args(&["status", "--dry-run"])).is_err());
+        assert!(parse(&args(&["verify", "--dry-run"])).is_err());
+        assert!(parse(&args(&["unregister", "--dry-run"])).is_err());
+        assert!(parse(&args(&["enroll", "--dry-run"])).is_err());
         // `--user` and `--all` are mutually exclusive.
         assert!(parse(&args(&["uninstall", "--user", "a", "--all"])).is_err());
         // Every other subcommand rejects flags outside its own documented set (the
@@ -2179,6 +2200,7 @@ mod tests {
             Parsed::Run(Command::Install {
                 allow_unattested: false,
                 skip_enroll: false,
+                dry_run: false,
                 non_interactive: false,
                 yes: false,
                 module_dir: None,
@@ -2191,6 +2213,7 @@ mod tests {
                 "install",
                 "--allow-unattested",
                 "--skip-enroll",
+                "--dry-run",
                 "--yes",
                 "--non-interactive",
                 "--module-dir=/usr/lib/x/security",
@@ -2203,6 +2226,7 @@ mod tests {
             Parsed::Run(Command::Install {
                 allow_unattested: true,
                 skip_enroll: true,
+                dry_run: true,
                 non_interactive: true,
                 yes: true,
                 module_dir: Some(PathBuf::from("/usr/lib/x/security")),
