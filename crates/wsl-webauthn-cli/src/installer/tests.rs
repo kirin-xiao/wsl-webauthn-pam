@@ -61,22 +61,48 @@ impl InteropRunner for MockInterop {
 }
 
 /// Mock command runner: records invocations and returns a configurable status.
-#[derive(Default)]
 struct MockCommands {
     calls: RefCell<Vec<(String, Vec<String>)>>,
+    /// Recorded `non_interactive` flag of each invocation.
+    non_interactive: RefCell<Vec<bool>>,
     success: bool,
+    /// Whether `pam-auth-update` is reported as available.
+    available: bool,
+}
+
+impl Default for MockCommands {
+    fn default() -> MockCommands {
+        MockCommands {
+            calls: RefCell::new(Vec::new()),
+            non_interactive: RefCell::new(Vec::new()),
+            success: false,
+            // Matches a Debian/Ubuntu-style host so existing tests keep exercising the
+            // `pam-auth-update` path.
+            available: true,
+        }
+    }
 }
 
 impl CommandRunner for MockCommands {
-    fn run(&self, program: &str, args: &[&str]) -> Result<CommandStatus, String> {
+    fn run(
+        &self,
+        program: &str,
+        args: &[&str],
+        non_interactive: bool,
+    ) -> Result<CommandStatus, String> {
         self.calls.borrow_mut().push((
             program.to_string(),
             args.iter().map(|s| s.to_string()).collect(),
         ));
+        self.non_interactive.borrow_mut().push(non_interactive);
         Ok(CommandStatus {
             success: self.success,
             code: Some(if self.success { 0 } else { 1 }),
         })
+    }
+
+    fn available(&self, program: &str) -> bool {
+        program == "pam-auth-update" && self.available
     }
 }
 
@@ -227,6 +253,8 @@ impl Harness {
             module_dir: Some(self.module_dir.clone()),
             win_mnt: Some(self.win_mnt.clone()),
             artifact_dir: Some(self.art_dir.clone()),
+            dry_run: false,
+            non_interactive: false,
         }
     }
 
@@ -337,6 +365,25 @@ fn detect_module_dir_finds_triplet_and_falls_back() {
     assert_eq!(detected, h.module_dir);
     // No pam_unix.so anywhere -> no detection.
     assert!(detect_module_dir(&[h._tmp.path().join("empty")]).is_none());
+}
+
+#[test]
+fn detect_module_dir_finds_lib64() {
+    let h = Harness::new();
+    // RHEL/Fedora layout: `pam_unix.so` in `/usr/lib64/security`, no triplet.
+    std::fs::remove_file(h.module_dir.join("pam_unix.so")).unwrap();
+    let lib64_security = h._tmp.path().join("usr/lib64/security");
+    write(&lib64_security.join("pam_unix.so"), b"fake pam_unix", 0o644);
+    let roots = vec![h._tmp.path().join("usr/lib64")];
+    assert_eq!(detect_module_dir(&roots).unwrap(), lib64_security);
+
+    // The production roots must include the lib64 root (regression guard).
+    assert!(
+        InstallPaths::system()
+            .module_search_roots
+            .contains(&PathBuf::from("/usr/lib64")),
+        "module_search_roots must include /usr/lib64"
+    );
 }
 
 #[test]
@@ -482,6 +529,129 @@ fn install_enable_offer_invokes_pam_auth_update() {
     assert!(calls.iter().any(|(p, a)| {
         p == "pam-auth-update" && a == &["--enable".to_string(), PROFILE_NAME.to_string()]
     }));
+}
+
+#[test]
+fn install_dry_run_writes_nothing() {
+    let h = Harness::new();
+    let mut opts = h.opts();
+    opts.dry_run = true;
+    opts.skip_enroll = false;
+    let commands = MockCommands {
+        success: true,
+        ..MockCommands::default()
+    };
+    let enroller = MockEnroller::default();
+    // No prompts should be reached; any prompt would consume this scripted answer.
+    let prompter = ScriptedPrompter::always(true);
+    let code = h
+        .run_install(&prompter, &enroller, &commands, &opts)
+        .unwrap();
+    assert_eq!(code, EXIT_OK);
+
+    // Nothing on disk changed.
+    assert!(
+        !h.paths.etc_wsl_webauthn.exists(),
+        "config dir must not exist"
+    );
+    assert!(!h.paths.profile_path().exists(), "profile must not exist");
+    assert!(
+        !h.module_dir.join(MODULE_NAME).exists(),
+        "module must not exist"
+    );
+    assert!(!h.bridge_dest().exists(), "bridge must not be copied");
+    assert!(
+        !h.bridge_dest().parent().unwrap().exists(),
+        "bridge dir must not exist"
+    );
+    // No helpers ran and no enrollment happened.
+    assert!(
+        commands.calls.borrow().is_empty(),
+        "no helper calls in dry-run"
+    );
+    assert!(prompter.questions().is_empty(), "no prompts in dry-run");
+    assert!(
+        enroller.called.borrow().is_empty(),
+        "no enrollment in dry-run"
+    );
+}
+
+#[test]
+fn install_non_interactive_sets_debian_frontend() {
+    let h = Harness::new();
+    let mut opts = h.opts();
+    opts.non_interactive = true;
+    let commands = MockCommands {
+        success: true,
+        ..MockCommands::default()
+    };
+    // Enable -> true.
+    let prompter = ScriptedPrompter::with_answers(&[true]);
+    h.run_install(&prompter, &MockEnroller::default(), &commands, &opts)
+        .unwrap();
+
+    // The helper saw the non-interactive flag...
+    let flags = commands.non_interactive.borrow();
+    assert!(
+        !flags.is_empty(),
+        "pam-auth-update should have been invoked"
+    );
+    assert!(
+        flags.iter().all(|&f| f),
+        "all helper calls must be non-interactive: {flags:?}"
+    );
+    // ...and the child command carries DEBIAN_FRONTEND=noninteractive.
+    let envs: Vec<(String, Option<String>)> = helper_command("pam-auth-update", &[], true)
+        .get_envs()
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().into_owned(),
+                v.map(|v| v.to_string_lossy().into_owned()),
+            )
+        })
+        .collect();
+    assert!(
+        envs.iter()
+            .any(|(k, v)| k == DEBIAN_FRONTEND && v.as_deref() == Some("noninteractive")),
+        "DEBIAN_FRONTEND must be set: {envs:?}"
+    );
+    // The interactive command must not force the env.
+    assert!(
+        helper_command("pam-auth-update", &[], false)
+            .get_envs()
+            .all(|(k, _)| k != std::ffi::OsStr::new(DEBIAN_FRONTEND)),
+        "interactive helpers must keep their own DEBIAN_FRONTEND"
+    );
+}
+
+#[test]
+fn install_without_pam_auth_update_prints_manual_steps() {
+    let h = Harness::new();
+    let commands = MockCommands {
+        success: true,
+        available: false,
+        ..MockCommands::default()
+    };
+    // skip_enroll means no other prompt; the absent pam-auth-update must not prompt.
+    let prompter = ScriptedPrompter::always(true);
+    let code = h
+        .run_install(&prompter, &MockEnroller::default(), &commands, &h.opts())
+        .unwrap();
+    assert_eq!(code, EXIT_OK);
+    assert!(
+        commands
+            .calls
+            .borrow()
+            .iter()
+            .all(|(p, _)| p != "pam-auth-update"),
+        "pam-auth-update must not be invoked when absent"
+    );
+    // First-class manual instructions are available (data form is asserted; the flow
+    // prints exactly these lines).
+    let steps = manual_enable_steps(&h.paths);
+    let joined = steps.join("\n");
+    assert!(joined.contains("/etc/pam.d/common-auth"), "{joined}");
+    assert!(joined.contains("pam_wsl_webauthn.so"), "{joined}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,6 +1191,7 @@ fn uninstall_all_removes_provisioned_artifacts_but_not_legacy() {
     let opts = UninstallOptions {
         win_mnt: Some(h.win_mnt.clone()),
         module_dir: Some(h.module_dir.clone()),
+        non_interactive: false,
     };
     let code = uninstall_all(
         &h.paths,
@@ -1090,6 +1261,7 @@ fn uninstall_restores_rewritten_pam_d_from_backup() {
         &UninstallOptions {
             win_mnt: Some(h.win_mnt.clone()),
             module_dir: Some(h.module_dir.clone()),
+            non_interactive: false,
         },
     )
     .unwrap();
@@ -1125,6 +1297,7 @@ fn uninstall_all_aborts_when_declined() {
         &UninstallOptions {
             win_mnt: Some(h.win_mnt.clone()),
             module_dir: Some(h.module_dir.clone()),
+            non_interactive: false,
         },
     )
     .unwrap();
