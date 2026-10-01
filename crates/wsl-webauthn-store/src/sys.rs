@@ -117,6 +117,41 @@ pub(crate) fn open_readonly(path: &Path) -> io::Result<Fd> {
     Ok(Fd(fd))
 }
 
+/// `fstatat(dirfd, name, AT_SYMLINK_NOFOLLOW)`: stat a single path component relative to
+/// an open directory without following a final symlink.
+///
+/// `name` must be a single component (the store only ever passes a validated `*.json`
+/// leaf). Operating relative to a held directory descriptor removes the path-swap window
+/// that a second absolute `lstat` would otherwise open.
+pub(crate) fn fstatat_nofollow(dirfd: RawFd, name: &OsStr) -> io::Result<Stat> {
+    let c = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains NUL byte"))?;
+    // SAFETY: `dirfd` is an owned directory descriptor, `c` is a valid NUL-terminated
+    // single component, `out` is zero-initialized and only read by fstatat.
+    let mut out: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstatat(dirfd, c.as_ptr(), &mut out, libc::AT_SYMLINK_NOFOLLOW) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(stat_from_raw(out))
+}
+
+/// `unlinkat(dirfd, name)`: unlink a single path component relative to an open directory.
+///
+/// `unlinkat` never follows a final symlink; it removes the link itself. Callers stat the
+/// entry with [`fstatat_nofollow`] first when they need to distinguish a symlink.
+pub(crate) fn unlinkat(dirfd: RawFd, name: &OsStr) -> io::Result<()> {
+    let c = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains NUL byte"))?;
+    // SAFETY: `dirfd` is an owned directory descriptor and `c` is a valid NUL-terminated
+    // single component; unlinkat takes no ownership of the buffer.
+    let rc = unsafe { libc::unlinkat(dirfd, c.as_ptr(), 0) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Open a directory for `fsync`/`rename` bookkeeping with `O_DIRECTORY|O_NOFOLLOW`.
 pub(crate) fn open_dir(path: &Path) -> io::Result<Fd> {
     let c = cpath(path)?;

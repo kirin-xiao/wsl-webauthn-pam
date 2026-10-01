@@ -19,18 +19,28 @@
 //!   [`StoreError::InvalidUsername`]. This never reaches the filesystem.
 //! * Every path component from the base down (base dir, `credentials` dir, record file)
 //!   is `lstat`ed; a symlink anywhere is [`StoreError::SymlinkedPath`].
-//! * The `credentials` dir must be `0700`, the record/config files `0600`, all owned by
-//!   the store's expected owner (root in production). Mismatches are
-//!   [`StoreError::BadOwnership`].
+//! * The `credentials` dir must be **exactly** `0700`, the record/config files **exactly**
+//!   `0600`, all owned by the store's expected owner (root in production). The check is an
+//!   equality test, so any group/other bit (or setuid/setgid/sticky bit) is rejected as
+//!   [`StoreError::BadOwnership`]; stricter than a "no wider than" test, and fail-closed.
 //! * Reads use `open(2)` with `O_RDONLY|O_NOFOLLOW|O_NOCTTY|O_CLOEXEC`, then `fstat` the
 //!   opened descriptor and compare `(dev, ino)` with the earlier `lstat` — a file swapped
-//!   between the two calls is rejected as [`StoreError::PathChanged`].
-//! * Reads are capped at 256 KiB (`64 KiB` for the config); a larger file is
-//!   [`StoreError::TooLarge`]. The content must parse as JSON/TOML or it is
-//!   [`StoreError::Corrupt`]/[`StoreError::Config`].
+//!   between the two calls is rejected as [`StoreError::PathChanged`]. The post-open
+//!   ownership/mode check is performed on the **opened descriptor's** `fstat`, so a file
+//!   swapped in after the pre-open `lstat` cannot pass with attacker-chosen metadata.
+//! * Reads are capped at 256 KiB (`64 KiB` for the config); the cap is enforced while
+//!   reading (the cap-exceeding byte is observed and never accumulated), so an oversized
+//!   or growing file cannot blow up memory. A larger file is [`StoreError::TooLarge`].
+//!   The content must parse as JSON/TOML or it is [`StoreError::Corrupt`]/[`StoreError::Config`].
+//! * The record's `schema_version` must be exactly 1 and its `linux_user` must equal the
+//!   lookup name; otherwise [`StoreError::Corrupt`]/[`StoreError::RecordUserMismatch`].
+//!   Parsing uses `deny_unknown_fields`, so a record carrying unexpected keys is
+//!   [`StoreError::Corrupt`] (strict, fail-closed). `enrolled_at` is stored but not
+//!   re-validated here (the verifier/PAM trust only the cryptographic fields).
 //! * Writes are atomic: `mkstemp` in the target directory (`.tmp-XXXXXX`), `fchmod 0600`,
-//!   `fsync`, then `rename` over the target (or `link` when `replace == false`), then
-//!   `fsync` the directory. A temp file is removed on every error path.
+//!   `fsync` the file, then `rename` over the target (or `link` when `replace == false`),
+//!   then `fsync` the directory **on every success path** (durability of the rename). A
+//!   temp file is removed on every error path.
 //!
 //! # JSON schema (`schema_version: 1`)
 //!
@@ -70,10 +80,12 @@
 mod record;
 mod sys;
 
+use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
+use wsl_webauthn_protocol::b64u_decode;
 
 pub use record::{
     AttestationRecord, Config, CredentialRecord, MODE_STRICT, MODE_UNATTESTED_OPT_IN,
@@ -273,32 +285,6 @@ impl Store {
         }
     }
 
-    /// Validate that `path` exists as a directory, is not a symlink, and has the expected
-    /// owner and permission bits.
-    fn check_dir(&self, path: &Path, mode: u32) -> Result<sys::Stat, StoreError> {
-        let st = match sys::lstat(path) {
-            Ok(st) => st,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Err(StoreError::NotFound {
-                    path: path.to_path_buf(),
-                });
-            }
-            Err(e) => return Err(self.io(path, e)),
-        };
-        if st.is_symlink() {
-            return Err(StoreError::SymlinkedPath {
-                path: path.to_path_buf(),
-            });
-        }
-        if !st.is_dir() {
-            return Err(StoreError::NotRegularFile {
-                path: path.to_path_buf(),
-            });
-        }
-        self.check_owner_mode(path, st, mode)?;
-        Ok(st)
-    }
-
     fn check_owner_mode(&self, path: &Path, st: sys::Stat, mode: u32) -> Result<(), StoreError> {
         if st.uid != self.owner_uid || st.perm_bits() != mode {
             return Err(StoreError::BadOwnership {
@@ -310,6 +296,53 @@ impl Store {
             });
         }
         Ok(())
+    }
+
+    /// Validate a directory and return an `O_NOFOLLOW|O_DIRECTORY` handle to it.
+    ///
+    /// This closes the window between the `lstat` checks and subsequent operations:
+    /// the metadata is re-read from the **opened descriptor** (`fstat`) and its
+    /// `(dev, ino)` is compared with the earlier `lstat`, so a directory swapped in
+    /// mid-operation is [`StoreError::PathChanged`] rather than silently trusted.
+    fn open_checked_dir(&self, path: &Path, mode: u32) -> Result<sys::Fd, StoreError> {
+        let before = match sys::lstat(path) {
+            Ok(st) => st,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(StoreError::NotFound {
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(e) => return Err(self.io(path, e)),
+        };
+        if before.is_symlink() {
+            return Err(StoreError::SymlinkedPath {
+                path: path.to_path_buf(),
+            });
+        }
+        if !before.is_dir() {
+            return Err(StoreError::NotRegularFile {
+                path: path.to_path_buf(),
+            });
+        }
+        self.check_owner_mode(path, before, mode)?;
+
+        let fd = sys::open_dir(path).map_err(|e| self.io(path, e))?;
+        let after = sys::fstat(fd.raw()).map_err(|e| self.io(path, e))?;
+        if after.uid != self.owner_uid || after.perm_bits() != mode {
+            return Err(StoreError::BadOwnership {
+                path: path.to_path_buf(),
+                expected_uid: self.owner_uid,
+                actual_uid: after.uid,
+                expected_mode: mode,
+                actual_mode: after.perm_bits(),
+            });
+        }
+        if after.dev != before.dev || after.ino != before.ino {
+            return Err(StoreError::PathChanged {
+                path: path.to_path_buf(),
+            });
+        }
+        Ok(fd)
     }
 
     /// Verify the base directory exists, is a directory, and is not a symlink.
@@ -338,13 +371,16 @@ impl Store {
 
     /// Ensure `<base>/credentials` exists with mode `0700` and the expected owner,
     /// creating it (and explicitly `fchmod`ing to defeat umask) if missing.
-    fn ensure_credentials_dir(&self) -> Result<(), StoreError> {
+    ///
+    /// Returns an ownership/mode-validated `O_DIRECTORY|O_NOFOLLOW` handle to the
+    /// directory; callers use it to `fsync` the directory entry after installing a file
+    /// and never re-resolve the path against a potentially swapped directory.
+    fn ensure_credentials_dir(&self) -> Result<sys::Fd, StoreError> {
         let dir = self.credentials_dir();
         match sys::lstat(&dir) {
             Ok(_) => {
-                // Reuse the strict checks for an existing directory.
-                self.check_dir(&dir, DIR_MODE)?;
-                Ok(())
+                // Reuse the TOCTOU-safe descriptor checks for an existing directory.
+                self.open_checked_dir(&dir, DIR_MODE)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 self.check_base()?;
@@ -353,8 +389,7 @@ impl Store {
                 let fd = sys::open_dir(&dir).map_err(|e| self.io(&dir, e))?;
                 sys::fchmod(fd.raw(), DIR_MODE).map_err(|e| self.io(&dir, e))?;
                 drop(fd);
-                self.check_dir(&dir, DIR_MODE)?;
-                Ok(())
+                self.open_checked_dir(&dir, DIR_MODE)
             }
             Err(e) => Err(self.io(&dir, e)),
         }
@@ -420,7 +455,7 @@ impl Store {
     pub fn load(&self, username: &str) -> Result<CredentialRecord, StoreError> {
         validate_username(username)?;
         self.check_base()?;
-        self.check_dir(&self.credentials_dir(), DIR_MODE)?;
+        let _dir_fd = self.open_checked_dir(&self.credentials_dir(), DIR_MODE)?;
 
         let path = self.record_path(username);
         let bytes = self.read_secure_file(&path, FILE_MODE, MAX_RECORD_BYTES, |p| {
@@ -446,6 +481,17 @@ impl Store {
                 argument_user: username.to_string(),
             });
         }
+        // Defense in depth: the two binary fields PAM/verifier will decode must be valid
+        // unpadded base64url *now*, so a corrupt record fails closed at load rather than
+        // deep inside the ceremony. Values are not otherwise constrained here.
+        b64u_decode(&record.credential_id).map_err(|e| StoreError::Corrupt {
+            path: path.clone(),
+            message: format!("credential_id is not valid base64url: {e}"),
+        })?;
+        b64u_decode(&record.cose_public_key).map_err(|e| StoreError::Corrupt {
+            path: path.clone(),
+            message: format!("cose_public_key is not valid base64url: {e}"),
+        })?;
         Ok(record)
     }
 
@@ -457,7 +503,10 @@ impl Store {
     pub fn save_atomic(&self, record: &CredentialRecord, replace: bool) -> Result<(), StoreError> {
         validate_username(&record.linux_user)?;
         self.check_base()?;
-        self.ensure_credentials_dir()?;
+        // Re-validate ownership/mode of the destination directory *before* creating a
+        // temp file in it; the returned, identity-checked handle is used for the final
+        // directory fsync so a swapped directory cannot be silently written into.
+        let dir_fd = self.ensure_credentials_dir()?;
 
         let dir = self.credentials_dir();
         let target = self.record_path(&record.linux_user);
@@ -481,7 +530,7 @@ impl Store {
 
         let (fd, temp_path) = sys::mkstemp_in(&dir).map_err(|e| self.io(&dir, e))?;
         let temp = PathBuf::from(temp_path);
-        let result = self.write_and_install(fd, &temp, &target, &json, replace, &dir);
+        let result = self.write_and_install(fd, &temp, &target, &json, replace, &dir_fd);
         if result.is_err() {
             // Best-effort cleanup of the temp file on every failure path.
             let _ = sys::remove_file(&temp);
@@ -496,7 +545,7 @@ impl Store {
         target: &Path,
         json: &[u8],
         replace: bool,
-        dir: &Path,
+        dir_fd: &sys::Fd,
     ) -> Result<(), StoreError> {
         sys::fchmod(fd.raw(), FILE_MODE).map_err(|e| self.io(temp, e))?;
         sys::write_all(fd.raw(), json).map_err(|e| self.io(temp, e))?;
@@ -519,9 +568,9 @@ impl Store {
             }
         }
 
-        // Persist the directory entry.
-        let dfd = sys::open_dir(dir).map_err(|e| self.io(dir, e))?;
-        sys::fsync(dfd.raw()).map_err(|e| self.io(dir, e))?;
+        // Persist the directory entry on every success path (both replace and non-replace
+        // go through here); the handle was identity-checked before the temp file existed.
+        sys::fsync(dir_fd.raw()).map_err(|e| self.io(self.credentials_dir(), e))?;
         Ok(())
     }
 
@@ -547,7 +596,12 @@ impl Store {
         }
 
         let target = self.record_path(username);
-        match sys::lstat(&target) {
+        // Hold the directory open and unlink relative to it, so the symlink check and the
+        // unlink refer to the same directory even under a concurrent swap.
+        let dfd = sys::open_dir(&dir).map_err(|e| self.io(&dir, e))?;
+        let file_name = format!("{username}.json");
+        let name = OsStr::new(&file_name);
+        match sys::fstatat_nofollow(dfd.raw(), name) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(self.io(&target, e)),
             Ok(st) => {
@@ -557,7 +611,7 @@ impl Store {
                 if !st.is_file() {
                     return Err(StoreError::NotRegularFile { path: target });
                 }
-                sys::remove_file(&target).map_err(|e| self.io(&target, e))?;
+                sys::unlinkat(dfd.raw(), name).map_err(|e| self.io(&target, e))?;
                 Ok(true)
             }
         }

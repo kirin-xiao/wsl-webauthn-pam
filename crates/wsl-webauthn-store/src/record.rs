@@ -21,6 +21,7 @@ pub const MODE_UNATTESTED_OPT_IN: &str = "unattested-opt-in";
 /// Serialized to `<base>/credentials/<linux_user>.json` (mode `0600`, root-owned).
 /// See the crate docs for the exact JSON schema and an example.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CredentialRecord {
     /// On-disk schema version; currently [`SCHEMA_VERSION`].
     pub schema_version: u32,
@@ -68,6 +69,7 @@ impl CredentialRecord {
 
 /// Attestation facts recorded for a credential (plan §6, D3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttestationRecord {
     /// Attestation statement format, e.g. `packed` or `none`.
     pub format: String,
@@ -88,6 +90,7 @@ impl AttestationRecord {
 
 /// The Windows account bound to a credential for audit purposes (plan D8).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WindowsIdentity {
     /// Account name in `HOST\user` form.
     pub account: String,

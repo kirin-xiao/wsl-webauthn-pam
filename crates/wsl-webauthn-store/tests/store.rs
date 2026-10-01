@@ -388,6 +388,77 @@ fn load_oversized_record_is_too_large() {
 }
 
 #[test]
+fn load_records_with_malformed_b64url_are_corrupt() {
+    let (_d, store) = fresh();
+    let dir = store.credentials_dir();
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut bad_cred = sample_record("alice");
+    bad_cred.credential_id = "not*valid*b64url".into();
+    write_record_json(&dir.join("alice.json"), &bad_cred);
+    assert!(matches!(
+        store.load("alice"),
+        Err(StoreError::Corrupt { .. })
+    ));
+
+    let mut bad_key = sample_record("alice");
+    bad_key.cose_public_key = "====".into();
+    write_record_json(&dir.join("alice.json"), &bad_key);
+    assert!(matches!(
+        store.load("alice"),
+        Err(StoreError::Corrupt { .. })
+    ));
+}
+
+#[test]
+fn load_rejects_unknown_record_fields() {
+    let (_d, store) = fresh();
+    let dir = store.credentials_dir();
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut value = serde_json::to_value(sample_record("alice")).unwrap();
+    value["unexpected_provenance"] = serde_json::json!("x");
+    write_private(&dir.join("alice.json"), value.to_string().as_bytes());
+    assert!(matches!(
+        store.load("alice"),
+        Err(StoreError::Corrupt { .. })
+    ));
+}
+
+#[test]
+fn remove_refuses_directory_record() {
+    let (_d, store) = fresh();
+    let dir = store.credentials_dir();
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir(dir.join("alice.json")).unwrap();
+    assert!(matches!(
+        store.remove("alice"),
+        Err(StoreError::NotRegularFile { .. })
+    ));
+}
+
+#[test]
+fn replace_over_symlinked_target_replaces_link_not_target() {
+    let (d, store) = fresh();
+    let dir = store.credentials_dir();
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let other = d.path().join("other.json");
+    write_private(&other, b"sentinel");
+    symlink(&other, dir.join("alice.json")).unwrap();
+
+    store.save_atomic(&sample_record("alice"), true).unwrap();
+
+    // rename replaces the symlink itself; the link target is untouched.
+    let meta = fs::symlink_metadata(dir.join("alice.json")).unwrap();
+    assert!(meta.file_type().is_file(), "must be a regular file now");
+    assert_eq!(fs::read(&other).unwrap(), b"sentinel");
+    assert_eq!(store.load("alice").unwrap().linux_user, "alice");
+}
+
+#[test]
 fn load_directory_named_record_is_not_regular_file() {
     let (_d, store) = fresh();
     let dir = store.credentials_dir();
