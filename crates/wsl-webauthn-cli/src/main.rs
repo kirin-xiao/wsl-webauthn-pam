@@ -2451,6 +2451,12 @@ mod tests {
         store
             .save_atomic(&sample_record("alice", 1000), false)
             .unwrap();
+        // A store whose records all load cleanly is healthy: exit 0.
+        assert_eq!(
+            status_with_store(&store, None).unwrap(),
+            EXIT_OK,
+            "a healthy store must still exit 0"
+        );
         // A record whose name is a valid username but whose content is not JSON.
         let bad = store.credentials_dir().join("bob.json");
         std::fs::write(&bad, b"not a credential record").unwrap();
