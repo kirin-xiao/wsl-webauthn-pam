@@ -466,9 +466,16 @@ impl Runner {
     ///
     /// The frame (≤ [`MAX_REQUEST_BYTES`]) normally fits the 64 KiB pipe buffer in a
     /// single `write`, so this returns immediately. It exists so a child that never drains
-    /// its stdin cannot block the PAM stack past `deadline`. On failure the child is left
-    /// for the caller to reap (so a concurrent non-zero exit can still be reported as
-    /// [`RunnerError::BridgeFailed`]).
+    /// its stdin cannot block the PAM stack past `deadline`.
+    ///
+    /// Write errors are *not* fatal: a child that has already exited (typically after
+    /// writing its response without draining stdin — the framed response is
+    /// authoritative per the protocol contract, and WSL interop pipes stdin
+    /// unconditionally) surfaces as `EPIPE` here. Instead of failing, the write is
+    /// abandoned and the read loop decides: a complete valid frame still succeeds; a
+    /// missing or short frame fails closed on the read path (`Transport` or
+    /// `Timeout`). This keeps "early-exit child with a valid response" working while
+    /// never accepting an incomplete one.
     fn write_frame(
         &self,
         fd: std::os::fd::RawFd,
@@ -483,9 +490,9 @@ impl Runner {
         while offset < frame.len() {
             match proc::write(fd, &frame[offset..]) {
                 Ok(0) => {
-                    return Err(RunnerError::Transport {
-                        message: "bridge closed stdin before the request was written".to_string(),
-                    });
+                    // Read end closed: the child exited early. Abandon the write
+                    // without error; the read path is authoritative.
+                    return Ok(());
                 }
                 Ok(n) => offset += n,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -516,9 +523,12 @@ impl Runner {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => {
-                    return Err(RunnerError::Transport {
-                        message: format!("writing request to bridge: {e}"),
-                    });
+                    // EPIPE (child exited), EIO, or any other write error: abandon
+                    // the write without failing. If the child produced a complete
+                    // response it is still honored; otherwise the read path fails
+                    // closed (EOF/no frame → Transport, or Timeout).
+                    let _ = e;
+                    return Ok(());
                 }
             }
             // Bound a pathological child that accepts only a byte at a time.
