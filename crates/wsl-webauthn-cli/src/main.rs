@@ -120,7 +120,7 @@ COMMANDS:
     probe        Report interop / Hello availability and the bridge pin
                    --bridge <PATH>       bridge exe path (else config, else required)
                    --win-mnt <PATH>      Windows mount root (else config, else /mnt/c)
-    status       List enrolled users and the config summary (root for records)
+    status       List enrolled users and the config summary (root for config and records)
                    --user <NAME>         show one user's full record
     verify       Self-test the crypto stack against a synthetic ceremony
     install      Provision the bridge, config, PAM module and profile (root)

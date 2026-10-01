@@ -24,7 +24,7 @@ machine-linked key material) live only in the git-ignored
 | **D2** second RP-ID shape `…-pam-test` also accepted | ✅ confirmed | enroll + assert end-to-end on the `-test` RP |
 | **D5** clientData pass-through via `client_data_json_echo` | ✅ confirmed (api 9) | echo b64url == sent b64url; decoded bytes identical |
 | **D5** API floor 1903; echo null when `ASSERTION < v6` | ✅ code path verified | bridge emits `null`; unit-tested |
-| **D3** Strict = `packed`/AttCA | ❌ **not what this host returns** | real format is **`tpm`**, plus **`none` on the first-ever enrollment per RP ID** |
+| **D3** Strict = `packed`/AttCA | ❌ **not what this host returns** | real format is **`tpm`**; a first-ever enrollment *can* be **`none`** (seen for one of two RP IDs — §4.4) |
 
 ---
 
@@ -165,7 +165,7 @@ rules are `packed`-specific. For `tpm`, authenticity comes from `certInfo`/
 still carried in `authenticatorData` and was in the Strict set here. A `tpm`
 verifier must not reuse the `packed` leaf rules. ⚠️ verifier agent note.
 
-### 4.4 First-ever enrollment per RP ID returns `none` — re-enrollment hazard
+### 4.4 An unattested first-ever enrollment — re-enrollment hazard
 
 Across four enrollment ceremonies:
 
@@ -176,14 +176,16 @@ Across four enrollment ceremonies:
 | 3 | `io.github.kirin-xiao.wsl-webauthn-pam` | `tpm` |
 | 4 | `io.github.kirin-xiao.wsl-webauthn-pam-test` | `tpm` |
 
-Pattern: the **first credential ever created for an RP ID yields `none`** (empty
-`attStmt`, 194-byte attestation object); **subsequent** credentials for the same
-RP ID yield `tpm`. (The RP is not yet known/trusted to the platform on the very
-first create.)
+Observation: one first-ever credential (`-test` RP) yielded `none` (empty
+`attStmt`, 194-byte attestation object), while the pinned RP's first-ever
+credential already yielded `tpm`, and all subsequent credentials yielded `tpm`.
+So `none` is *not* a guaranteed first-enrollment outcome — on this host it
+appeared in one of two RP IDs. (Plausibly the RP is not yet known/trusted to the
+platform on the very first create, but that is not what the pinned RP's row #1
+shows.)
 
-**Plan impact.** With D3 Strict, the **very first enrollment for RP_ID would be
-rejected** (`none` is only admitted under `AllowUnattested`). This is a
-hard blocker for a clean first `wsl-webauthn-pam enroll` on a fresh machine.
+**Plan impact.** Because a first enrollment *may* still be unattested, a Strict
+install could reject it (`none` is only admitted under `AllowUnattested`).
 Options: pre-warm the RP (undesirable), admit `none` only for the first
 enrollment, or ship with `--allow-unattested` guidance for first enroll. Needs a
 plan decision alongside §4.1.
@@ -207,18 +209,20 @@ stray processes          = none (tasklist.exe shows no WSLWebAuthnBridge)
 * The bridge's own watchdog fired at ~5 s and the ceremony self-cancelled
   **before** the Linux-side deadline — the Linux deadline never had to fire. ✅
 * No stray Windows process remained after exit. ✅
-* **Deviation:** the taxonomy is **`user_cancelled`, not `timeout`**.
+* **Historical observation (now resolved):** at spike time the taxonomy was
+  **`user_cancelled`, not `timeout`**.
   `WebAuthNCancelCurrentOperation` makes the platform return
   `NTE_USER_CANCELLED` (`0x80090036`, `NotAllowedError`) — the *same* HRESULT a
-  manual cancel produces. The bridge maps that to `user_cancelled`.
-  Consequently the PAM module cannot distinguish "timed out" from "user hit
-  cancel" from the wire error alone.
+  manual cancel produces — so the wire error alone could not distinguish
+  "timed out" from "user hit cancel".
 
-  This is harmless for the §8 PAM mapping (both map to `PAM_AUTH_ERR`), but it
-  contradicts the §3 taxonomy's intent that `timeout` be distinguishable. If
-  distinguishable timeout logging is wanted, the bridge should decide it
-  locally: when its watchdog fired, report `timeout` regardless of the HRESULT.
-  **Recommend a small bridge/plan tweak.**
+  This is harmless for the §8 PAM mapping (both map to `PAM_AUTH_ERR`). The
+  bridge now makes the distinction locally: when its own watchdog fired it
+  reports `timeout` regardless of the HRESULT
+  (`crates/wsl-webauthn-bridge/src/ceremony.rs::remap_watchdog_fire`, unit-tested
+  by `watchdog_self_cancel_of_user_cancelled_error_reports_timeout`; a genuine
+  user cancel — watchdog not fired — still reports `user_cancelled`). The README
+  documents the shipped behaviour.
 
 ---
 
@@ -359,16 +363,18 @@ worst case for foreground stealing; the result may be milder in a quiet session.
 1. **D3/D4 — attestation format.** Real format is **`tpm`** (with `x5c`,
    `certInfo`, `pubArea`, `sig`), not `packed`; `alg = -65535`.
    *Action:* add a verified `tpm` path or explicitly narrow Strict.
-2. **D3 — first-enroll returns `none`.** The first credential ever for an RP ID
-   is `none`-attested; Strict would reject a fresh enroll.
+2. **D3 — first-enroll can return `none`.** One first-ever credential
+   (`-test` RP) was `none`-attested while the pinned RP's first-ever credential
+   was already `tpm`; Strict would reject such a first enrollment.
    *Action:* decide policy for first enrollment.
 3. **D3/§4 — leaf rules.** The `tpm` leaf has an empty subject and **no**
    `OU = "Authenticator Attestation"` and **no** AAGUID extension; those
    `packed` rules must not be applied to `tpm`.
-4. **§3 — timeout taxonomy.** Watchdog self-cancel yields `user_cancelled`
-   (`0x80090036`), not `timeout`.
-   *Action:* optionally have the bridge report `timeout` when its own watchdog
-   fired.
+4. **§3 — timeout taxonomy (resolved).** At spike time a watchdog self-cancel
+   yielded `user_cancelled` (`0x80090036`), not `timeout`. Fixed in
+   `ceremony.rs::remap_watchdog_fire`: when the bridge's own watchdog fired it
+   reports `timeout` regardless of the HRESULT, while a genuine user cancel stays
+   `user_cancelled` (unit-tested).
 5. **SR-11 — prompt shows RP_ID, not RP_NAME**, and hides `user_display_name`.
 
 Confirmed as planned: RP ID acceptance + `rpIdHash` (D2), echo pass-through (D5),

@@ -168,17 +168,21 @@ See [SECURITY.md](SECURITY.md) for the full threat model and citations.
 
 ### The double-enroll behavior (read this before first enrollment)
 
-The **first-ever** enrollment for a given RP ID on a machine returns
-`fmt: "none"` from Windows (spike-confirmed across two RP IDs); subsequent
-enrollments return `tpm`. Under the default Strict policy the CLI handles this
-automatically:
+Windows *can* return an unattested (`fmt: "none"`) credential on the first
+enrollment for an RP ID. In the spike this happened for only one of the two RP
+IDs tested (`…-pam-test`); the pinned RP's first-ever ceremony already returned
+`tpm` (`SPIKE.md` §4.4). It is therefore a hazard the CLI guards against, not a
+confirmed universal first-enrollment behaviour. Under the default Strict policy
+the CLI handles it automatically:
 
 1. Run the enrollment ceremony.
 2. If the attestation is `none`/self and the policy is Strict, **discard that
-   credential** and run exactly one more ceremony with a **fresh challenge**.
-3. The persisted credential is always the second one — the first (unattested)
-   Windows credential is orphaned and never trusted.
-4. If the second is *still* unattested, the CLI fails and points at
+   credential** and run exactly one more ceremony with a **fresh challenge**
+   (belt-and-braces: if the first ceremony was already attested, no retry
+   happens).
+3. The persisted credential is always the one that passed strict verification —
+   an unattested first credential is orphaned and never trusted.
+4. If the retry is *still* unattested, the CLI fails and points at
    `--allow-unattested`.
 
 **`--allow-unattested`** exists for TPM-less machines. It admits `self` and
@@ -341,7 +345,7 @@ wsl-webauthn-pam <COMMAND> [OPTIONS]
   probe        Report interop / Hello availability and the bridge pin
                  --bridge <PATH>       bridge exe path (else config, else required)
                  --win-mnt <PATH>      Windows mount root (else config, else /mnt/c)
-  status       List enrolled users and the config summary (root for records)
+  status       List enrolled users and the config summary (root for config and records)
                  --user <NAME>         show one user's full record
   verify       Self-test the crypto stack against a synthetic ceremony
   install      Provision the bridge, config, PAM module and profile (root)
@@ -361,10 +365,12 @@ wsl-webauthn-pam <COMMAND> [OPTIONS]
                  --non-interactive     never read stdin; use question defaults
 ```
 
-`enroll`, `unregister`, `install`, and `uninstall` require root. `probe` and
-`verify` run unprivileged; `status` works unprivileged for the config summary
-but needs root to read credential records. Exit codes: `0` success, `1`
-operational failure, `2` usage error.
+`enroll`, `unregister`, `install`, `uninstall`, and `status` require root.
+`status` reads the `0600` root-owned config for its summary and the `0700`
+credential store for its records, so a non-root run prints
+`Config: unavailable (…); re-run as root` and cannot list users. Only `probe`
+and `verify` run unprivileged. Exit codes: `0` success, `1` operational
+failure, `2` usage error.
 
 ---
 
