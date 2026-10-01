@@ -11,6 +11,12 @@ repository.workspace = true
 name = "pam_wsl_webauthn"
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "pam-test-fake-bridge"
+path = "src/bin/test_fake_bridge.rs"
+test = false
+bench = false
+
 [dependencies]
 wsl-webauthn-protocol = { path = "../wsl-webauthn-protocol" }
 wsl-webauthn-store = { path = "../wsl-webauthn-store" }
@@ -20,3 +26,12 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 libc = { workspace = true }
 rand = { workspace = true }
+# Bridge executable pin: SHA-256 of the configured `bridge_path` (plan D11).
+sha2 = { workspace = true }
+
+[dev-dependencies]
+# Test support only: tempdir-backed stores, a real ES256 keypair to sign the
+# scripted assertions, and CBOR to build the enrolled COSE key.
+tempfile = "3"
+p256 = { workspace = true, features = ["ecdsa"] }
+ciborium = { workspace = true }
