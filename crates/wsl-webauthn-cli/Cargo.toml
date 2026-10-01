@@ -17,3 +17,14 @@ wsl-webauthn-store = { path = "../wsl-webauthn-store" }
 wsl-webauthn-runner = { path = "../wsl-webauthn-runner" }
 wsl-webauthn-verifier = { path = "../wsl-webauthn-verifier" }
 anyhow = { workspace = true }
+ciborium = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+p256 = { workspace = true }
+ecdsa = { workspace = true }
+libc = { workspace = true }
+
+# Test-only: tempdir-backed store fixtures. `tempfile` is already in the workspace
+# lock (used by the store/runner dev-deps), so this adds no new locked package.
+[dev-dependencies]
+tempfile = "3"
