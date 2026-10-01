@@ -15,7 +15,6 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-arbitrary = { version = "1", features = ["derive"] }
 wsl-webauthn-verifier = { path = "../crates/wsl-webauthn-verifier" }
 wsl-webauthn-protocol = { path = "../crates/wsl-webauthn-protocol" }
 p256 = { version = "0.13.2", features = ["ecdsa"] }
