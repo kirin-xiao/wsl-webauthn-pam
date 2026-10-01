@@ -214,7 +214,8 @@ It is never a silent fallback.
   `pam_start` integration tests (not for `cargo check`); those tests use
   `pam_start_confdir`, which requires **libpam ≥ 1.4** (test-only).
 - **Stable Rust** to build from source (pinned by `rust-toolchain.toml`;
-  `rust-version = 1.85`, edition 2024).
+  `rust-version = 1.88`, edition 2024). 1.88 is required because the CLI uses
+  let-chains.
 
 ---
 

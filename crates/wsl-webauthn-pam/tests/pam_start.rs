@@ -97,21 +97,21 @@ unsafe extern "C" fn conversation(
 /// Locate the built cdylib (mirrors `tests/dlopen.rs`; no `CI` dependence).
 fn locate_library() -> Option<PathBuf> {
     let mut candidates = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(deps_dir) = exe.parent() {
-            candidates.push(deps_dir.join("libpam_wsl_webauthn.so"));
-            if let Some(profile_dir) = deps_dir.parent() {
-                candidates.push(profile_dir.join("libpam_wsl_webauthn.so"));
-                if let Some(target_dir) = profile_dir.parent() {
-                    for profile in ["debug", "release"] {
-                        candidates.push(target_dir.join(profile).join("libpam_wsl_webauthn.so"));
-                        candidates.push(
-                            target_dir
-                                .join(profile)
-                                .join("deps")
-                                .join("libpam_wsl_webauthn.so"),
-                        );
-                    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(deps_dir) = exe.parent()
+    {
+        candidates.push(deps_dir.join("libpam_wsl_webauthn.so"));
+        if let Some(profile_dir) = deps_dir.parent() {
+            candidates.push(profile_dir.join("libpam_wsl_webauthn.so"));
+            if let Some(target_dir) = profile_dir.parent() {
+                for profile in ["debug", "release"] {
+                    candidates.push(target_dir.join(profile).join("libpam_wsl_webauthn.so"));
+                    candidates.push(
+                        target_dir
+                            .join(profile)
+                            .join("deps")
+                            .join("libpam_wsl_webauthn.so"),
+                    );
                 }
             }
         }

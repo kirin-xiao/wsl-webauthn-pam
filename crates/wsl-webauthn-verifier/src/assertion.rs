@@ -75,13 +75,14 @@ pub(crate) fn verify(
     //    greater than the persisted one, this is a clone signal -> reject.
     //    Zero/zero (or no persisted count) skips the check: Windows Hello is a
     //    zero-counter authenticator by default, and some machines are not.
-    if let Some(stored) = expected_sign_count {
-        if (stored != 0 || prefix.sign_count != 0) && prefix.sign_count <= stored {
-            return Err(VerifyError::CounterRegression {
-                stored,
-                observed: prefix.sign_count,
-            });
-        }
+    if let Some(stored) = expected_sign_count
+        && (stored != 0 || prefix.sign_count != 0)
+        && prefix.sign_count <= stored
+    {
+        return Err(VerifyError::CounterRegression {
+            stored,
+            observed: prefix.sign_count,
+        });
     }
 
     // 6. Return the observed counter for the store to persist.

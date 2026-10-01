@@ -9,7 +9,10 @@ exclude = ["fuzz"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# 1.88 is the true floor: `wsl-webauthn-cli` uses let-chains (`if let … && …`),
+# stabilized in 1.88. Verified by the `msrv` CI job, which checks the workspace
+# with `cargo +1.88.0 … --locked`.
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/kirin-xiao/wsl-webauthn-pam"
 

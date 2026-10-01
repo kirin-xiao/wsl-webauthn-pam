@@ -1132,26 +1132,26 @@ fn set_tpm_fields(
 ) -> Vec<u8> {
     let mut map = parse_object(obj);
     for (k, v) in map.iter_mut() {
-        if k.as_text() == Some("attStmt") {
-            if let Some(stmt) = v.as_map_mut() {
-                for (sk, sv) in stmt.iter_mut() {
-                    match sk.as_text() {
-                        Some("pubArea") if !pub_area.is_empty() => {
-                            *sv = Value::Bytes(pub_area.to_vec());
-                        }
-                        Some("certInfo") if !cert_info.is_empty() => {
-                            *sv = Value::Bytes(cert_info.to_vec());
-                        }
-                        Some("sig") => {
-                            if let Some(sig) = sig {
-                                *sv = Value::Bytes(sig.to_vec());
-                            }
-                        }
-                        Some(name) if text.map(|(n, _)| n) == Some(name) => {
-                            *sv = Value::from(text.expect("checked").1);
-                        }
-                        _ => {}
+        if k.as_text() == Some("attStmt")
+            && let Some(stmt) = v.as_map_mut()
+        {
+            for (sk, sv) in stmt.iter_mut() {
+                match sk.as_text() {
+                    Some("pubArea") if !pub_area.is_empty() => {
+                        *sv = Value::Bytes(pub_area.to_vec());
                     }
+                    Some("certInfo") if !cert_info.is_empty() => {
+                        *sv = Value::Bytes(cert_info.to_vec());
+                    }
+                    Some("sig") => {
+                        if let Some(sig) = sig {
+                            *sv = Value::Bytes(sig.to_vec());
+                        }
+                    }
+                    Some(name) if text.map(|(n, _)| n) == Some(name) => {
+                        *sv = Value::from(text.expect("checked").1);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1163,10 +1163,10 @@ fn set_tpm_fields(
 fn remove_field(obj: &[u8], name: &str) -> Vec<u8> {
     let mut map = parse_object(obj);
     for (k, v) in map.iter_mut() {
-        if k.as_text() == Some("attStmt") {
-            if let Some(stmt) = v.as_map_mut() {
-                stmt.retain(|(sk, _)| sk.as_text() != Some(name));
-            }
+        if k.as_text() == Some("attStmt")
+            && let Some(stmt) = v.as_map_mut()
+        {
+            stmt.retain(|(sk, _)| sk.as_text() != Some(name));
         }
     }
     encode_object(map)
@@ -1176,12 +1176,12 @@ fn remove_field(obj: &[u8], name: &str) -> Vec<u8> {
 fn rewrite_att_stmt_text(obj: &[u8], name: &str, value: &str) -> Vec<u8> {
     let mut map = parse_object(obj);
     for (k, v) in map.iter_mut() {
-        if k.as_text() == Some("attStmt") {
-            if let Some(stmt) = v.as_map_mut() {
-                for (sk, sv) in stmt.iter_mut() {
-                    if sk.as_text() == Some(name) {
-                        *sv = Value::from(value);
-                    }
+        if k.as_text() == Some("attStmt")
+            && let Some(stmt) = v.as_map_mut()
+        {
+            for (sk, sv) in stmt.iter_mut() {
+                if sk.as_text() == Some(name) {
+                    *sv = Value::from(value);
                 }
             }
         }
@@ -1193,16 +1193,15 @@ fn rewrite_att_stmt_text(obj: &[u8], name: &str, value: &str) -> Vec<u8> {
 fn rewrite_att_stmt_bytes_flip(obj: &[u8], name: &str) -> Vec<u8> {
     let mut map = parse_object(obj);
     for (k, v) in map.iter_mut() {
-        if k.as_text() == Some("attStmt") {
-            if let Some(stmt) = v.as_map_mut() {
-                for (sk, sv) in stmt.iter_mut() {
-                    if sk.as_text() == Some(name) {
-                        if let Some(bytes) = sv.as_bytes_mut() {
-                            if !bytes.is_empty() {
-                                bytes[0] ^= 0xff;
-                            }
-                        }
-                    }
+        if k.as_text() == Some("attStmt")
+            && let Some(stmt) = v.as_map_mut()
+        {
+            for (sk, sv) in stmt.iter_mut() {
+                if sk.as_text() == Some(name)
+                    && let Some(bytes) = sv.as_bytes_mut()
+                    && !bytes.is_empty()
+                {
+                    bytes[0] ^= 0xff;
                 }
             }
         }
@@ -1354,16 +1353,15 @@ fn rewrite_x5c_entry(obj: &[u8], index: usize, replacement: Vec<u8>) -> Vec<u8> 
     use ciborium::value::Value;
     let mut map = parse_object(obj);
     for (k, v) in map.iter_mut() {
-        if k.as_text() == Some("attStmt") {
-            if let Some(stmt) = v.as_map_mut() {
-                for (sk, sv) in stmt.iter_mut() {
-                    if sk.as_text() == Some("x5c") {
-                        if let Some(arr) = sv.as_array_mut() {
-                            if index < arr.len() {
-                                arr[index] = Value::Bytes(replacement.clone());
-                            }
-                        }
-                    }
+        if k.as_text() == Some("attStmt")
+            && let Some(stmt) = v.as_map_mut()
+        {
+            for (sk, sv) in stmt.iter_mut() {
+                if sk.as_text() == Some("x5c")
+                    && let Some(arr) = sv.as_array_mut()
+                    && index < arr.len()
+                {
+                    arr[index] = Value::Bytes(replacement.clone());
                 }
             }
         }
@@ -1375,12 +1373,12 @@ fn rewrite_x5c(obj: &[u8], certs: Vec<Vec<u8>>) -> Vec<u8> {
     use ciborium::value::Value;
     let mut map = parse_object(obj);
     for (k, v) in map.iter_mut() {
-        if k.as_text() == Some("attStmt") {
-            if let Some(stmt) = v.as_map_mut() {
-                for (sk, sv) in stmt.iter_mut() {
-                    if sk.as_text() == Some("x5c") {
-                        *sv = Value::Array(certs.iter().cloned().map(Value::Bytes).collect());
-                    }
+        if k.as_text() == Some("attStmt")
+            && let Some(stmt) = v.as_map_mut()
+        {
+            for (sk, sv) in stmt.iter_mut() {
+                if sk.as_text() == Some("x5c") {
+                    *sv = Value::Array(certs.iter().cloned().map(Value::Bytes).collect());
                 }
             }
         }
@@ -1392,14 +1390,14 @@ fn rewrite_att_stmt_sig(obj: &[u8]) -> Vec<u8> {
     // Corrupt the existing signature bytes.
     let mut map = parse_object(obj);
     for (k, v) in map.iter_mut() {
-        if k.as_text() == Some("attStmt") {
-            if let Some(stmt) = v.as_map_mut() {
-                for (sk, sv) in stmt.iter_mut() {
-                    if sk.as_text() == Some("sig") {
-                        if let Some(bytes) = sv.as_bytes_mut() {
-                            bytes[0] ^= 0xff;
-                        }
-                    }
+        if k.as_text() == Some("attStmt")
+            && let Some(stmt) = v.as_map_mut()
+        {
+            for (sk, sv) in stmt.iter_mut() {
+                if sk.as_text() == Some("sig")
+                    && let Some(bytes) = sv.as_bytes_mut()
+                {
+                    bytes[0] ^= 0xff;
                 }
             }
         }
@@ -1411,12 +1409,12 @@ fn rewrite_att_stmt_sig_with(obj: &[u8], signer: &Signer, message: &[u8]) -> Vec
     use ciborium::value::Value;
     let mut map = parse_object(obj);
     for (k, v) in map.iter_mut() {
-        if k.as_text() == Some("attStmt") {
-            if let Some(stmt) = v.as_map_mut() {
-                for (sk, sv) in stmt.iter_mut() {
-                    if sk.as_text() == Some("sig") {
-                        *sv = Value::Bytes(signer.sign(message));
-                    }
+        if k.as_text() == Some("attStmt")
+            && let Some(stmt) = v.as_map_mut()
+        {
+            for (sk, sv) in stmt.iter_mut() {
+                if sk.as_text() == Some("sig") {
+                    *sv = Value::Bytes(signer.sign(message));
                 }
             }
         }

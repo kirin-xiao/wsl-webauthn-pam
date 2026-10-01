@@ -7,6 +7,7 @@ name: CI
 #
 # Job inventory:
 #   lint        linux: rustfmt + clippy(--all-targets -D warnings)
+#   msrv        linux: cargo check --all-targets on the declared 1.88.0 floor
 #   build       linux: cargo build --workspace --locked (links the pam cdylib)
 #   test        linux: cargo test --workspace --locked (dlopen/pam_start/vectors)
 #   windows     windows-latest (msvc): bridge clippy + unit tests
@@ -63,6 +64,27 @@ jobs:
 
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  msrv:
+    name: linux (MSRV 1.88.0 check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust 1.88.0
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: "1.88.0"
+
+      - name: Cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # `rust-version = 1.88` is the declared floor; this job is the gate that
+      # keeps it honest (let-chains in the CLI need 1.88). `--locked` pins the
+      # dependency versions the MSRV was validated against; without it a newer
+      # transitive release could silently raise the effective MSRV.
+      - name: cargo check (MSRV, locked)
+        run: cargo check --workspace --all-targets --locked
 
   build:
     name: linux (build --locked smoke)

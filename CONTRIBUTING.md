@@ -9,7 +9,7 @@ infrastructure, so correctness and fail-closed behavior matter more than speed.
 ## Development setup
 
 - **Rust:** stable, pinned by `rust-toolchain.toml` (edition 2024,
-  `rust-version = 1.85`). Nothing else is required for `cargo check`.
+  `rust-version = 1.88`). Nothing else is required for `cargo check`.
 - **PAM headers** (to link the `cdylib` and run the `pam_start` tests):
 
   ```sh
