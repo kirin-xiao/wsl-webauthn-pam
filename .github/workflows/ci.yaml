@@ -238,6 +238,12 @@ jobs:
   fuzz-smoke:
     name: fuzz smoke (nightly)
     runs-on: ubuntu-latest
+    # cargo-fuzz shells out to a child `cargo`; rust-toolchain.toml pins
+    # `stable` and would override the nightly install for that child, yielding
+    # `-Zsanitizer only accepted on nightly`. RUSTUP_TOOLCHAIN wins over
+    # toolchain files for every process in the job (cargo-fuzz + its children).
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
