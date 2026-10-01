@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# The cargo-fuzz crate is its own workspace root (see fuzz/Cargo.toml); keep it out
+# of the main workspace so `cargo test`/`clippy --workspace` don't pull in the
+# nightly-only libFuzzer targets.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
