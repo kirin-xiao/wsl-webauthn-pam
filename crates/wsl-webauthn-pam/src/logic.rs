@@ -1,0 +1,533 @@
+//! The fail-closed authentication state machine (plan §8).
+//!
+//! [`authenticate`] holds the entire decision logic. It talks to libpam through a
+//! [`PamSeam`] and to the outside world (store, bridge, verifier, entropy) through a
+//! [`Deps`] trait, so it is exercised end-to-end by unit tests with fakes and can be
+//! audited as one linear function.
+//!
+//! [`run`] adds argument parsing, panic containment, and the `pam_fail_delay`
+//! request; the exported `pam_sm_*` symbols are thin wrappers over it.
+//!
+//! # Fail-closed rule
+//!
+//! There is exactly one way to return [`PAM_SUCCESS`]: a fully verified assertion.
+//! Every other path returns a specific failure code from the crate root's mapping
+//! table. No error is swallowed into success.
+
+use std::path::Path;
+use std::time::{Duration, SystemTime};
+
+use wsl_webauthn_protocol::{
+    BridgeError, ClientDataKind, ORIGIN, RP_ID, b64u_decode, b64u_encode, build_client_data,
+};
+use wsl_webauthn_runner::{AssertParams, RunnerError, RunnerResponse};
+use wsl_webauthn_store::{Config, CredentialRecord, StoreError};
+use wsl_webauthn_verifier::{AssertionCheck, verify_assertion};
+
+use crate::args::ModuleArgs;
+use crate::bindings::{
+    LOG_CRIT, LOG_ERR, LOG_INFO, PAM_ABORT, PAM_AUTH_ERR, PAM_AUTHINFO_UNAVAIL, PAM_SILENT,
+    PAM_SUCCESS, PAM_TEXT_INFO, PAM_USER_UNKNOWN,
+};
+use crate::logger;
+use crate::seam::PamSeam;
+
+/// Failure delay requested on every failure path (2 s; plan §3/§8, CR-14).
+pub const FAIL_DELAY_USEC: u32 = 2_000_000;
+
+/// The result of one authentication attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthOutcome {
+    /// A verified assertion.
+    Success {
+        /// The authenticator's asserted signature counter (logged, not persisted here).
+        sign_count: u32,
+    },
+    /// A failure with the PAM code to return to libpam.
+    Failure {
+        /// The PAM return code.
+        code: i32,
+        /// Human-readable reason, already logged.
+        reason: String,
+    },
+}
+
+impl AuthOutcome {
+    /// The PAM code this outcome maps to.
+    pub fn code(&self) -> i32 {
+        match self {
+            AuthOutcome::Success { .. } => PAM_SUCCESS,
+            AuthOutcome::Failure { code, .. } => *code,
+        }
+    }
+}
+
+/// Everything the state machine needs from beyond the seam.
+///
+/// Production wires these to [`wsl_webauthn_store::Store::system`] and
+/// [`wsl_webauthn_runner::Runner`]; tests substitute deterministic fakes.
+pub trait Deps {
+    /// Load `/etc/wsl_webauthn/config`.
+    fn load_config(&self) -> Result<Config, StoreError>;
+    /// Load the credential record for `username`.
+    fn load_record(&self, username: &str) -> Result<CredentialRecord, StoreError>;
+    /// SHA-256 of the file at `path`.
+    fn sha256_file(&self, path: &Path) -> Result<[u8; 32], String>;
+    /// Fill `dest` with cryptographically secure random bytes.
+    fn fill_random(&self, dest: &mut [u8]);
+    /// Run the `assert` ceremony against the bridge under a hard deadline.
+    fn authenticate(
+        &self,
+        bridge: &Path,
+        win_mnt: &Path,
+        params: AssertParams,
+        deadline: Duration,
+    ) -> Result<RunnerResponse, RunnerError>;
+    /// Test-only panic injection point (production is a no-op).
+    fn panic_probe(&self);
+
+    /// Test-only override for the assertion clock; production uses the wall clock.
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+}
+
+/// Build a [`Deps`] driven by the real store and runner.
+#[derive(Debug, Default)]
+pub struct SystemDeps;
+
+impl SystemDeps {
+    /// Construct the production dependency bundle.
+    pub fn new() -> SystemDeps {
+        SystemDeps
+    }
+}
+
+impl Deps for SystemDeps {
+    fn load_config(&self) -> Result<Config, StoreError> {
+        wsl_webauthn_store::Store::system().load_config()
+    }
+    fn load_record(&self, username: &str) -> Result<CredentialRecord, StoreError> {
+        wsl_webauthn_store::Store::system().load(username)
+    }
+    fn sha256_file(&self, path: &Path) -> Result<[u8; 32], String> {
+        sha256_file(path)
+    }
+    fn fill_random(&self, dest: &mut [u8]) {
+        use rand::RngCore as _;
+        rand::rngs::OsRng.fill_bytes(dest);
+    }
+    fn authenticate(
+        &self,
+        bridge: &Path,
+        win_mnt: &Path,
+        params: AssertParams,
+        deadline: Duration,
+    ) -> Result<RunnerResponse, RunnerError> {
+        wsl_webauthn_runner::Runner::new(bridge, win_mnt).authenticate(params, deadline)
+    }
+    fn panic_probe(&self) {}
+}
+
+/// Hash a file with SHA-256, streaming so an arbitrarily large bridge executable is
+/// never held in memory.
+fn sha256_file(path: &Path) -> Result<[u8; 32], String> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+
+    let file = std::fs::File::open(path).map_err(|e| format!("open {path:?}: {e}"))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| format!("read {path:?}: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    Ok(out)
+}
+
+/// Map a bridge ceremony error to a PAM code (plan §8 mapping table).
+///
+/// The plan is explicit: only `user_cancelled` is an authentication failure; every
+/// other taxonomy entry means the underlying service could not authenticate
+/// information, which is `PAM_AUTHINFO_UNAVAIL`.
+fn bridge_error_code(error: BridgeError) -> i32 {
+    match error {
+        BridgeError::UserCancelled => PAM_AUTH_ERR,
+        BridgeError::Timeout
+        | BridgeError::NotAvailable
+        | BridgeError::NotSupported
+        | BridgeError::Busy
+        | BridgeError::InvalidParameter
+        | BridgeError::Internal => PAM_AUTHINFO_UNAVAIL,
+    }
+}
+
+fn bridge_error_name(error: BridgeError) -> &'static str {
+    match error {
+        BridgeError::NotAvailable => "not_available",
+        BridgeError::NotSupported => "not_supported",
+        BridgeError::UserCancelled => "user_cancelled",
+        BridgeError::Timeout => "timeout",
+        BridgeError::Busy => "busy",
+        BridgeError::InvalidParameter => "invalid_parameter",
+        BridgeError::Internal => "internal",
+    }
+}
+
+/// Log and construct a failure outcome.
+fn fail(code: i32, reason: impl Into<String>) -> AuthOutcome {
+    let reason = reason.into();
+    logger::auth(LOG_ERR, &format!("authentication failed: {reason}"));
+    AuthOutcome::Failure { code, reason }
+}
+
+/// Run the authentication state machine. May panic only through [`Deps::panic_probe`]
+/// (test injection); production never panics.
+pub fn authenticate<S: PamSeam, D: Deps>(
+    seam: &mut S,
+    deps: &D,
+    flags: i32,
+    args: &ModuleArgs,
+) -> AuthOutcome {
+    let silent = (flags & PAM_SILENT) != 0;
+    // Test-only injection point just inside the guarded region.
+    deps.panic_probe();
+
+    // --- 1. Username -----------------------------------------------------
+    let username = match seam.get_user_name() {
+        Ok(name) if !name.is_empty() => name,
+        Ok(_) => return fail(PAM_USER_UNKNOWN, "pam_get_user returned an empty name"),
+        Err(e) => return fail(PAM_USER_UNKNOWN, format!("pam_get_user failed: {e:?}")),
+    };
+    if let Err(e) = wsl_webauthn_store::validate_username(&username) {
+        return fail(PAM_USER_UNKNOWN, format!("invalid user name: {e}"));
+    }
+
+    // --- 2. Config -------------------------------------------------------
+    let config = match deps.load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            return fail(
+                PAM_AUTHINFO_UNAVAIL,
+                format!("configuration unavailable: {e}"),
+            );
+        }
+    };
+
+    // --- 3. Credential record -------------------------------------------
+    let record = match deps.load_record(&username) {
+        Ok(r) => r,
+        Err(StoreError::NotFound { .. }) => {
+            return fail(PAM_USER_UNKNOWN, "no credential enrolled for user");
+        }
+        Err(e) => {
+            return fail(PAM_AUTHINFO_UNAVAIL, format!("credential store error: {e}"));
+        }
+    };
+    // Defense in depth: a record whose pinned RP/origin do not match this build can
+    // never verify (the verifier checks clientData against the same constants), so
+    // fail fast with an unavailable service rather than a generic auth error.
+    if record.rp_id != RP_ID || record.origin != ORIGIN {
+        return fail(
+            PAM_AUTHINFO_UNAVAIL,
+            "credential record RP ID/origin does not match this module build (re-enroll)",
+        );
+    }
+    let credential_id = match b64u_decode(&record.credential_id) {
+        Ok(v) if !v.is_empty() => v,
+        Ok(_) => return fail(PAM_AUTHINFO_UNAVAIL, "credential id is empty"),
+        Err(e) => {
+            return fail(
+                PAM_AUTHINFO_UNAVAIL,
+                format!("credential id is not base64url: {e}"),
+            );
+        }
+    };
+    let cose_public_key = match b64u_decode(&record.cose_public_key) {
+        Ok(v) if !v.is_empty() => v,
+        Ok(_) => return fail(PAM_AUTHINFO_UNAVAIL, "COSE public key is empty"),
+        Err(e) => {
+            return fail(
+                PAM_AUTHINFO_UNAVAIL,
+                format!("COSE public key is not base64url: {e}"),
+            );
+        }
+    };
+
+    // --- 4. Bridge executable pin (plan D11) -----------------------------
+    let bridge_path = config.bridge_path.as_path();
+    if record.bridge_path != config.bridge_path.to_string_lossy() {
+        logger::debug(&format!(
+            "record bridge_path {:?} differs from configured {:?}",
+            record.bridge_path, config.bridge_path
+        ));
+    }
+    if args.noverifypin {
+        logger::auth(
+            LOG_ERR,
+            "noverifypin: bridge executable SHA-256 pin check DISABLED by configuration",
+        );
+    } else {
+        let expected = match decode_hex32(&record.bridge_sha256) {
+            Some(v) => v,
+            None => {
+                return fail(
+                    PAM_AUTHINFO_UNAVAIL,
+                    "recorded bridge_sha256 is not a 32-byte lowercase hex digest",
+                );
+            }
+        };
+        match deps.sha256_file(bridge_path) {
+            Ok(actual) if actual == expected => {}
+            Ok(_) => {
+                return fail(
+                    PAM_AUTHINFO_UNAVAIL,
+                    format!(
+                        "bridge executable {bridge_path:?} failed its SHA-256 pin check \
+                         (possible tampering); refusing to launch"
+                    ),
+                );
+            }
+            Err(e) => {
+                return fail(
+                    PAM_AUTHINFO_UNAVAIL,
+                    format!("bridge executable {bridge_path:?} unreadable for pin check: {e}"),
+                );
+            }
+        }
+    }
+
+    // --- 5. Challenge + clientDataJSON -----------------------------------
+    let mut challenge = [0u8; 32];
+    deps.fill_random(&mut challenge);
+    let client_data_json = match build_client_data(ClientDataKind::Get, &challenge) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return fail(
+                PAM_AUTHINFO_UNAVAIL,
+                format!("could not build clientDataJSON: {e}"),
+            );
+        }
+    };
+
+    // --- 6. Optional consent pre-prompt (SR-11) --------------------------
+    // Windows Hello shows the RP ID, not RP_NAME; this conversation message is the
+    // primary consent-naming mechanism. It is best-effort: a missing or failing
+    // conversation never blocks authentication.
+    if !silent && seam.conv_available() {
+        let service = seam.get_service().unwrap_or_else(|| "?".to_string());
+        let text = format!(
+            "Windows Hello: authenticating '{service}' for Linux user {username} \
+             \u{2014} check the Windows prompt"
+        );
+        if let Err(e) = seam.conv_text(PAM_TEXT_INFO, &text) {
+            logger::debug(&format!("conversation info message not delivered: {e:?}"));
+        }
+    }
+
+    // --- 7. Bridge ceremony ----------------------------------------------
+    let deadline = Duration::from_secs(args.deadline_secs(config.timeout_secs));
+    let params = AssertParams::new(
+        b64u_encode(&client_data_json),
+        vec![b64u_encode(&credential_id)],
+    );
+    logger::debug(&format!(
+        "running assertion for user {username} via {bridge_path:?} (deadline {deadline:?})"
+    ));
+    let response = match deps.authenticate(bridge_path, &config.win_mnt, params, deadline) {
+        Ok(r) => r,
+        Err(e) => {
+            return fail(
+                PAM_AUTHINFO_UNAVAIL,
+                format!("bridge transport failure: {e}"),
+            );
+        }
+    };
+
+    // --- 8. Response handling --------------------------------------------
+    match response {
+        RunnerResponse::Assert { .. } => {
+            // 8a. echo consistency (ASSERTION v6 bonus).
+            match response.decode_client_data_json_echo() {
+                Ok(Some(echo)) => {
+                    if echo != client_data_json {
+                        return fail(
+                            PAM_AUTH_ERR,
+                            "clientDataJSON echo from bridge does not match the request",
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return fail(PAM_AUTH_ERR, format!("malformed clientDataJSON echo: {e}"));
+                }
+            }
+            // 8b. decode + validate the credential id.
+            match response.decode_credential_id() {
+                Ok(id) if id == credential_id => {}
+                Ok(_) => {
+                    return fail(
+                        PAM_AUTH_ERR,
+                        "bridge returned a different credential id than requested",
+                    );
+                }
+                Err(e) => {
+                    return fail(PAM_AUTH_ERR, format!("malformed credential id: {e}"));
+                }
+            }
+            let authenticator_data = match response.decode_authenticator_data() {
+                Ok(v) => v,
+                Err(e) => return fail(PAM_AUTH_ERR, format!("malformed authenticator data: {e}")),
+            };
+            let signature = match response.decode_signature() {
+                Ok(v) => v,
+                Err(e) => return fail(PAM_AUTH_ERR, format!("malformed signature: {e}")),
+            };
+
+            // 8c. cryptographic verification.
+            let check = AssertionCheck {
+                expected_challenge: &challenge,
+                credential_id: &credential_id,
+                cose_public_key: &cose_public_key,
+                client_data_json: &client_data_json,
+                authenticator_data: &authenticator_data,
+                signature: &signature,
+                expected_sign_count: Some(record.sign_count),
+                now: deps.now(),
+            };
+            match verify_assertion(&check) {
+                Ok(outcome) => {
+                    // The PAM module does NOT persist the counter: the record stays
+                    // authoritative for enrollment-time data and the counter is
+                    // advisory (Windows Hello reports zero). A follow-up may persist it.
+                    logger::debug(&format!(
+                        "assertion verified (observed sign_count {})",
+                        outcome.sign_count
+                    ));
+                    logger::auth(
+                        LOG_INFO,
+                        &format!(
+                            "authentication succeeded for user {username} (sign_count {})",
+                            outcome.sign_count
+                        ),
+                    );
+                    AuthOutcome::Success {
+                        sign_count: outcome.sign_count,
+                    }
+                }
+                Err(e) => fail(PAM_AUTH_ERR, format!("assertion verification failed: {e}")),
+            }
+        }
+        RunnerResponse::Error(error) => {
+            let code = bridge_error_code(error);
+            fail(
+                code,
+                format!("bridge ceremony error: {}", bridge_error_name(error)),
+            )
+        }
+        RunnerResponse::Probe { .. } | RunnerResponse::Enroll { .. } => fail(
+            PAM_AUTH_ERR,
+            "bridge returned an unexpected response variant for an assertion",
+        ),
+    }
+}
+
+/// Parse module arguments, contain panics, and map the outcome to a PAM code.
+///
+/// On failure this requests `pam_fail_delay` (2 s) *before* returning.
+pub fn run<S: PamSeam, D: Deps>(seam: &mut S, deps: &D, flags: i32, raw_args: &[String]) -> i32 {
+    let args = crate::args::parse(raw_args);
+    logger::set_debug(args.debug);
+    logger::debug(&format!(
+        "pam_sm_authenticate invoked (flags {flags:#x}, args {args:?})"
+    ));
+
+    let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        authenticate(seam, deps, flags, &args)
+    })) {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            logger::auth(
+                LOG_CRIT,
+                "panic while authenticating; returning PAM_ABORT (fail closed)",
+            );
+            return PAM_ABORT;
+        }
+    };
+
+    match outcome {
+        AuthOutcome::Success { .. } => PAM_SUCCESS,
+        AuthOutcome::Failure { code, .. } => {
+            seam.fail_delay(FAIL_DELAY_USEC);
+            code
+        }
+    }
+}
+
+/// Decode a lowercase hex 32-byte digest.
+fn decode_hex32(s: &str) -> Option<[u8; 32]> {
+    let bytes = s.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let hi = hex_nibble(bytes[2 * i])?;
+        let lo = hex_nibble(bytes[2 * i + 1])?;
+        *byte = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+// Keep `SeamError` referenced from the trait contract documentation without importing
+// it into the value namespace.
+#[allow(unused_imports)]
+use crate::seam::SeamError as _SeamError;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bridge_error_mapping_matches_plan_table() {
+        assert_eq!(bridge_error_code(BridgeError::UserCancelled), PAM_AUTH_ERR);
+        for e in [
+            BridgeError::Timeout,
+            BridgeError::NotAvailable,
+            BridgeError::NotSupported,
+            BridgeError::Busy,
+            BridgeError::InvalidParameter,
+            BridgeError::Internal,
+        ] {
+            assert_eq!(bridge_error_code(e), PAM_AUTHINFO_UNAVAIL, "{e:?}");
+        }
+    }
+
+    #[test]
+    fn hex_decode_round_trip() {
+        let digest = [0xabu8; 32];
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(decode_hex32(&hex), Some(digest));
+        assert_eq!(decode_hex32(&hex.to_uppercase()), Some(digest));
+        assert_eq!(decode_hex32("short"), None);
+        assert_eq!(decode_hex32(&"z".repeat(64)), None);
+    }
+}
