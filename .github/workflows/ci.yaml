@@ -267,9 +267,12 @@ jobs:
     #
     # cargo-fuzz 0.13.2 has no `--locked` pass-through to its child `cargo`, so
     # reproducibility is enforced by the committed `fuzz/Cargo.lock` plus
-    # CARGO_NET_OFFLINE=1 on the build/run steps (not on `cargo install`):
-    # cargo must satisfy the build from the locked graph and the local registry
-    # cache, and fails rather than silently re-resolving.
+    # CARGO_NET_OFFLINE=1 on the build/run steps. The dependency graph is
+    # fetched *online* first (`cargo fetch --locked`, which itself validates the
+    # lock) so the build/run steps are guaranteed to have a populated registry
+    # cache; on a cold runner the offline build would otherwise be unable to
+    # download the fuzz workspace's deps (libfuzzer-sys, rsa, p256, …) since
+    # `cargo install cargo-fuzz` above only fetches cargo-fuzz's own.
     env:
       RUSTUP_TOOLCHAIN: nightly
     steps:
@@ -299,6 +302,15 @@ jobs:
       - name: Install cargo-fuzz
         if: steps.detect.outputs.present == 'true'
         run: cargo install cargo-fuzz --version 0.13.2 --locked
+
+      # Populate the registry cache from the committed lock *before* switching
+      # to offline mode. `cargo install` above only fetched cargo-fuzz's own
+      # deps; without this, the offline build/run on a cold runner (or any
+      # cache miss) cannot download the fuzz workspace's graph and fails.
+      - name: Fetch fuzz dependencies (online, locked)
+        if: steps.detect.outputs.present == 'true'
+        working-directory: fuzz
+        run: cargo fetch --locked
 
       - name: cargo fuzz build (all targets)
         if: steps.detect.outputs.present == 'true'
