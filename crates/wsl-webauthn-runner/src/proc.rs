@@ -45,9 +45,12 @@ pub(crate) fn set_nonblocking(fd: RawFd) -> io::Result<()> {
 /// errors to `Err`. `EINTR` is reported as an error with `ErrorKind::Interrupted` so the
 /// caller can simply retry.
 pub(crate) fn poll(fds: &mut [libc::pollfd], timeout_ms: i32) -> io::Result<usize> {
+    // `nfds_t` may be narrower than `usize` on some targets; never narrow silently.
+    let nfds =
+        libc::nfds_t::try_from(fds.len()).expect("poll descriptor count always fits in nfds_t");
     // SAFETY: `fds` is a valid mutable slice of pollfd; nfds matches its length; the
     // kernel only writes readiness flags into the slice.
-    let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+    let rc = unsafe { libc::poll(fds.as_mut_ptr(), nfds, timeout_ms) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
