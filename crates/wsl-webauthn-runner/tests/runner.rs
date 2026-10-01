@@ -255,9 +255,100 @@ fn nonzero_exit_is_bridge_failed() {
     let dir = cwd_dir();
     let r = build_runner(dir.path(), &["exit=3"]);
     match r.probe(Duration::from_secs(5)).unwrap_err() {
-        RunnerError::BridgeFailed { code } => assert_eq!(code, Some(3)),
+        RunnerError::BridgeFailed { code, message } => {
+            assert_eq!(code, Some(3));
+            // L8-4: exit code 3 is documented as a bad-frame request failure.
+            assert!(
+                message.contains("malformed") || message.contains("request frame"),
+                "{message}"
+            );
+        }
         other => panic!("expected BridgeFailed, got {other:?}"),
     }
+}
+
+/// L8-4: each documented bridge exit code (3/4/5) is classified, not collapsed.
+#[test]
+fn bridge_exit_codes_map_to_documented_meaning() {
+    for (code, needle) in [(3, "request frame"), (4, "`op`"), (5, "stdout write")] {
+        let dir = cwd_dir();
+        let r = build_runner(dir.path(), &[&format!("exit={code}")]);
+        match r.probe(Duration::from_secs(5)).unwrap_err() {
+            RunnerError::BridgeFailed { code: got, message } => {
+                assert_eq!(got, Some(code));
+                assert!(message.contains(needle), "exit {code}: {message}");
+            }
+            other => panic!("expected BridgeFailed for exit {code}, got {other:?}"),
+        }
+    }
+}
+
+/// L8-4: the bridge's stderr tail (its HRESULT/error line) is folded into the failure
+/// diagnostic instead of being discarded.
+#[test]
+fn bridge_failed_carries_stderr_tail() {
+    let dir = cwd_dir();
+    let r = build_runner(dir.path(), &["hresult=0x80070005", "exit=3"]);
+    match r.probe(Duration::from_secs(5)).unwrap_err() {
+        RunnerError::BridgeFailed { message, .. } => {
+            assert!(message.contains("0x80070005"), "{message}");
+            assert!(message.contains("hr="), "{message}");
+        }
+        other => panic!("expected BridgeFailed, got {other:?}"),
+    }
+}
+
+/// L8-3: a ceremony error on a healthy transport (exit 0) still exposes the bridge's
+/// HRESULT line via `RunnerExchange::bridge_stderr`.
+#[test]
+fn ceremony_error_exposes_bridge_stderr_diagnostic() {
+    let dir = cwd_dir();
+    let r = build_runner(dir.path(), &["ok", "err=internal", "hresult=0x80070005"]);
+    let exchange = r
+        .authenticate_with_diagnostics(assert_params(), Duration::from_secs(5))
+        .expect("transport ok");
+    assert_eq!(
+        exchange.response,
+        RunnerResponse::Error(BridgeError::Internal)
+    );
+    let diag = exchange.bridge_stderr.expect("stderr tail retained");
+    assert!(diag.contains("0x80070005"), "{diag}");
+}
+
+/// L8-4: the stderr tail is also attached to a malformed-frame transport failure.
+#[test]
+fn transport_failure_carries_stderr_tail() {
+    let dir = cwd_dir();
+    let r = build_runner(dir.path(), &["hresult=0x80070005", "garbage=1"]);
+    match r.probe(Duration::from_secs(5)).unwrap_err() {
+        RunnerError::Transport { message } => {
+            assert!(
+                message.contains("frame") || message.contains("JSON"),
+                "{message}"
+            );
+            assert!(message.contains("0x80070005"), "{message}");
+        }
+        other => panic!("expected Transport, got {other:?}"),
+    }
+}
+
+/// Hostile child output cannot smuggle NULs/newlines into the diagnostic string.
+#[test]
+fn stderr_diagnostic_escapes_control_bytes() {
+    let dir = cwd_dir();
+    // The filler bytes include NUL-adjacent controls and newlines; they must be escaped
+    // or collapsed, never passed through raw.
+    let r = build_runner(dir.path(), &["stderrflood=256", "exit=3"]);
+    let err = r.probe(Duration::from_secs(5)).unwrap_err();
+    let rendered = err.to_string();
+    assert!(
+        !rendered.contains('\0'),
+        "diagnostic must never carry a raw NUL"
+    );
+    assert!(
+        !rendered.contains('\n'),
+        "diagnostic must be a single line: {rendered:?}"
+    );
 }
 
 #[test]

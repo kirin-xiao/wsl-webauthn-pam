@@ -62,6 +62,14 @@ pub const DEFAULT_ASSERT_TIMEOUT_MS: u32 = wsl_webauthn_protocol::BRIDGE_AUTH_TI
 /// Maximum bytes of the child's stderr we retain (bounded capture).
 pub const MAX_STDERR_BYTES: usize = 4 * 1024;
 
+/// Maximum bytes of the retained stderr tail that is folded into an error diagnostic.
+///
+/// Deliberately much smaller than [`MAX_STDERR_BYTES`]: the bridge writes its Windows PID
+/// as the first stderr line on every run, followed by at most a few diagnostic lines (an
+/// HRESULT/error name). A short tail keeps syslog records and PAM reason strings bounded
+/// while still carrying the useful line.
+pub const STDERR_DIAGNOSTIC_BYTES: usize = 512;
+
 /// `taskkill.exe` escalation budget after a Linux-side timeout.
 pub const TASKKILL_BUDGET: Duration = Duration::from_secs(5);
 
@@ -106,10 +114,16 @@ pub enum RunnerError {
         source: std::io::Error,
     },
     /// The child exited non-zero (transport failure per the process contract).
-    #[error("bridge exited with status {code:?}")]
+    ///
+    /// `code` carries the raw exit status; `message` is the pre-composed human-readable
+    /// description: the documented meaning of the exit code plus a bounded, sanitized
+    /// tail of the child's stderr (the bridge's HRESULT/error line, when present).
+    #[error("{message}")]
     BridgeFailed {
         /// The exit code, or `None` if the child was terminated by a signal.
         code: Option<i32>,
+        /// Exit-code meaning plus the bounded stderr tail, ready for a log line.
+        message: String,
     },
     /// Malformed framing, unexpected EOF, oversize response, or an IO failure mid-stream.
     #[error("bridge transport error: {message}")]
@@ -179,6 +193,24 @@ pub enum RunnerResponse {
     },
     /// A ceremony failure delivered on a healthy transport.
     Error(BridgeError),
+}
+
+/// A decoded bridge response together with bounded diagnostics from the same exchange.
+///
+/// On an `ok:false` ceremony failure the bridge writes its Windows HRESULT/error line to
+/// **stderr** and then exits `0` with a well-formed frame on stdout. The plain
+/// [`RunnerResponse`] carries only the coarse taxonomy, so callers that want the HRESULT
+/// (the PAM logger) use [`Runner::authenticate_with_diagnostics`] and log
+/// [`RunnerExchange::bridge_stderr`].
+///
+/// `bridge_stderr` is a NUL/control-escaped tail of at most [`STDERR_DIAGNOSTIC_BYTES`]
+/// bytes; it is `None` when the child wrote nothing to stderr.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerExchange {
+    /// The decoded response (ceremony result or error).
+    pub response: RunnerResponse,
+    /// Sanitized, bounded stderr tail from the exchange, if any.
+    pub bridge_stderr: Option<String>,
 }
 
 /// Errors from decoding b64url fields of a [`RunnerResponse`].
@@ -363,6 +395,7 @@ impl Runner {
             },
             deadline,
         )
+        .map(|exchange| exchange.response)
     }
 
     /// Enroll a credential, using the caller-supplied [`EnrollParams`].
@@ -382,6 +415,7 @@ impl Runner {
             },
             deadline,
         )
+        .map(|exchange| exchange.response)
     }
 
     /// Produce an assertion, using the caller-supplied [`AssertParams`].
@@ -398,10 +432,33 @@ impl Runner {
             },
             deadline,
         )
+        .map(|exchange| exchange.response)
+    }
+
+    /// Like [`Runner::authenticate`], but also returns the bounded bridge-stderr tail.
+    ///
+    /// The bridge reports an `internal` (or other) ceremony failure as an `ok:false`
+    /// frame with exit `0`, writing its HRESULT/error line to stderr. That diagnostic is
+    /// otherwise discarded on the success path; this variant carries it so an audit
+    /// logger can record it. All authentication *decisions* still come from
+    /// [`RunnerExchange::response`]; `bridge_stderr` is diagnostic only.
+    pub fn authenticate_with_diagnostics(
+        &self,
+        params: AssertParams,
+        deadline: Duration,
+    ) -> Result<RunnerExchange, RunnerError> {
+        self.run(
+            Request::Assert {
+                client_data_json: params.client_data_json,
+                allow_credentials: params.allow_credentials,
+                timeout_ms: params.timeout_ms,
+            },
+            deadline,
+        )
     }
 
     /// Run one request/response exchange against the bridge.
-    fn run(&self, request: Request, deadline: Duration) -> Result<RunnerResponse, RunnerError> {
+    fn run(&self, request: Request, deadline: Duration) -> Result<RunnerExchange, RunnerError> {
         self.preflight()?;
 
         let payload = serde_json::to_vec(&request).map_err(|e| RunnerError::Transport {
@@ -441,9 +498,7 @@ impl Runner {
                 let status = guard.try_wait().ok().flatten();
                 guard.kill_and_reap();
                 return Err(match status {
-                    Some(status) if !status.success() => RunnerError::BridgeFailed {
-                        code: status.code(),
-                    },
+                    Some(status) if !status.success() => bridge_failed(status.code(), &[]),
                     _ => e,
                 });
             }
@@ -571,7 +626,7 @@ impl Runner {
         stdout: std::process::ChildStdout,
         stderr: std::process::ChildStderr,
         deadline: Duration,
-    ) -> Result<RunnerResponse, RunnerError> {
+    ) -> Result<RunnerExchange, RunnerError> {
         match drive_child(
             guard,
             stdout,
@@ -580,7 +635,11 @@ impl Runner {
             MAX_RESPONSE_BYTES + 4, // frame prefix + payload
             MAX_STDERR_BYTES,
         ) {
-            DriveOutcome::Exited { status, stdout, .. } => self.finish(status, &stdout),
+            DriveOutcome::Exited {
+                status,
+                stdout,
+                stderr,
+            } => self.finish(status, &stdout, &stderr),
             DriveOutcome::TimedOut { stderr } => self.deadline_error(deadline, &stderr),
             DriveOutcome::StdoutOverflow => Err(RunnerError::Transport {
                 message: format!("response exceeds {MAX_RESPONSE_BYTES} bytes"),
@@ -590,24 +649,30 @@ impl Runner {
     }
 
     /// Interpret a fully-drained child: parse the response or map the exit status.
-    fn finish(&self, status: ExitStatus, out_buf: &[u8]) -> Result<RunnerResponse, RunnerError> {
+    ///
+    /// `err_buf` is the bounded stderr captured during the same exchange. It is folded
+    /// into transport/bridge-failure diagnostics (the bridge's HRESULT line lives there)
+    /// and returned alongside a successful ceremony response so a caller can log it.
+    fn finish(
+        &self,
+        status: ExitStatus,
+        out_buf: &[u8],
+        err_buf: &[u8],
+    ) -> Result<RunnerExchange, RunnerError> {
         // Non-zero exit is a transport failure even if bytes happen to parse.
         if !status.success() {
-            return Err(RunnerError::BridgeFailed {
-                code: status.code(),
-            });
+            return Err(bridge_failed(status.code(), err_buf));
         }
 
         let mut cursor = std::io::Cursor::new(out_buf);
-        let payload =
-            read_frame(&mut cursor, MAX_RESPONSE_BYTES).map_err(|e| RunnerError::Transport {
-                message: format!("reading response frame: {e}"),
-            })?;
-        let response: Response =
-            serde_json::from_slice(&payload).map_err(|e| RunnerError::Transport {
-                message: format!("parsing response JSON: {e}"),
-            })?;
-        Ok(runner_response(response))
+        let payload = read_frame(&mut cursor, MAX_RESPONSE_BYTES)
+            .map_err(|e| transport_with_stderr(format!("reading response frame: {e}"), err_buf))?;
+        let response: Response = serde_json::from_slice(&payload)
+            .map_err(|e| transport_with_stderr(format!("parsing response JSON: {e}"), err_buf))?;
+        Ok(RunnerExchange {
+            response: runner_response(response),
+            bridge_stderr: stderr_tail(err_buf, STDERR_DIAGNOSTIC_BYTES),
+        })
     }
 
     /// Deadline expired: the child has already been killed and reaped by the [`ChildGuard`]
@@ -616,7 +681,7 @@ impl Runner {
         &self,
         deadline: Duration,
         err_buf: &[u8],
-    ) -> Result<RunnerResponse, RunnerError> {
+    ) -> Result<RunnerExchange, RunnerError> {
         let windows_pid = parse_pid_line(err_buf);
         let taskkill_attempted = match windows_pid {
             Some(pid) => {
@@ -785,6 +850,76 @@ fn runner_response(response: Response) -> RunnerResponse {
             client_data_json_echo,
         },
         Response::Error { error, .. } => RunnerResponse::Error(error),
+    }
+}
+
+/// Documented meaning of a bridge exit code (see the bridge process contract).
+fn bridge_exit_meaning(code: Option<i32>) -> &'static str {
+    match code {
+        Some(3) => {
+            "malformed/oversized/truncated request frame or invalid request body \
+             (bridge transport failure)"
+        }
+        Some(4) => {
+            "valid JSON object whose `op` is not probe/enroll/assert (bridge transport failure)"
+        }
+        Some(5) => {
+            "stdout write/flush failure while emitting the response (bridge transport failure)"
+        }
+        Some(_) => "unrecognized bridge transport failure",
+        None => "bridge terminated by signal before writing a response",
+    }
+}
+
+/// Build a [`RunnerError::BridgeFailed`] carrying the exit-code meaning and stderr tail.
+fn bridge_failed(code: Option<i32>, err_buf: &[u8]) -> RunnerError {
+    let mut message = format!(
+        "bridge exited with status {code:?}: {}",
+        bridge_exit_meaning(code)
+    );
+    if let Some(tail) = stderr_tail(err_buf, STDERR_DIAGNOSTIC_BYTES) {
+        message.push_str(" (stderr: ");
+        message.push_str(&tail);
+        message.push(')');
+    }
+    RunnerError::BridgeFailed { code, message }
+}
+
+/// Attach the bounded stderr tail to a transport error message.
+fn transport_with_stderr(message: String, err_buf: &[u8]) -> RunnerError {
+    match stderr_tail(err_buf, STDERR_DIAGNOSTIC_BYTES) {
+        Some(tail) => RunnerError::Transport {
+            message: format!("{message} (bridge stderr: {tail})"),
+        },
+        None => RunnerError::Transport { message },
+    }
+}
+
+/// Render at most `cap` bytes of the child's stderr as a single-line, NUL/control-escaped
+/// diagnostic string.
+///
+/// The stderr text is attacker-influenced (child output), so bytes that could corrupt a
+/// syslog record or the PAM reason string are escaped: newlines collapse to ` | ` and any
+/// other non-printable character becomes a visible `\u{..}` escape. Returns `None` for an
+/// empty (or all-whitespace) tail so callers can omit the diagnostic entirely.
+fn stderr_tail(bytes: &[u8], cap: usize) -> Option<String> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let slice = &bytes[..bytes.len().min(cap)];
+    let mut out = String::with_capacity(slice.len());
+    for ch in String::from_utf8_lossy(slice).chars() {
+        match ch {
+            '\n' | '\r' => out.push_str(" | "),
+            c if c == '\t' || (' '..='~').contains(&c) => out.push(c),
+            c => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+        }
+    }
+    let trimmed = out.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
     }
 }
 

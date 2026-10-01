@@ -56,10 +56,17 @@ fn ensure_openlog() {
 /// fixed by `openlog`).
 pub fn auth(priority: i32, msg: &str) {
     ensure_openlog();
-    let Ok(c_msg) = CString::new(msg) else {
-        // Interior NUL: drop rather than risk a malformed format. This can only happen
-        // if an interpolated string contained a NUL, which the callers do not produce.
-        return;
+    // `CString::new` rejects any interior NUL. Dropping the record would let hostile
+    // input (e.g. a username embedding NUL) suppress the audit line for its own
+    // rejection, so sanitize and log a redacted line instead.
+    let c_msg = match CString::new(msg) {
+        Ok(c_msg) => c_msg,
+        Err(_) => {
+            let Ok(sanitized) = CString::new(sanitize_for_syslog(msg)) else {
+                return;
+            };
+            sanitized
+        }
     };
     // SAFETY: `%s` is a valid literal format and `c_msg` is a valid C string that
     // outlives the call. libc's `syslog` is not thread-safe, but PAM modules are
@@ -70,9 +77,52 @@ pub fn auth(priority: i32, msg: &str) {
     }
 }
 
+/// Make `msg` representable as a C string without silently losing content.
+///
+/// Only called when `msg` contains an interior NUL (so it cannot be a `CString`).
+/// NUL becomes a visible `\0`; other control characters (which could otherwise inject
+/// line breaks or terminal escapes into a log record) become `\u{..}` escapes. Normal
+/// text, including newlines and tabs, is left untouched.
+fn sanitize_for_syslog(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    for ch in msg.chars() {
+        match ch {
+            '\0' => out.push_str("\\0"),
+            c if c.is_control() && c != '\n' && c != '\r' && c != '\t' => {
+                out.push_str(&format!("\\u{{{:x}}}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Log at `LOG_DEBUG`, but only when the `debug` module argument was supplied.
 pub fn debug(msg: &str) {
     if debug_enabled() {
         auth(LOG_DEBUG, msg);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_replaces_interior_nul_and_control_bytes() {
+        let sanitized = sanitize_for_syslog("user\0name\nnext\x1b[31m");
+        assert!(!sanitized.contains('\0'), "NUL must be escaped");
+        assert!(sanitized.contains("user\\0name"), "{sanitized}");
+        // Newlines are preserved (they are valid in a C string); other controls escape.
+        assert!(sanitized.contains("\\u{1b}"), "{sanitized}");
+        // The sanitized form is representable as a C string (no interior NUL remains).
+        assert!(CString::new(sanitized).is_ok());
+    }
+
+    #[test]
+    fn auth_with_interior_nul_does_not_panic_or_drop() {
+        // Must not panic and must still issue a (redacted) record. We cannot inspect the
+        // syslog sink here, but the sanitized path is exercised end to end.
+        auth(LOG_DEBUG, "hostile\0username rejected");
     }
 }

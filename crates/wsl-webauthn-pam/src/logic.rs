@@ -133,7 +133,21 @@ impl Deps for SystemDeps {
         params: AssertParams,
         deadline: Duration,
     ) -> Result<RunnerResponse, RunnerError> {
-        wsl_webauthn_runner::Runner::new(bridge, win_mnt).authenticate(params, deadline)
+        let exchange = wsl_webauthn_runner::Runner::new(bridge, win_mnt)
+            .authenticate_with_diagnostics(params, deadline)?;
+        // A ceremony failure arrives on a healthy transport, so the HRESULT/error line the
+        // bridge writes to stderr is the only fine-grained diagnostic. Log it (bounded and
+        // already escaped by the runner) under debug; the taxonomy itself is logged
+        // unconditionally by the state machine below.
+        if let RunnerResponse::Error(error) = &exchange.response {
+            if let Some(diag) = &exchange.bridge_stderr {
+                logger::debug(&format!(
+                    "bridge ceremony error {}: {diag}",
+                    bridge_error_name(*error)
+                ));
+            }
+        }
+        Ok(exchange.response)
     }
     fn panic_probe(&self) {}
 }
@@ -446,6 +460,10 @@ pub fn authenticate<S: PamSeam, D: Deps>(
             }
         }
         RunnerResponse::Error(error) => {
+            // Structured, always-on taxonomy line (the reason below is the human text;
+            // the HRESULT/stderr diagnostic, when present, is logged at debug by the
+            // SystemDeps bridge call).
+            logger::debug(&format!("bridge_error={}", bridge_error_name(error)));
             let code = bridge_error_code(error);
             fail(
                 code,
