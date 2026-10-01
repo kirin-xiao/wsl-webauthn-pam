@@ -17,7 +17,6 @@ wsl-webauthn-store = { path = "../wsl-webauthn-store" }
 wsl-webauthn-runner = { path = "../wsl-webauthn-runner" }
 wsl-webauthn-verifier = { path = "../wsl-webauthn-verifier" }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
 ciborium = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }

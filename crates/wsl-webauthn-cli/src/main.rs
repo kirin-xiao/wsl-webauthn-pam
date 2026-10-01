@@ -10,18 +10,48 @@
 //! * `status` — list enrolled users and the config summary.
 //! * `verify` — run the verifier against an in-process synthetic attestation+assertion
 //!   to prove the crypto stack works on this machine.
-//! * `install` / `uninstall` — **Wave C** (not implemented here).
+//! * `install` / `uninstall` — **Wave C** (not implemented here): they print a notice
+//!   and exit `2`.
 //!
 //! # Design notes
 //!
 //! * **Minimal dependencies.** Argument parsing is hand-rolled (no `clap`); the only
 //!   cryptography used here is for the `verify` self-test, reusing the workspace's
 //!   `p256`/`ecdsa`/`sha2`/`ciborium` (all already in `Cargo.lock`).
-//! * **Diagnostics go to stderr; stdout is human-readable status output only.**
+//! * **Diagnostics go to stderr; stdout is human-readable status output only.** The
+//!   Windows SID captured for audit is stored in the record but never printed.
 //! * Exit codes: `0` success, `1` operational failure, `2` usage error.
 //! * The `alg` field is derived from the enrolled COSE key with a tiny local CBOR
 //!   reader ([`read_cose_alg`]) rather than the verifier's `#[doc(hidden)] pub mod
 //!   testing` seam, so the CLI does not depend on a test-only API.
+//!
+//! # D3 double-enroll
+//!
+//! The first-ever enrollment for the pinned RP ID yields a `none`-attested credential
+//! from Windows (spike-confirmed). Under Strict the verifier rejects it; the CLI runs
+//! exactly one further ceremony with a **fresh** challenge and verifies that instead.
+//! The first ceremony's outcome is **discarded** and can never reach the record — the
+//! persisted `credential_id` always names the second credential. See
+//! [`enroll_with_double_enroll`].
+//!
+//! # Wave C contract (installer)
+//!
+//! The not-yet-implemented `install` subcommand (plan §10) MUST, before `enroll`/PAM can
+//! work, write:
+//!
+//! * `/etc/wsl_webauthn/config` (TOML, `0600` root:root) with `bridge_path` (absolute),
+//!   `win_mnt`, and optional `timeout_secs`;
+//! * `/etc/wsl_webauthn/credentials/` (`0700` root:root);
+//! * record files (`0600` root:root) — written later by `enroll`;
+//! * the bridge exe to
+//!   `%LOCALAPPDATA%\Programs\wsl-webauthn-pam\WSLWebAuthnBridge.exe` and pin its
+//!   SHA-256 at enrollment;
+//! * `pam_wsl_webauthn.so` and the `pam-config` profile **before** removing the legacy
+//!   module (D7: a stale reference means a load failure and lockout).
+//!
+//! The `probe`/`status`/`enroll` subcommands read that config via
+//! `wsl_webauthn_store::Store::load_config`; until it exists, `enroll` requires an
+//! explicit `--bridge`.
 
 #![deny(unsafe_code)]
 
@@ -107,6 +137,12 @@ GLOBAL:
 /// `#![deny(unsafe_code)]`); the wrappers are safe and documented. `getpwnam`/`getpwuid`
 /// return a pointer into a process-global static buffer that must not be retained, so
 /// each wrapper copies the value it needs immediately and never returns the pointer.
+///
+/// **Thread safety:** these reentrant-unsafe libc functions are not safe to call
+/// concurrently with other libc user/group lookups. The CLI is single-threaded and calls
+/// them only during startup/enrollment, before the ceremony spawns any external process;
+/// no concurrent lookup can occur. If the crate ever gains threads, switch to
+/// `getpwnam_r`/`getpwuid_r`.
 mod userdb {
     #![allow(unsafe_code)]
 
@@ -296,8 +332,25 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
             }
             Command::Verify
         }
-        "install" => Command::Install,
-        "uninstall" => Command::Uninstall { user, all },
+        "install" => {
+            if !only(&[replace, allow_unattested, yes, all])
+                || user.is_some()
+                || bridge.is_some()
+                || win_mnt.is_some()
+            {
+                return Err("`install` takes no arguments".to_string());
+            }
+            Command::Install
+        }
+        "uninstall" => {
+            if !only(&[replace, allow_unattested, yes]) || bridge.is_some() || win_mnt.is_some() {
+                return Err("`uninstall` accepts only --user/--all".to_string());
+            }
+            if user.is_some() && all {
+                return Err("`uninstall` accepts only one of --user/--all".to_string());
+            }
+            Command::Uninstall { user, all }
+        }
         other => return Err(format!("unknown subcommand {other:?}")),
     };
     Ok(Parsed::Run(cmd))
@@ -320,10 +373,21 @@ fn take_value<'a>(args: &'a [String], i: &mut usize, flag: &str) -> Result<&'a s
 // ---------------------------------------------------------------------------
 
 fn main() -> ExitCode {
-    let raw: Vec<String> = std::env::args_os()
-        .skip(1)
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
+    // Reject non-UTF-8 arguments explicitly rather than lossily converting them (the
+    // bridge learned this as SEC-018): a mangled username or path must be a clean usage
+    // error, never a silently altered argument.
+    let mut raw: Vec<String> = Vec::new();
+    for arg in std::env::args_os().skip(1) {
+        match arg.into_string() {
+            Ok(value) => raw.push(value),
+            Err(bad) => {
+                eprintln!("error: argument is not valid UTF-8: {bad:?}");
+                eprintln!();
+                eprint!("{USAGE}");
+                return ExitCode::from(EXIT_USAGE as u8);
+            }
+        }
+    }
 
     let code = match parse(&raw) {
         Err(message) => {
@@ -397,25 +461,44 @@ struct UserInfo {
 /// `SUDO_USER` is used when it names a valid local account, otherwise the real uid's
 /// passwd entry. This means `sudo wsl-webauthn-pam enroll` enrolls the user who typed
 /// `sudo`, not `root`.
+///
+/// The resolved name is validated against the store's username grammar
+/// ([`wsl_webauthn_store::validate_username`]) so an exotic `--user`/`SUDO_USER` value is
+/// rejected here with a clear message, before it could reach a path or produce a record
+/// the PAM hot path would later refuse to load.
 fn resolve_target_user(explicit: Option<String>) -> anyhow::Result<UserInfo> {
-    if let Some(name) = explicit {
+    let resolved = if let Some(name) = explicit {
         let uid = lookup_uid(&name).ok_or_else(|| anyhow!("unknown local user {name:?}"))?;
-        return Ok(UserInfo { name, uid });
-    }
-
-    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+        UserInfo { name, uid }
+    } else if let Ok(sudo_user) = std::env::var("SUDO_USER") {
         let name = sudo_user.trim();
         if !name.is_empty()
             && name != "root"
             && let Some(uid) = lookup_uid(name)
         {
-            return Ok(UserInfo {
+            UserInfo {
                 name: name.to_string(),
                 uid,
-            });
+            }
+        } else {
+            current_user()?
         }
-    }
+    } else {
+        current_user()?
+    };
 
+    wsl_webauthn_store::validate_username(&resolved.name).map_err(|_| {
+        anyhow!(
+            "username {:?} is not a valid Linux login name \
+             (the store accepts ^[A-Za-z_][A-Za-z0-9._-]{{0,31}}$)",
+            resolved.name
+        )
+    })?;
+    Ok(resolved)
+}
+
+/// Build the [`UserInfo`] for the current real uid.
+fn current_user() -> anyhow::Result<UserInfo> {
     let uid = wsl_webauthn_store::current_uid();
     let name = lookup_name(uid)
         .ok_or_else(|| anyhow!("could not resolve a username for uid {uid}; pass --user"))?;
@@ -441,6 +524,10 @@ fn lookup_name(uid: u32) -> Option<String> {
 struct BridgeConfig {
     bridge: PathBuf,
     win_mnt: PathBuf,
+    /// A non-fatal error reading the on-disk config (e.g. a read-permission failure as
+    /// a non-root user despite `--bridge`/`--win-mnt` being supplied). Surfaced by
+    /// `probe` as a warning; `enroll` folds it into its missing-bridge error.
+    config_error: Option<String>,
 }
 
 /// Resolve the bridge path and Windows mount root from flags, then the config file.
@@ -473,7 +560,7 @@ fn resolve_bridge(
     let bridge = match bridge_flag.or_else(|| config.as_ref().map(|c| c.bridge_path.clone())) {
         Some(bridge) => bridge,
         None => {
-            let detail = config_error.unwrap_or_else(|| {
+            let detail = config_error.clone().unwrap_or_else(|| {
                 format!(
                     "{} is missing (written by `install`, Wave C)",
                     store.config_path().display()
@@ -494,7 +581,11 @@ fn resolve_bridge(
         .unwrap_or_else(|| PathBuf::from(DEFAULT_WIN_MNT));
     let win_mnt = std::fs::canonicalize(&win_mnt).unwrap_or(win_mnt);
 
-    Ok(BridgeConfig { bridge, win_mnt })
+    Ok(BridgeConfig {
+        bridge,
+        win_mnt,
+        config_error,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -638,6 +729,13 @@ impl EnrollCeremony for Runner {
     }
 }
 
+/// A per-ceremony verification function (the production value is [`verify_ceremony`]).
+///
+/// This is a function pointer rather than a hard call so the double-enroll state
+/// machine's *discard* behaviour can be exercised with a scripted verifier in tests.
+type VerifyCeremony =
+    fn(&CeremonyOutcome, &AttestationPolicy) -> Result<EnrollOutcome, VerifyError>;
+
 /// Run the enrollment ceremony, implementing the D3 double-enroll quirk.
 ///
 /// The **first-ever** enrollment for the pinned RP ID returns `fmt:"none"` from Windows
@@ -646,38 +744,67 @@ impl EnrollCeremony for Runner {
 /// again. If it is still unattested we fail with a clear `--allow-unattested` hint.
 /// Under `--allow-unattested` a single ceremony suffices. Exactly one retry is attempted
 /// on every path, so this cannot loop.
+///
+/// **First-credential discard (critical).** The credential created by ceremony #1 exists
+/// on the Windows side and is *never* trusted. Its [`CeremonyOutcome`] is dropped the
+/// moment it is rejected (see [`enroll_with_verifier`]) and only the outcome returned by
+/// [`verify_ceremony`] for ceremony #2 can reach [`build_record`]; the persisted
+/// `credential_id` therefore always names the second credential.
 fn enroll_with_double_enroll(
     runner: &dyn EnrollCeremony,
     target: &UserInfo,
     policy: &AttestationPolicy,
     allow_unattested: bool,
 ) -> anyhow::Result<EnrollOutcome> {
-    let outcome = run_ceremony(runner, target)?;
-    match verify_ceremony(&outcome, policy) {
-        Ok(verified) => Ok(verified),
+    enroll_with_verifier(runner, target, policy, allow_unattested, verify_ceremony)
+}
+
+/// Implementation of [`enroll_with_double_enroll`] parameterized by the verifier.
+///
+/// `verify` is called at most twice: once on ceremony #1's outcome and, only if that is
+/// rejected with [`VerifyError::AttestationNotAllowed`], once on ceremony #2's outcome.
+fn enroll_with_verifier(
+    runner: &dyn EnrollCeremony,
+    target: &UserInfo,
+    policy: &AttestationPolicy,
+    allow_unattested: bool,
+    verify: VerifyCeremony,
+) -> anyhow::Result<EnrollOutcome> {
+    // Ceremony #1. `first` is scoped to this function and is explicitly dropped before
+    // the retry: nothing derived from it can be returned or recorded.
+    let first = run_ceremony(runner, target)?;
+    match verify(&first, policy) {
+        Ok(outcome) => return Ok(outcome),
         Err(error) if is_unattested_rejection(&error) => {
             if allow_unattested {
                 // Under AllowUnattested the verifier would have accepted it; an
                 // unattested rejection here means an unexpected policy mismatch.
                 bail!("attestation was rejected even under --allow-unattested: {error}");
             }
-            eprintln!();
-            eprintln!(
-                "First enrollment for this RP ID returned an unattested credential \
-                 (Windows Hello quirk). Retrying once with a fresh challenge…"
-            );
-            let retry = run_ceremony(runner, target)?;
-            match verify_ceremony(&retry, policy) {
-                Ok(verified) => Ok(verified),
-                Err(second) if is_unattested_rejection(&second) => bail!(
-                    "both enrollment ceremonies produced an unattested credential; this machine \
-                     has no TPM-backed Windows Hello. Re-run with --allow-unattested to accept a \
-                     self/none-attested key (less strong), or enroll a Hello PIN backed by a TPM."
-                ),
-                Err(second) => Err(anyhow!("second enrollment failed verification: {second}")),
-            }
+            // Fall through to the single retry. `first` is discarded here.
         }
-        Err(error) => Err(anyhow!("enrollment verification failed: {error}")),
+        Err(error) => return Err(anyhow!("enrollment verification failed: {error}")),
+    }
+    // Explicitly drop ceremony #1's outcome before running the retry. The first
+    // (unattested) credential must never be trusted or persisted.
+    drop(first);
+
+    eprintln!();
+    eprintln!(
+        "First enrollment for this RP ID returned an unattested credential \
+         (Windows Hello quirk). Retrying once with a fresh challenge…"
+    );
+    // Exactly one retry: there is no loop, and a transport/ceremony failure here
+    // propagates immediately via `?`.
+    let second = run_ceremony(runner, target)?;
+    match verify(&second, policy) {
+        Ok(outcome) => Ok(outcome),
+        Err(error) if is_unattested_rejection(&error) => bail!(
+            "both enrollment ceremonies produced an unattested credential; this machine \
+             has no TPM-backed Windows Hello. Re-run with --allow-unattested to accept a \
+             self/none-attested key (less strong), or enroll a Hello PIN backed by a TPM."
+        ),
+        Err(error) => Err(anyhow!("second enrollment failed verification: {error}")),
     }
 }
 
@@ -934,6 +1061,9 @@ fn cmd_probe(bridge: Option<PathBuf>, win_mnt: Option<PathBuf>) -> anyhow::Resul
 
     println!("Bridge:  {}", config.bridge.display());
     println!("win_mnt: {}", config.win_mnt.display());
+    if let Some(error) = &config.config_error {
+        eprintln!("warning: {error}");
+    }
 
     if !config.bridge.exists() {
         eprintln!(
@@ -1087,8 +1217,11 @@ fn cmd_status_one(store: &Store, name: &str) -> anyhow::Result<i32> {
             println!("  bridge_path: {}", record.bridge_path);
             println!("  bridge_sha256: {}", short_hash(&record.bridge_sha256));
             match &record.windows_identity {
-                Some(identity) => println!("  windows:     {}", identity.account),
-                None => println!("  windows:     (unknown)"),
+                Some(identity) if !identity.account.is_empty() => {
+                    // Never print the SID: it is machine/user-identifying forensic data.
+                    println!("  windows:     {}", identity.account);
+                }
+                _ => println!("  windows:     (unknown)"),
             }
             Ok(EXIT_OK)
         }
@@ -1566,6 +1699,14 @@ mod tests {
         assert!(parse(&args(&["probe", "--user", "alice"])).is_err());
         // `verify` takes no flags.
         assert!(parse(&args(&["verify", "--yes"])).is_err());
+        // `install` takes no flags.
+        assert!(parse(&args(&["install", "--replace"])).is_err());
+        assert!(parse(&args(&["install", "--all"])).is_err());
+        // `uninstall` accepts only --user/--all.
+        assert!(parse(&args(&["uninstall", "--bridge", "/x"])).is_err());
+        assert!(parse(&args(&["uninstall", "--replace"])).is_err());
+        // `--user` and `--all` are mutually exclusive.
+        assert!(parse(&args(&["uninstall", "--user", "a", "--all"])).is_err());
     }
 
     #[test]
@@ -1621,6 +1762,10 @@ mod tests {
         assert_eq!(root.uid, 0);
         assert_eq!(root.name, "root");
         assert!(resolve_target_user(Some("no-such-user-b2-xyz".into())).is_err());
+        // A name the store grammar rejects is refused (here it also fails the passwd
+        // lookup, but the guard is what makes the failure explicit and path-safe).
+        assert!(resolve_target_user(Some("0root".into())).is_err());
+        assert!(resolve_target_user(Some("a/b".into())).is_err());
     }
 
     #[test]
@@ -1726,7 +1871,10 @@ mod tests {
                     path: PathBuf::from("/nonexistent-bridge"),
                 });
             }
-            let credential_id = vec![1u8, 2, 3, 4];
+            // Encode the invocation number in the credential id so tests can prove that
+            // the *second* ceremony's credential is the one that survives.
+            let n = self.calls.get() as u8;
+            let credential_id = vec![n, n, n, n];
             let cose = p256_cose_key(&self.key).unwrap();
             let auth_data = attested_auth_data(&cose, &credential_id, &STRICT_AAGUID_SELF_TEST);
             let object = none_attestation(&auth_data);
@@ -1781,6 +1929,109 @@ mod tests {
                 .unwrap_err();
         assert!(error.to_string().contains("transport"));
         assert_eq!(ceremony.calls.get(), 1, "transport errors are not retried");
+    }
+
+    thread_local! {
+        static SCRIPTED_VERIFY_SEEN: std::cell::RefCell<Vec<Vec<u8>>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// A scripted verifier: rejects ceremony #1 with [`VerifyError::AttestationNotAllowed`]
+    /// (the D3 unattested-first-enroll signal) and accepts ceremony #2, returning an
+    /// outcome whose `credential_id` identifies which ceremony it came from.
+    fn scripted_verify(
+        outcome: &CeremonyOutcome,
+        _policy: &AttestationPolicy,
+    ) -> Result<EnrollOutcome, VerifyError> {
+        SCRIPTED_VERIFY_SEEN.with(|seen| seen.borrow_mut().push(outcome.credential_bytes.clone()));
+        if outcome.credential_bytes == [1, 1, 1, 1] {
+            return Err(VerifyError::AttestationNotAllowed);
+        }
+        Ok(EnrollOutcome {
+            credential_id: outcome.credential_bytes.clone(),
+            cose_public_key: es256_cose_bytes(),
+            aaguid: STRICT_AAGUIDS[1],
+            sign_count: 0,
+            attestation: wsl_webauthn_verifier::AttestationMetadata {
+                format: "tpm".to_string(),
+                mode: AttestationMode::StrictVerified,
+                leaf_sha256: None,
+            },
+        })
+    }
+
+    /// **First-credential discard (D3, critical).** When ceremony #1 is unattested and
+    /// ceremony #2 succeeds, the returned outcome must reference ceremony #2's credential
+    /// id, and the verifier must have seen exactly the two distinct ceremonies.
+    #[test]
+    fn double_enroll_discards_the_first_ceremony_outcome() {
+        SCRIPTED_VERIFY_SEEN.with(|s| s.borrow_mut().clear());
+        let ceremony = ScriptedCeremony::none_attestation();
+        let outcome = enroll_with_verifier(
+            &ceremony,
+            &test_target(),
+            &AttestationPolicy::Strict,
+            false,
+            scripted_verify,
+        )
+        .unwrap();
+
+        assert_eq!(ceremony.calls.get(), 2, "exactly two ceremonies");
+        assert_eq!(
+            outcome.credential_id,
+            vec![2, 2, 2, 2],
+            "the persisted credential must be ceremony #2's, never ceremony #1's"
+        );
+        let seen = SCRIPTED_VERIFY_SEEN.with(|s| s.borrow().clone());
+        assert_eq!(
+            seen,
+            vec![vec![1, 1, 1, 1], vec![2, 2, 2, 2]],
+            "verifier saw ceremony #1 then a fresh ceremony #2"
+        );
+    }
+
+    /// A transport failure on the second ceremony must surface and must not trigger a
+    /// third attempt (it can never silently succeed with ceremony #1's abandoned key).
+    struct FailSecondCeremony {
+        calls: std::cell::Cell<usize>,
+        key: p256::ecdsa::SigningKey,
+    }
+
+    impl EnrollCeremony for FailSecondCeremony {
+        fn run_ceremony(
+            &self,
+            _params: EnrollParams,
+            _deadline: Duration,
+        ) -> Result<RunnerResponse, wsl_webauthn_runner::RunnerError> {
+            self.calls.set(self.calls.get() + 1);
+            if self.calls.get() == 2 {
+                return Err(wsl_webauthn_runner::RunnerError::BridgeMissing {
+                    path: PathBuf::from("/nonexistent-bridge"),
+                });
+            }
+            let credential_id = vec![1u8, 1, 1, 1];
+            let cose = p256_cose_key(&self.key).unwrap();
+            let auth_data = attested_auth_data(&cose, &credential_id, &STRICT_AAGUID_SELF_TEST);
+            let object = none_attestation(&auth_data);
+            Ok(RunnerResponse::Enroll {
+                format: "none".to_string(),
+                attestation_object: wsl_webauthn_protocol::b64u_encode(&object),
+                credential_id: wsl_webauthn_protocol::b64u_encode(&credential_id),
+            })
+        }
+    }
+
+    #[test]
+    fn double_enroll_second_transport_error_surfaces_without_third_attempt() {
+        let ceremony = FailSecondCeremony {
+            calls: std::cell::Cell::new(0),
+            key: p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng),
+        };
+        let error =
+            enroll_with_double_enroll(&ceremony, &test_target(), &AttestationPolicy::Strict, false)
+                .unwrap_err();
+        assert!(error.to_string().contains("transport"), "{error}");
+        assert_eq!(ceremony.calls.get(), 2, "exactly one retry, never a loop");
     }
 
     // ---- record construction ----

@@ -1078,7 +1078,6 @@ dependencies = [
  "rand 0.8.8",
  "sha2",
  "tempfile",
- "thiserror",
  "wsl-webauthn-protocol",
  "wsl-webauthn-runner",
  "wsl-webauthn-store",
