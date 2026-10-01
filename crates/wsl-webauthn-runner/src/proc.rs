@@ -45,9 +45,15 @@ pub(crate) fn set_nonblocking(fd: RawFd) -> io::Result<()> {
 /// errors to `Err`. `EINTR` is reported as an error with `ErrorKind::Interrupted` so the
 /// caller can simply retry.
 pub(crate) fn poll(fds: &mut [libc::pollfd], timeout_ms: i32) -> io::Result<usize> {
-    // `nfds_t` may be narrower than `usize` on some targets; never narrow silently.
-    let nfds =
-        libc::nfds_t::try_from(fds.len()).expect("poll descriptor count always fits in nfds_t");
+    // `nfds_t` may be narrower than `usize` on some targets; never narrow silently. The
+    // call sites pass one or two descriptors so this cannot realistically fail, but the
+    // error is surfaced rather than panicking inside the root auth deadline loop.
+    let nfds = libc::nfds_t::try_from(fds.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "poll descriptor count does not fit in nfds_t",
+        )
+    })?;
     // SAFETY: `fds` is a valid mutable slice of pollfd; nfds matches its length; the
     // kernel only writes readiness flags into the slice.
     let rc = unsafe { libc::poll(fds.as_mut_ptr(), nfds, timeout_ms) };
