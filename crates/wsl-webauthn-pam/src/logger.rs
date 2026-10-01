@@ -39,8 +39,15 @@ pub fn debug_enabled() -> bool {
 fn ensure_openlog() {
     OPENLOG.get_or_init(|| {
         // SAFETY: `ident` is a `'static` C string and the call is idempotent.
+        //
+        // `openlog(ident, option, facility)` — the facility is the **third** argument.
+        // `LOG_PID` is an *option* bit, not a facility. Passing the facility in the
+        // option slot (a classic mistake) leaves the default facility (0) in place, so
+        // this module's audit records would be filed under `kern` instead of `authpriv`
+        // and would be visible to every unprivileged reader of `syslog`/the journal.
+        // Keep the facility where it belongs.
         unsafe {
-            bindings::openlog(c"pam_wsl_webauthn".as_ptr(), LOG_AUTHPRIV | LOG_PID, 0);
+            bindings::openlog(c"pam_wsl_webauthn".as_ptr(), LOG_PID, LOG_AUTHPRIV);
         }
     });
 }
