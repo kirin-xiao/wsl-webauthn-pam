@@ -271,13 +271,17 @@ fn embedded_profile_matches_repo_file_byte_for_byte() {
 #[test]
 fn install_reads_win_mnt_from_wsl_conf() {
     let h = Harness::new();
-    // Point wsl.conf at /mnt/d and have LOCALAPPDATA report a D: path.
+    // Point wsl.conf at a drive root *inside the harness tempdir* (final component `d`,
+    // so it stands in for `/mnt/d`) and have LOCALAPPDATA report a D: path. Using a real
+    // `/mnt/d` here would make the installer create the bridge outside the tempdir — on
+    // CI that path is unwritable (EACCES); on a dev box with a real DrvFs mount it would
+    // silently pollute the host. The absolute tempdir path is accepted by the parser.
+    let win_mnt = h.win_mnt.parent().unwrap().join("d");
     write(
         &h.paths.etc_wsl_conf,
-        b"[automount]\r\nroot = /mnt/d/\r\n",
+        format!("[automount]\r\nroot = {}/\r\n", win_mnt.display()).as_bytes(),
         0o644,
     );
-    let win_mnt = h.win_mnt.parent().unwrap().join("d");
     std::fs::create_dir_all(&win_mnt).unwrap();
 
     let interop = MockInterop::local_appdata("D:\\Users\\tester\\AppData\\Local");
@@ -296,10 +300,11 @@ fn install_reads_win_mnt_from_wsl_conf() {
 
     let store = Store::with_owner(&h.paths.etc_wsl_webauthn, h.paths.owner_uid);
     let config = store.load_config().unwrap();
-    assert_eq!(config.win_mnt, PathBuf::from("/mnt/d"));
+    assert_eq!(config.win_mnt, win_mnt);
     assert_eq!(
         config.bridge_path,
-        PathBuf::from("/mnt/d/Users/tester/AppData/Local/Programs/wsl-webauthn-pam")
+        win_mnt
+            .join("Users/tester/AppData/Local/Programs/wsl-webauthn-pam")
             .join(BRIDGE_EXE)
     );
 }
