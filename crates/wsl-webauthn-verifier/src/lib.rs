@@ -34,7 +34,7 @@
 //! | packed/x5c | chain to pinned root; leaf v3 + `CA=false` + `OU="Authenticator Attestation"` + `id-fido-gen-ce-aaguid` == authData AAGUID; `attStmt.alg` == leaf key alg |
 //! | tpm | §8.3: `ver=="2.0"`; `certInfo` magic `TPM_GENERATED` / type `TPM_ST_ATTEST_CERTIFY`; `extraData == H_alg(authData‖clientDataHash)`; attested `name == nameAlg‖H_nameAlg(pubArea)`; AIK `sig` over raw `certInfo`; `pubArea` key == credential key; AIK leaf v3 + empty Subject + `CA=false` + TCG AIK EKU (`2.23.133.8.3`) + KeyUsage permitting `digitalSignature` |
 //! | policy | `tpm`/`packed`+x5c accepted under both policies; self/`none` only under [`AttestationPolicy::AllowUnattested`] |
-//! | AAGUID | authData AAGUID must be one of [`STRICT_AAGUIDS`] on every verified **attestation** path (assertions never parse an AAGUID); enforced before format dispatch, so no arm can bypass it |
+//! | AAGUID | authData AAGUID must be one of [`STRICT_AAGUIDS`] on every verified **attestation** path (assertions do not enforce an AAGUID allow-list); enforced before format dispatch, so no arm can bypass it |
 //!
 //! # `tpm` vs `packed` rule asymmetry
 //!

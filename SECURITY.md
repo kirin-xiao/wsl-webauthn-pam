@@ -160,7 +160,8 @@ suite substitute a synthetic root; it cannot weaken the production path.
 - AAGUID allow-list: the authData AAGUID must be one of `STRICT_AAGUIDS` on
   **every** attestation path. It is checked once, before the format/policy
   dispatch, so self and `none` (admitted under `AllowUnattested`) cannot bypass
-  it. Assertions never parse an AAGUID.
+  it. Assertions do not enforce an AAGUID allow-list; the assertion path does not
+  trust or compare an AAGUID.
 - Self/`none` attestation: admitted **only** under explicit
   `AttestationPolicy::AllowUnattested` — never a silent fallback. The policy is
   permissive, not prescriptive: a fully verified `tpm`/`packed` attestation is

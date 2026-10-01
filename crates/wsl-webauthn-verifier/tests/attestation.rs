@@ -1122,6 +1122,24 @@ fn negative_tpm_aik_eku_missing() {
 }
 
 #[test]
+fn negative_tpm_aik_key_usage_forbids_signature() {
+    // The AIK signs `certInfo`; a leaf whose KeyUsage extension is present but omits
+    // `digitalSignature` must be rejected even though it carries the AIK EKU.
+    let f = tpm_fixture_with_opts(
+        TpmSig::Rs1,
+        tpm_alg::SHA1,
+        ChainOptions {
+            aik_key_usage_forbids_signature: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        verify_tpm(&f, AttestationPolicy::Strict),
+        Err(VerifyError::TpmAikKeyUsageForbidsSignature)
+    );
+}
+
+#[test]
 fn negative_tpm_missing_x5c() {
     let f = tpm_fixture(TpmSig::Rs1, tpm_alg::SHA1);
     let obj = remove_field(&f.attestation_object, "x5c");

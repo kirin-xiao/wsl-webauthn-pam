@@ -22,7 +22,7 @@ use rand::rngs::OsRng;
 use sha2::{Digest as _, Sha256};
 use x509_cert::Certificate;
 use x509_cert::builder::{Builder as _, CertificateBuilder, Profile};
-use x509_cert::ext::pkix::ExtendedKeyUsage;
+use x509_cert::ext::pkix::{ExtendedKeyUsage, KeyUsage, KeyUsages};
 use x509_cert::ext::{AsExtension, Extension};
 use x509_cert::name::Name;
 use x509_cert::serial_number::SerialNumber;
@@ -313,6 +313,9 @@ pub struct ChainOptions {
     pub omit_root: bool,
     /// Emit the TCG AIK Extended Key Usage on the `tpm` leaf (required by §8.3.1).
     pub include_aik_eku: bool,
+    /// Replace the `tpm` leaf's KeyUsage with one that omits `digitalSignature`, so
+    /// the "KeyUsage forbids signatures" rejection can be exercised.
+    pub aik_key_usage_forbids_signature: bool,
     pub leaf_validity: Validity,
     pub intermediate_validity: Validity,
     pub root_validity: Validity,
@@ -330,6 +333,7 @@ impl Default for ChainOptions {
             break_leaf_signature: false,
             omit_root: false,
             include_aik_eku: true,
+            aik_key_usage_forbids_signature: false,
             leaf_validity: Validity::from_now(Duration::from_secs(3600)).unwrap(),
             intermediate_validity: Validity::from_now(Duration::from_secs(3600)).unwrap(),
             root_validity: Validity::from_now(Duration::from_secs(3600)).unwrap(),
@@ -506,6 +510,39 @@ fn build_cert(
     )
 }
 
+/// Replace a certificate's KeyUsage extension with one carrying exactly `flags`,
+/// re-signing the TBS with `issuer` so the certificate stays a valid chain link.
+///
+/// `Profile::Leaf` hard-codes `digitalSignature | nonRepudiation`; this is the only
+/// way to synthesize a leaf whose KeyUsage forbids signing, which the verifier's
+/// `tpm` profile must reject.
+fn replace_key_usage(cert: Certificate, issuer: &Signer, flags: KeyUsages) -> Certificate {
+    use der::Encode as _;
+
+    let replacement = KeyUsage(flags.into())
+        .to_extension(&cert.tbs_certificate.subject, &[])
+        .expect("keyusage extension");
+    let mut tbs = cert.tbs_certificate.clone();
+    let extensions = tbs
+        .extensions
+        .as_mut()
+        .expect("leaf certificate carries extensions");
+    let index = extensions
+        .iter()
+        .position(|e| e.extn_id == <KeyUsage as const_oid::AssociatedOid>::OID)
+        .expect("leaf carries a KeyUsage extension");
+    extensions[index] = replacement;
+
+    let tbs_der = tbs.to_der().expect("tbs der");
+    let signature =
+        der::asn1::BitString::from_bytes(&issuer.sign(&tbs_der)).expect("signature bit string");
+    Certificate {
+        tbs_certificate: tbs,
+        signature_algorithm: cert.signature_algorithm,
+        signature,
+    }
+}
+
 /// Build a TPM AIK certificate chain: P-256 root → P-256 intermediate → **RSA AIK**
 /// leaf with an empty Subject (WebAuthn §8.3.1).
 ///
@@ -573,6 +610,13 @@ pub fn build_tpm_chain(aik: &TestKey, opts: &ChainOptions) -> TestChain {
         None,
         aik_eku,
     );
+    // Profile::Leaf always emits a KeyUsage containing `digitalSignature`; for the
+    // one negative test that needs a forbidding KeyUsage, replace it (and re-sign).
+    let leaf = if opts.aik_key_usage_forbids_signature {
+        replace_key_usage(leaf, &intermediate_key.signer, KeyUsages::KeyAgreement)
+    } else {
+        leaf
+    };
 
     let root_der = root.to_der().expect("root der");
     let mut x5c = vec![
