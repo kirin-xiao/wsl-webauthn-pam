@@ -44,6 +44,16 @@
 //! matching plan §3/CR-14. No attempt counter is persisted across processes: the PAM
 //! stack owns retry policy (plan §3).
 //!
+//! # Log severity
+//!
+//! Every failure line names the PAM code and its symbolic name, e.g.
+//! `authentication failed: PAM_AUTHINFO_UNAVAIL(9): ...`. Severity follows the class:
+//! an authentication decision (`PAM_AUTH_ERR` — a rejected/forged assertion, malformed
+//! response, or a user cancel) is the conventional `LOG_NOTICE`; a missing/unknown
+//! identity (`PAM_USER_UNKNOWN`) is `LOG_WARNING`; infrastructure unavailability
+//! (`PAM_AUTHINFO_UNAVAIL` and any other code) is `LOG_ERR`. This lets an admin grepping
+//! `authpriv` tell the three classes apart.
+//!
 //! # Module arguments
 //!
 //! ```text

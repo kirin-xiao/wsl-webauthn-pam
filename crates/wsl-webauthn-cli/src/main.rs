@@ -29,11 +29,13 @@
 //!
 //! # D3 double-enroll
 //!
-//! The first-ever enrollment for the pinned RP ID yields a `none`-attested credential
-//! from Windows (spike-confirmed). Under Strict the verifier rejects it; the CLI runs
-//! exactly one further ceremony with a **fresh** challenge and verifies that instead.
-//! The first ceremony's outcome is **discarded** and can never reach the record — the
-//! persisted `credential_id` always names the second credential. See
+//! Windows *can* return a `none`-attested credential on the first-ever enrollment for an
+//! RP ID. The spike observed this for one of two RP IDs (the other returned `tpm` even on
+//! its first enrollment), so it is a real but not guaranteed quirk. Under Strict the
+//! verifier rejects `none` because of the format; the CLI then runs exactly one further
+//! ceremony with a **fresh** challenge and verifies that instead — belt-and-braces for the
+//! quirk. The first ceremony's outcome is **discarded** and can never reach the record —
+//! the persisted `credential_id` always names the second credential. See
 //! [`enroll_with_double_enroll`].
 //!
 //! # Wave C installer (plan §10)
@@ -262,6 +264,83 @@ enum Parsed {
     Run(Command),
 }
 
+/// Every flag the parser recognises, independent of which subcommand consumes it.
+///
+/// The per-subcommand allow-list ([`allowed_flags`]) is the single source of truth for
+/// the CLI contract: a flag that is not listed for the chosen subcommand is a usage
+/// error, never a silently ignored argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flag {
+    Replace,
+    AllowUnattested,
+    Yes,
+    All,
+    SkipEnroll,
+    NonInteractive,
+    User,
+    Bridge,
+    WinMnt,
+    ModuleDir,
+    ArtifactDir,
+}
+
+impl Flag {
+    /// The canonical spelling used in usage errors.
+    fn label(self) -> &'static str {
+        match self {
+            Flag::Replace => "--replace",
+            Flag::AllowUnattested => "--allow-unattested",
+            Flag::Yes => "--yes",
+            Flag::All => "--all",
+            Flag::SkipEnroll => "--skip-enroll",
+            Flag::NonInteractive => "--non-interactive",
+            Flag::User => "--user",
+            Flag::Bridge => "--bridge",
+            Flag::WinMnt => "--win-mnt",
+            Flag::ModuleDir => "--module-dir",
+            Flag::ArtifactDir => "--artifact-dir",
+        }
+    }
+}
+
+/// The flags each subcommand actually consumes, or `None` for an unknown subcommand.
+///
+/// This mirrors the `USAGE` text exactly; `-h`/`--help` is accepted everywhere and is
+/// handled before this table is consulted.
+fn allowed_flags(subcommand: &str) -> Option<&'static [Flag]> {
+    match subcommand {
+        "enroll" => Some(&[
+            Flag::Replace,
+            Flag::AllowUnattested,
+            Flag::User,
+            Flag::Bridge,
+            Flag::WinMnt,
+        ]),
+        "unregister" => Some(&[Flag::User, Flag::Yes]),
+        "probe" => Some(&[Flag::Bridge, Flag::WinMnt]),
+        "status" => Some(&[Flag::User]),
+        "verify" => Some(&[]),
+        "install" => Some(&[
+            Flag::AllowUnattested,
+            Flag::SkipEnroll,
+            Flag::NonInteractive,
+            Flag::Yes,
+            Flag::ModuleDir,
+            Flag::WinMnt,
+            Flag::ArtifactDir,
+        ]),
+        "uninstall" => Some(&[
+            Flag::User,
+            Flag::All,
+            Flag::NonInteractive,
+            Flag::Yes,
+            Flag::ModuleDir,
+            Flag::WinMnt,
+        ]),
+        _ => None,
+    }
+}
+
 /// Parse the argument vector (without the program name).
 ///
 /// Returns `Err(message)` for a usage error (the caller prints usage and exits `2`).
@@ -278,7 +357,26 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
 }
 
 /// Parse one subcommand's flags.
+///
+/// Every recognised flag is recorded as it is parsed and then checked against
+/// [`allowed_flags`] once the argument vector is exhausted, so a flag the subcommand does
+/// not consume is rejected with a usage error (exit `2`) rather than being silently
+/// dropped or surfacing later as a confusing root-check failure. Deferring the check
+/// keeps `-h`/`--help` reachable in any position: it is honoured even when a misplaced
+/// flag appears before it, exactly as before the table existed. Unknown arguments still
+/// fail immediately.
 fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
+    let Some(allowed) = allowed_flags(name) else {
+        return Err(format!("unknown subcommand {name:?}"));
+    };
+    let reject = |flag: Flag| -> Result<(), String> {
+        if allowed.contains(&flag) {
+            Ok(())
+        } else {
+            Err(format!("`{name}` does not accept {}", flag.label()))
+        }
+    };
+
     let mut replace = false;
     let mut allow_unattested = false;
     let mut yes = false;
@@ -290,40 +388,79 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
     let mut win_mnt: Option<PathBuf> = None;
     let mut module_dir: Option<PathBuf> = None;
     let mut artifact_dir: Option<PathBuf> = None;
+    // Recognised flags in the order seen; checked against the allow-list after the loop.
+    // Rejecting only after the whole argument vector is parsed keeps `-h`/`--help`
+    // reachable in any position (a later help wins over an earlier misplaced flag),
+    // matching the pre-table parser.
+    let mut seen: Vec<Flag> = Vec::new();
 
     let mut i = 0usize;
     while i < args.len() {
         let arg = args[i].as_str();
         match arg {
             "-h" | "--help" => return Ok(Parsed::Help),
-            "--replace" => replace = true,
-            "--allow-unattested" => allow_unattested = true,
-            "--yes" | "-y" => yes = true,
-            "--all" => all = true,
-            "--skip-enroll" => skip_enroll = true,
-            "--non-interactive" => non_interactive = true,
-            "--user" => user = Some(take_value(args, &mut i, "--user")?.to_string()),
-            "--bridge" => bridge = Some(PathBuf::from(take_value(args, &mut i, "--bridge")?)),
-            "--win-mnt" => win_mnt = Some(PathBuf::from(take_value(args, &mut i, "--win-mnt")?)),
+            "--replace" => {
+                seen.push(Flag::Replace);
+                replace = true;
+            }
+            "--allow-unattested" => {
+                seen.push(Flag::AllowUnattested);
+                allow_unattested = true;
+            }
+            "--yes" | "-y" => {
+                seen.push(Flag::Yes);
+                yes = true;
+            }
+            "--all" => {
+                seen.push(Flag::All);
+                all = true;
+            }
+            "--skip-enroll" => {
+                seen.push(Flag::SkipEnroll);
+                skip_enroll = true;
+            }
+            "--non-interactive" => {
+                seen.push(Flag::NonInteractive);
+                non_interactive = true;
+            }
+            "--user" => {
+                seen.push(Flag::User);
+                user = Some(take_value(args, &mut i, "--user")?.to_string());
+            }
+            "--bridge" => {
+                seen.push(Flag::Bridge);
+                bridge = Some(PathBuf::from(take_value(args, &mut i, "--bridge")?));
+            }
+            "--win-mnt" => {
+                seen.push(Flag::WinMnt);
+                win_mnt = Some(PathBuf::from(take_value(args, &mut i, "--win-mnt")?));
+            }
             "--module-dir" => {
+                seen.push(Flag::ModuleDir);
                 module_dir = Some(PathBuf::from(take_value(args, &mut i, "--module-dir")?));
             }
             "--artifact-dir" => {
+                seen.push(Flag::ArtifactDir);
                 artifact_dir = Some(PathBuf::from(take_value(args, &mut i, "--artifact-dir")?));
             }
             other if other.starts_with("--user=") => {
+                seen.push(Flag::User);
                 user = Some(other["--user=".len()..].to_string());
             }
             other if other.starts_with("--bridge=") => {
+                seen.push(Flag::Bridge);
                 bridge = Some(PathBuf::from(&other["--bridge=".len()..]));
             }
             other if other.starts_with("--win-mnt=") => {
+                seen.push(Flag::WinMnt);
                 win_mnt = Some(PathBuf::from(&other["--win-mnt=".len()..]));
             }
             other if other.starts_with("--module-dir=") => {
+                seen.push(Flag::ModuleDir);
                 module_dir = Some(PathBuf::from(&other["--module-dir=".len()..]));
             }
             other if other.starts_with("--artifact-dir=") => {
+                seen.push(Flag::ArtifactDir);
                 artifact_dir = Some(PathBuf::from(&other["--artifact-dir=".len()..]));
             }
             other => return Err(format!("unknown argument {other:?} for `{name}`")),
@@ -331,9 +468,12 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
         i += 1;
     }
 
-    // Flag/command validation: keep every accepted flag tied to a subcommand so a
-    // typo or a misplaced flag is a usage error rather than silently ignored.
-    let only = |allowed: &[bool]| allowed.iter().all(|b| !b);
+    // Enforce the allow-list once the whole vector parsed, so `--help` anywhere still wins.
+    for &flag in &seen {
+        reject(flag)?;
+    }
+
+    // Only allowed flags can be set at this point; map them into the concrete command.
     let cmd = match name {
         "enroll" => Command::Enroll {
             replace,
@@ -342,71 +482,20 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
             bridge,
             win_mnt,
         },
-        "unregister" => {
-            if !only(&[replace, allow_unattested, all]) {
-                return Err("`unregister` accepts only --user/--yes".to_string());
-            }
-            if bridge.is_some() || win_mnt.is_some() {
-                return Err("`unregister` does not accept --bridge/--win-mnt".to_string());
-            }
-            Command::Unregister { user, yes }
-        }
-        "probe" => {
-            if !only(&[replace, allow_unattested, yes, all]) {
-                return Err("`probe` accepts only --bridge/--win-mnt".to_string());
-            }
-            if user.is_some() {
-                return Err("`probe` does not accept --user".to_string());
-            }
-            Command::Probe { bridge, win_mnt }
-        }
-        "status" => {
-            if !only(&[replace, allow_unattested, yes, all]) {
-                return Err("`status` accepts only --user".to_string());
-            }
-            if bridge.is_some() || win_mnt.is_some() {
-                return Err("`status` does not accept --bridge/--win-mnt".to_string());
-            }
-            Command::Status { user }
-        }
-        "verify" => {
-            if !only(&[replace, allow_unattested, yes, all])
-                || user.is_some()
-                || bridge.is_some()
-                || win_mnt.is_some()
-            {
-                return Err("`verify` takes no arguments".to_string());
-            }
-            Command::Verify
-        }
-        "install" => {
-            if replace || bridge.is_some() || user.is_some() || all {
-                return Err("`install` accepts only \
-                     --artifact-dir/--module-dir/--win-mnt/--allow-unattested/--skip-enroll/--yes/--non-interactive"
-                    .to_string());
-            }
-            Command::Install {
-                allow_unattested,
-                skip_enroll,
-                non_interactive,
-                yes,
-                module_dir,
-                win_mnt,
-                artifact_dir,
-            }
-        }
+        "unregister" => Command::Unregister { user, yes },
+        "probe" => Command::Probe { bridge, win_mnt },
+        "status" => Command::Status { user },
+        "verify" => Command::Verify,
+        "install" => Command::Install {
+            allow_unattested,
+            skip_enroll,
+            non_interactive,
+            yes,
+            module_dir,
+            win_mnt,
+            artifact_dir,
+        },
         "uninstall" => {
-            if replace
-                || allow_unattested
-                || skip_enroll
-                || bridge.is_some()
-                || artifact_dir.is_some()
-            {
-                return Err(
-                    "`uninstall` accepts only --user/--all/--module-dir/--win-mnt/--yes/--non-interactive"
-                        .to_string(),
-                );
-            }
             if user.is_some() && all {
                 return Err("`uninstall` accepts only one of --user/--all".to_string());
             }
@@ -419,7 +508,8 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
                 win_mnt,
             }
         }
-        other => return Err(format!("unknown subcommand {other:?}")),
+        // `allowed_flags` already rejected any name outside this set.
+        _ => unreachable!("allowed_flags accepted an unknown subcommand"),
     };
     Ok(Parsed::Run(cmd))
 }
@@ -720,6 +810,7 @@ fn cmd_enroll(
         .with_context(|| format!("hashing bridge {}", config.bridge.display()))?;
 
     let runner = Runner::new(&config.bridge, &config.win_mnt);
+    let store = Store::system();
 
     // 1. Probe first: a clear message is better than a mysterious ceremony failure.
     match runner.probe(PROBE_DEADLINE) {
@@ -755,7 +846,7 @@ fn cmd_enroll(
     } else {
         AttestationPolicy::Strict
     };
-    let outcome = enroll_with_double_enroll(&runner, &target, &policy, allow_unattested)?;
+    let outcome = enroll_checked(&store, &runner, &target, &policy, allow_unattested, replace)?;
 
     // 4. Build and persist the record.
     let enrolled_at = format_rfc3339(SystemTime::now());
@@ -769,7 +860,7 @@ fn cmd_enroll(
         &enrolled_at,
     )?;
 
-    match Store::system().save_atomic(&record, replace) {
+    match store.save_atomic(&record, replace) {
         Ok(()) => {}
         Err(StoreError::AlreadyExists { .. }) => {
             bail!(
@@ -789,7 +880,7 @@ fn cmd_enroll(
     println!("  credential: {short}");
     println!(
         "  saved:      {}",
-        Store::system()
+        store
             .credentials_dir()
             .join(format!("{}.json", target.name))
             .display()
@@ -829,12 +920,14 @@ type VerifyCeremony =
 
 /// Run the enrollment ceremony, implementing the D3 double-enroll quirk.
 ///
-/// The **first-ever** enrollment for the pinned RP ID returns `fmt:"none"` from Windows
-/// (spike-confirmed). Under Strict that is rejected by the verifier because of the
-/// format; we then run exactly **one** second ceremony with a fresh challenge and verify
-/// again. If it is still unattested we fail with a clear `--allow-unattested` hint.
-/// Under `--allow-unattested` a single ceremony suffices. Exactly one retry is attempted
-/// on every path, so this cannot loop.
+/// Windows *can* return a `none`-attested credential (`fmt:"none"`, empty `attStmt`) on a
+/// first-ever enrollment for an RP ID. The spike observed it for one of two RP IDs; the
+/// other returned `tpm` even on its first enrollment, and a re-enrollment on either RP
+/// returned `tpm`. Under Strict the verifier rejects `none` because of the format; we then
+/// run exactly **one** second ceremony with a fresh challenge and verify again. If it is
+/// still unattested we fail with a clear `--allow-unattested` hint. Under
+/// `--allow-unattested` a single ceremony suffices. Exactly one retry is attempted on
+/// every path, so this cannot loop.
 ///
 /// **First-credential discard (critical).** The credential created by ceremony #1 exists
 /// on the Windows side and is *never* trusted. Its [`CeremonyOutcome`] is dropped the
@@ -848,6 +941,49 @@ fn enroll_with_double_enroll(
     allow_unattested: bool,
 ) -> anyhow::Result<EnrollOutcome> {
     enroll_with_verifier(runner, target, policy, allow_unattested, verify_ceremony)
+}
+
+/// Enforce the `--replace` policy against the target record *before* any ceremony.
+///
+/// A re-run without `--replace` must not spawn a Windows Hello ceremony: the ceremony
+/// creates a real Windows-side credential, and when [`Store::save_atomic`] then rejects
+/// the write as [`StoreError::AlreadyExists`] that credential is orphaned (the record
+/// always names the ceremony outcome, never the pre-existing one). The check here makes
+/// the common case a fast, clear failure; `save_atomic` remains the atomic second guard
+/// against a race between this check and the write.
+///
+/// The check is policy-independent: `--allow-unattested` never implies "may overwrite an
+/// existing record".
+///
+/// **Fail closed.** Only [`StoreError::NotFound`] means "no record": a valid existing
+/// record is refused with the `--replace` hint, and *any other* store error (corrupt
+/// record, bad ownership, symlink, I/O) is refused too. Treating such an error as "no
+/// record" would run a ceremony that `save_atomic` then rejects, orphaning the Windows
+/// credential exactly as in the `AlreadyExists` case. `--replace` bypasses the check and
+/// lets [`Store::save_atomic`] decide.
+fn enroll_checked(
+    store: &Store,
+    runner: &dyn EnrollCeremony,
+    target: &UserInfo,
+    policy: &AttestationPolicy,
+    allow_unattested: bool,
+    replace: bool,
+) -> anyhow::Result<EnrollOutcome> {
+    if !replace {
+        match store.load(&target.name) {
+            Ok(_) => bail!(
+                "a credential for \"{}\" already exists; pass --replace to overwrite it",
+                target.name
+            ),
+            Err(StoreError::NotFound { .. }) => {}
+            Err(error) => bail!(
+                "refusing to enroll \"{}\": the credential store is not readable ({error}); \
+                 fix or remove the existing record, or pass --replace",
+                target.name
+            ),
+        }
+    }
+    enroll_with_double_enroll(runner, target, policy, allow_unattested)
 }
 
 /// Implementation of [`enroll_with_double_enroll`] parameterized by the verifier.
@@ -1781,6 +1917,123 @@ mod tests {
         assert!(parse(&args(&["uninstall", "--user", "a", "--all"])).is_err());
     }
 
+    /// A misplaced flag must not hide `--help`: help wins whenever it is reached, exactly
+    /// as it did before the allow-list table existed.
+    #[test]
+    fn parse_help_wins_over_an_earlier_misplaced_flag() {
+        assert_eq!(
+            parse(&args(&["status", "--skip-enroll", "--help"])).unwrap(),
+            Parsed::Help
+        );
+        assert_eq!(
+            parse(&args(&["uninstall", "--skip-enroll", "-h"])).unwrap(),
+            Parsed::Help
+        );
+        // An unknown argument still fails immediately, before help can be reached.
+        assert!(parse(&args(&["status", "--nope", "--help"])).is_err());
+    }
+
+    /// The allow-list contract: for *every* subcommand and *every* recognised flag, the
+    /// flag is accepted iff the subcommand consumes it. The expected table is written
+    /// out independently here so a drift in production's [`allowed_flags`] fails.
+    #[test]
+    fn parse_rejects_flags_not_consumed_by_the_subcommand() {
+        let expected: &[(&str, &[&str])] = &[
+            (
+                "enroll",
+                &[
+                    "--replace",
+                    "--allow-unattested",
+                    "--user",
+                    "--bridge",
+                    "--win-mnt",
+                ],
+            ),
+            ("unregister", &["--user", "--yes"]),
+            ("probe", &["--bridge", "--win-mnt"]),
+            ("status", &["--user"]),
+            ("verify", &[]),
+            (
+                "install",
+                &[
+                    "--allow-unattested",
+                    "--skip-enroll",
+                    "--non-interactive",
+                    "--yes",
+                    "--module-dir",
+                    "--win-mnt",
+                    "--artifact-dir",
+                ],
+            ),
+            (
+                "uninstall",
+                &[
+                    "--user",
+                    "--all",
+                    "--non-interactive",
+                    "--yes",
+                    "--module-dir",
+                    "--win-mnt",
+                ],
+            ),
+        ];
+        let value_flags = [
+            "--user",
+            "--bridge",
+            "--win-mnt",
+            "--module-dir",
+            "--artifact-dir",
+        ];
+        let all_flags = [
+            "--replace",
+            "--allow-unattested",
+            "--yes",
+            "--all",
+            "--skip-enroll",
+            "--non-interactive",
+            "--user",
+            "--bridge",
+            "--win-mnt",
+            "--module-dir",
+            "--artifact-dir",
+        ];
+
+        for (sub, allowed) in expected {
+            for flag in all_flags {
+                let mut argv = vec![*sub, flag];
+                if value_flags.contains(&flag) {
+                    argv.push("x");
+                }
+                let result = parse(&args(&argv));
+                if allowed.contains(&flag) {
+                    assert!(
+                        result.is_ok(),
+                        "`{sub} {flag}` must be accepted: {:?}",
+                        result.err()
+                    );
+                } else {
+                    assert!(result.is_err(), "`{sub} {flag}` must be a usage error");
+                }
+            }
+        }
+
+        // The specific crossings cited by the audit, in both value forms: rejection must
+        // also fire for `--flag=value`, not just `--flag value`.
+        for bad in [
+            vec!["enroll", "--module-dir", "x"],
+            vec!["enroll", "--module-dir=x"],
+            vec!["unregister", "--skip-enroll"],
+            vec!["status", "--module-dir", "x"],
+            vec!["status", "--module-dir=x"],
+            vec!["status", "--bridge=/x"],
+            vec!["probe", "--artifact-dir", "x"],
+            vec!["probe", "--artifact-dir=x"],
+            vec!["verify", "--non-interactive"],
+        ] {
+            assert!(parse(&args(&bad)).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
     #[test]
     fn parse_uninstall_and_install() {
         assert_eq!(
@@ -2144,6 +2397,97 @@ mod tests {
                 .unwrap_err();
         assert!(error.to_string().contains("transport"), "{error}");
         assert_eq!(ceremony.calls.get(), 2, "exactly one retry, never a loop");
+    }
+
+    // ---- enroll pre-check (no orphaned credential) ----
+
+    /// With an existing record and no `--replace`, the ceremony must not run at all:
+    /// otherwise Windows creates a credential that is then discarded by `save_atomic`,
+    /// leaving an orphan. The policy is irrelevant: `--allow-unattested` does not imply
+    /// "may overwrite".
+    #[test]
+    fn enroll_without_replace_runs_zero_ceremonies() {
+        for (policy, allow_unattested) in [
+            (AttestationPolicy::Strict, false),
+            (AttestationPolicy::AllowUnattested, true),
+        ] {
+            let (_dir, store) = tempdir_store();
+            store
+                .save_atomic(&sample_record("alice", 1000), false)
+                .unwrap();
+            let ceremony = ScriptedCeremony::none_attestation();
+            let error = enroll_checked(
+                &store,
+                &ceremony,
+                &test_target(),
+                &policy,
+                allow_unattested,
+                false,
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("--replace"),
+                "the refusal must point at --replace: {error}"
+            );
+            assert_eq!(
+                ceremony.calls.get(),
+                0,
+                "no Windows Hello ceremony when the record exists and --replace is absent"
+            );
+        }
+    }
+
+    /// A store error other than `NotFound` must fail closed: treating a corrupt record as
+    /// "no record" would run a ceremony that `save_atomic` then rejects, orphaning the
+    /// Windows credential just like the plain `AlreadyExists` case.
+    #[test]
+    fn enroll_fails_closed_on_an_unreadable_store() {
+        let (_dir, store) = tempdir_store();
+        store
+            .save_atomic(&sample_record("alice", 1000), false)
+            .unwrap();
+        // Keep the 0600/owner bits `save_atomic` set, but invalidate the contents.
+        std::fs::write(store.credentials_dir().join("alice.json"), b"not json").unwrap();
+        let ceremony = ScriptedCeremony::none_attestation();
+        let error = enroll_checked(
+            &store,
+            &ceremony,
+            &test_target(),
+            &AttestationPolicy::Strict,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("not readable"),
+            "the refusal must explain the store problem: {error}"
+        );
+        assert_eq!(
+            ceremony.calls.get(),
+            0,
+            "no Windows Hello ceremony when the store cannot be read"
+        );
+    }
+
+    /// `--replace` re-runs the ceremony (and the atomic write is still the second guard).
+    #[test]
+    fn enroll_with_replace_runs_the_ceremony() {
+        let (_dir, store) = tempdir_store();
+        store
+            .save_atomic(&sample_record("alice", 1000), false)
+            .unwrap();
+        let ceremony = ScriptedCeremony::none_attestation();
+        let outcome = enroll_checked(
+            &store,
+            &ceremony,
+            &test_target(),
+            &AttestationPolicy::AllowUnattested,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(ceremony.calls.get(), 1);
+        assert_eq!(outcome.attestation.format, "none");
     }
 
     // ---- record construction ----
