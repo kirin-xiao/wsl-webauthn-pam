@@ -48,6 +48,7 @@ proptest! {
             client_data_json: &client_data_json,
             authenticator_data: &auth_data,
             signature: &signature,
+            expected_sign_count: None,
             now: SystemTime::now(),
         };
         let _ = verify_assertion(&check);

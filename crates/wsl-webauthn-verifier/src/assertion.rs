@@ -11,8 +11,10 @@
 //! 4. The signature over `authenticatorData || SHA-256(clientDataJSON)` must verify
 //!    under the enrolled COSE key.
 //! 5. The observed `signCount` is returned for persistence. Per the spec's counter
-//!    policy a `0` counter is *accepted* (Windows Hello is a zero-counter
-//!    authenticator); we never reject on the counter value.
+//!    policy (§7.2 step 22): a `0/0` counter pair is *accepted* (Windows Hello is a
+//!    zero-counter authenticator); when the caller supplies the persisted count and
+//!    either count is non-zero, a non-increasing observed value is rejected as a
+//!    clone signal.
 //!
 //! ## Note on credential id and Windows Hello
 //!
@@ -39,6 +41,7 @@ pub(crate) fn verify(
     client_data_json: &[u8],
     authenticator_data: &[u8],
     signature: &[u8],
+    expected_sign_count: Option<u32>,
 ) -> Result<AssertionOutcome, VerifyError> {
     if credential_id.is_empty() {
         return Err(VerifyError::EmptyCredentialId);
@@ -67,7 +70,21 @@ pub(crate) fn verify(
     signed.extend_from_slice(&Sha256::digest(client_data_json));
     key.verify(&signed, signature)?;
 
-    // 5. Return the observed counter for the store to persist.
+    // 5. Counter policy per WebAuthn §7.2 step 22: if the authenticator maintains
+    //    a counter (either count non-zero) and the observed value is not strictly
+    //    greater than the persisted one, this is a clone signal -> reject.
+    //    Zero/zero (or no persisted count) skips the check: Windows Hello is a
+    //    zero-counter authenticator by default, and some machines are not.
+    if let Some(stored) = expected_sign_count {
+        if (stored != 0 || prefix.sign_count != 0) && prefix.sign_count <= stored {
+            return Err(VerifyError::CounterRegression {
+                stored,
+                observed: prefix.sign_count,
+            });
+        }
+    }
+
+    // 6. Return the observed counter for the store to persist.
     Ok(AssertionOutcome {
         sign_count: prefix.sign_count,
     })

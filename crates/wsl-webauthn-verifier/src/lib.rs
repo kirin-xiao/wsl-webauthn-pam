@@ -201,6 +201,12 @@ pub struct AssertionCheck<'a> {
     pub authenticator_data: &'a [u8],
     /// The assertion signature.
     pub signature: &'a [u8],
+    /// The previously persisted signature counter from the credential store, if any.
+    /// `Some(n)` applies the WebAuthn §7.2 step 22 counter policy: a clone signal
+    /// (observed `<=` stored) is rejected whenever either count is non-zero;
+    /// `None` (or a stored count of 0 on a zero-counter authenticator) skips the
+    /// check. Pass the value loaded with the credential record.
+    pub expected_sign_count: Option<u32>,
     /// The instant used for any time-based checks. Defaults to `SystemTime::now()`.
     pub now: SystemTime,
 }
@@ -222,8 +228,17 @@ impl<'a> AssertionCheck<'a> {
             client_data_json,
             authenticator_data,
             signature,
+            // No stored count by default: the counter check is skipped. The PAM
+            // module and CLI set this from the loaded credential record.
+            expected_sign_count: None,
             now: SystemTime::now(),
         }
+    }
+
+    /// Set the persisted counter for clone detection (WebAuthn §7.2 step 22).
+    pub fn with_expected_sign_count(mut self, count: u32) -> Self {
+        self.expected_sign_count = Some(count);
+        self
     }
 }
 
@@ -302,6 +317,7 @@ pub fn verify_assertion(check: &AssertionCheck) -> Result<AssertionOutcome, Veri
         check.client_data_json,
         check.authenticator_data,
         check.signature,
+        check.expected_sign_count,
     )
 }
 

@@ -48,6 +48,7 @@ fn check<'a>(a: &'a Assertion) -> AssertionCheck<'a> {
         client_data_json: &a.client_data_json,
         authenticator_data: &a.auth_data,
         signature: &a.signature,
+        expected_sign_count: None,
         now: SystemTime::now(),
     }
 }
@@ -437,6 +438,103 @@ fn zero_counter_is_accepted() {
     };
     let outcome = verify_assertion(&check(&a)).expect("zero counter must pass");
     assert_eq!(outcome.sign_count, 0);
+}
+
+#[test]
+fn zero_counter_with_persisted_zero_is_accepted() {
+    let key = es256();
+    let challenge = vec![0x55u8; 32];
+    let credential_id = b"zero-counter".to_vec();
+    let client_data_json = client_data(ClientDataKind::Get, &challenge);
+    let auth_data = build_auth_data(RP_ID, 0x01 | 0x04, 0, None);
+    let signature = key
+        .signer
+        .sign(&signed_message(&auth_data, &client_data_json));
+    let a = Assertion {
+        challenge,
+        credential_id,
+        client_data_json,
+        auth_data,
+        signature,
+        cose: key.cose.clone(),
+    };
+    let c = check(&a).with_expected_sign_count(0);
+    let outcome = verify_assertion(&c).expect("zero/zero must pass");
+    assert_eq!(outcome.sign_count, 0);
+}
+
+#[test]
+fn counter_regression_is_rejected() {
+    let key = es256();
+    let challenge = vec![0x56u8; 32];
+    let credential_id = b"counter-regression".to_vec();
+    let client_data_json = client_data(ClientDataKind::Get, &challenge);
+    // Sign counter 2: a counter-maintaining authenticator.
+    let auth_data = build_auth_data(RP_ID, 0x01 | 0x04, 2, None);
+    let signature = key
+        .signer
+        .sign(&signed_message(&auth_data, &client_data_json));
+    let a = Assertion {
+        challenge,
+        credential_id,
+        client_data_json,
+        auth_data,
+        signature,
+        cose: key.cose.clone(),
+    };
+    // Stored 5, observed 2 -> clone signal.
+    let c = check(&a).with_expected_sign_count(5);
+    assert_eq!(
+        verify_assertion(&c),
+        Err(VerifyError::CounterRegression {
+            stored: 5,
+            observed: 2
+        })
+    );
+    // Equal counts are also a regression (must be strictly greater).
+    let c = check(&a).with_expected_sign_count(2);
+    assert_eq!(
+        verify_assertion(&c),
+        Err(VerifyError::CounterRegression {
+            stored: 2,
+            observed: 2
+        })
+    );
+    // Strictly greater is accepted.
+    let c = check(&a).with_expected_sign_count(1);
+    let outcome = verify_assertion(&c).expect("increasing counter must pass");
+    assert_eq!(outcome.sign_count, 2);
+    // No persisted count (None) skips the check entirely.
+    assert!(verify_assertion(&check(&a)).is_ok());
+}
+
+#[test]
+fn observed_zero_with_persisted_nonzero_is_rejected() {
+    let key = es256();
+    let challenge = vec![0x57u8; 32];
+    let credential_id = b"counter-rollback".to_vec();
+    let client_data_json = client_data(ClientDataKind::Get, &challenge);
+    // Observed counter 0 while the store says the authenticator maintained counts.
+    let auth_data = build_auth_data(RP_ID, 0x01 | 0x04, 0, None);
+    let signature = key
+        .signer
+        .sign(&signed_message(&auth_data, &client_data_json));
+    let a = Assertion {
+        challenge,
+        credential_id,
+        client_data_json,
+        auth_data,
+        signature,
+        cose: key.cose.clone(),
+    };
+    let c = check(&a).with_expected_sign_count(5);
+    assert_eq!(
+        verify_assertion(&c),
+        Err(VerifyError::CounterRegression {
+            stored: 5,
+            observed: 0
+        })
+    );
 }
 
 /// Small helper to build a raw COSE map from `(i64 label, value)` pairs.

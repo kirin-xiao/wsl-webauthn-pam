@@ -1303,6 +1303,7 @@ fn local_vector_tpm_strict_round_trip() {
         client_data_json: &assert_cdj,
         authenticator_data: &auth_data,
         signature: &signature,
+        expected_sign_count: None,
         now: SystemTime::now(),
     };
     wsl_webauthn_verifier::verify_assertion(&assert_check).expect("real assertion verification");

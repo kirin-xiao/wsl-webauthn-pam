@@ -61,6 +61,17 @@ pub enum VerifyError {
     #[error("authenticatorData user-verified flag not set")]
     UserVerificationRequired,
 
+    /// The signature counter did not increase over the persisted value
+    /// (WebAuthn §7.2 step 22 clone signal; only applies when the
+    /// authenticator maintains a counter).
+    #[error("signature counter regression (stored {stored}, observed {observed})")]
+    CounterRegression {
+        /// The persisted count at verification time.
+        stored: u32,
+        /// The count observed in this assertion.
+        observed: u32,
+    },
+
     // ------------------------------------------------------------------
     // attestationObject
     // ------------------------------------------------------------------
