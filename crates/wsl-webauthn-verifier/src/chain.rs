@@ -326,10 +326,10 @@ fn require_digital_signature_usage(cert: &Certificate) -> Result<(), VerifyError
             .map_err(|_| VerifyError::MalformedCertificate {
                 reason: "KeyUsage extension failed to parse or is duplicated",
             })?;
-    if let Some((_, usage)) = usage {
-        if !usage.digital_signature() {
-            return Err(VerifyError::TpmAikKeyUsageForbidsSignature);
-        }
+    if let Some((_, usage)) = usage
+        && !usage.digital_signature()
+    {
+        return Err(VerifyError::TpmAikKeyUsageForbidsSignature);
     }
     Ok(())
 }
