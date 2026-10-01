@@ -24,7 +24,8 @@
 //!   using that HWND. This is deliberate: if the pump and the blocking
 //!   ceremony shared a thread, no messages would be dispatched during the
 //!   ceremony, defeating the purpose. If window creation fails, the bridge
-//!   falls back to `GetForegroundWindow()` (then `GetDesktopWindow()`).
+//!   falls back to `GetForegroundWindow()` (then `GetTopWindow(NULL)`, then
+//!   `GetDesktopWindow()`), so the API never receives a NULL window.
 //! * **Hardened load.** `webauthn.dll` is loaded with
 //!   `LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32)` rather than the
 //!   brief's `LoadLibraryW`, so the bridge's Windows mount-root working
@@ -95,6 +96,7 @@ unsafe extern "system" {
     fn DispatchMessageW(lpMsg: *const Msg) -> isize;
     fn PostMessageW(hWnd: Hwnd, msg: u32, wParam: usize, lParam: isize) -> i32;
     fn GetForegroundWindow() -> Hwnd;
+    fn GetTopWindow(hWnd: Hwnd) -> Hwnd;
     fn GetDesktopWindow() -> Hwnd;
 }
 
@@ -592,8 +594,10 @@ struct WebauthnDll {
     free_credential_attestation: FnFreeCredentialAttestation,
     /// Optional (pre-1903 DLLs); `None` ⇒ treat as API version 0.
     get_api_version_number: Option<FnGetApiVersionNumber>,
-    /// Optional (logging only).
-    get_error_name: Option<FnGetErrorName>,
+    /// Required: every DLL exposing the ceremony APIs also exports
+    /// `WebAuthNGetErrorName` (libfido2 treats a missing export as a load
+    /// failure too). Used for bounded stderr diagnostics only.
+    get_error_name: FnGetErrorName,
 }
 
 // SAFETY: after `load()` the function pointers and module handle are
@@ -685,6 +689,7 @@ impl Win32Api {
             Some(get_cancellation_id),
             Some(free_assertion),
             Some(free_credential_attestation),
+            Some(get_error_name),
         ) = (
             is_uv_platform_available,
             make_credential,
@@ -693,6 +698,7 @@ impl Win32Api {
             get_cancellation_id,
             free_assertion,
             free_credential_attestation,
+            get_error_name,
         )
         else {
             // `WebauthnDll` owns `handle`; dropping it via this early return
@@ -723,17 +729,27 @@ impl Win32Api {
     }
 
     /// The HWND handed to the ceremony: the hidden window when available,
-    /// otherwise the foreground/desktop window (documented fallback).
+    /// otherwise the foreground window, then the top-level window, then the
+    /// desktop window.
+    ///
+    /// The fallback chain mirrors libfido2's `winhello.c`
+    /// (`GetForegroundWindow` → `GetTopWindow(NULL)`); `GetDesktopWindow` is a
+    /// last resort so the parameter is never NULL. The WebAuthN API only
+    /// requires *a* window handle — it is not used as an owner/parent for a
+    /// child window, so cross-thread use of a foreign top-level HWND is sound.
     fn hwnd(&self) -> Hwnd {
         if let Some(w) = &self.window {
             return w.hwnd;
         }
         let fg = unsafe { GetForegroundWindow() };
         if !fg.is_null() {
-            fg
-        } else {
-            unsafe { GetDesktopWindow() }
+            return fg;
         }
+        let top = unsafe { GetTopWindow(ptr::null_mut()) };
+        if !top.is_null() {
+            return top;
+        }
+        unsafe { GetDesktopWindow() }
     }
 
     fn api_version(&self) -> u32 {
@@ -744,13 +760,9 @@ impl Win32Api {
     }
 
     fn log_error(&self, context: &str, hr: Hresult) {
-        if let Some(f) = self.dll.get_error_name {
-            let name =
-                unsafe { wide_ptr_to_string(f(hr)) }.unwrap_or_else(|| "UnknownError".into());
-            eprintln!("{context}: hr=0x{:08X} {name}", hr as u32);
-        } else {
-            eprintln!("{context}: hr=0x{:08X}", hr as u32);
-        }
+        let name = unsafe { wide_ptr_to_string((self.dll.get_error_name)(hr)) }
+            .unwrap_or_else(|| "UnknownError".into());
+        eprintln!("{context}: hr=0x{:08X} {name}", hr as u32);
     }
 }
 
@@ -1027,6 +1039,45 @@ mod tests {
         assert_eq!(mem::size_of::<CredentialEx>(), 32);
         assert_eq!(mem::size_of::<Extensions>(), 16);
         assert_eq!(mem::size_of::<ClientData>(), 24);
+        assert_eq!(mem::size_of::<HmacSecretSalt>(), 32);
+        assert_eq!(mem::size_of::<HmacSecretSaltValues>(), 24);
+        assert_eq!(mem::size_of::<RpEntityInformation>(), 32);
+        assert_eq!(mem::size_of::<UserEntityInformation>(), 40);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn critical_field_offsets_match_public_header() {
+        // Independently recomputed from `webauthn.h` with a C `offsetof` program;
+        // these pin the exact byte positions the DLL reads/writes.
+        assert_eq!(mem::offset_of!(CredentialEx, cb_id), 4);
+        assert_eq!(mem::offset_of!(CredentialEx, pb_id), 8);
+        assert_eq!(mem::offset_of!(CredentialEx, dw_transports), 24);
+        assert_eq!(
+            mem::offset_of!(CredentialAttestationRaw, pwsz_format_type),
+            8
+        );
+        assert_eq!(
+            mem::offset_of!(CredentialAttestationRaw, pb_attestation_object),
+            72
+        );
+        assert_eq!(
+            mem::offset_of!(CredentialAttestationRaw, pb_credential_id),
+            88
+        );
+        assert_eq!(
+            mem::offset_of!(CredentialAttestationRaw, pb_client_data_json),
+            168
+        );
+        assert_eq!(
+            mem::offset_of!(CredentialAttestationRaw, pb_registration_response_json),
+            184
+        );
+        assert_eq!(mem::offset_of!(AssertionRaw, cb_authenticator_data), 4);
+        assert_eq!(mem::offset_of!(AssertionRaw, pb_authenticator_data), 8);
+        assert_eq!(mem::offset_of!(AssertionRaw, pb_signature), 24);
+        assert_eq!(mem::offset_of!(AssertionRaw, credential), 32);
+        assert_eq!(mem::offset_of!(AssertionRaw, pb_user_id), 64);
     }
 
     #[cfg(target_pointer_width = "64")]

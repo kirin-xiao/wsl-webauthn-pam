@@ -9,6 +9,8 @@
 //! The real Win32 implementation lives in [`crate::ffi`] (`#[cfg(windows)]`);
 //! tests supply a hand-written stub.
 
+// Enforce the plan §5 invariant that all `unsafe` lives in `crate::ffi`.
+#![forbid(unsafe_code)]
 // This module mirrors the Win32 vocabulary in full (plan D5); the variants and
 // constants that the bridge does not currently select are still part of the
 // faithful transcription and are referenced from the `#[cfg(windows)]` FFI

@@ -3,6 +3,11 @@
 //! Kept free of any platform calls so it is testable on Linux. `main` uses
 //! these helpers for the one-request/one-response invariant; the exit-code
 //! policy is applied by `main`.
+//!
+//! All `unsafe` is confined to `crate::ffi`; this module is
+//! `#![forbid(unsafe_code)]`.
+
+#![forbid(unsafe_code)]
 
 use wsl_webauthn_protocol::{BridgeError, MAX_RESPONSE_BYTES, Response};
 use wsl_webauthn_protocol::{Request, read_frame};

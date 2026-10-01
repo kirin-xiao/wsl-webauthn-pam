@@ -10,7 +10,17 @@
 //! * exit code: `0` whenever a framed response was written (even an `ok:false`
 //!   ceremony failure); non-zero only for transport/protocol failures.
 //!
-//! Exit codes: `3` malformed frame, `4` unknown operation, `5` stdio failure.
+//! Exit codes:
+//!
+//! | code | meaning |
+//! |---|---|
+//! | `0` | a framed response was written (including an `ok:false` ceremony failure) |
+//! | `3` | malformed/oversized/truncated request frame, non-JSON, or a request body that fails schema validation |
+//! | `4` | valid JSON object whose `op` is not `probe`/`enroll`/`assert` |
+//! | `5` | stdout write/flush failure while emitting the response |
+//!
+//! Any non-zero exit (or a missing/extra frame) is a *transport* failure on the Linux
+//! side (fail-closed `PAM_AUTHINFO_UNAVAIL`), never a ceremony result.
 //!
 //! On non-Windows hosts the binary is a stub (the crate still builds and its
 //! platform-independent layers are unit-tested there).

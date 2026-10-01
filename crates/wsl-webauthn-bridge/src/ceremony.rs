@@ -7,7 +7,10 @@
 //! inside a ceremony. `WebAuthNAuthenticatorMakeCredential` /
 //! `WebAuthNAuthenticatorGetAssertion` execute on the *calling* Win32 thread;
 //! the hidden window created there is what gives Windows Hello a foreground
-//! owner (plan §5, "window model").
+//! owner (plan §5, "window model"). All `unsafe` is confined to `crate::ffi`;
+//! this module is `#![forbid(unsafe_code)]`.
+
+#![forbid(unsafe_code)]
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
