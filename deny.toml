@@ -15,14 +15,21 @@ yanked = "deny"
 ignore = [
     # RUSTSEC-2023-0071 ("Marvin Attack"): non-constant-time RSA private-key
     # operations in the `rsa` crate. It reaches us transitively through the
-    # verifier's RS256 / packed-attestation verification (plan §4, D4). That is a
-    # *public-key verify only* path: no RSA private key ever exists in this
-    # project and the PAM path is local, never network-reachable — so the timing
-    # sidechannel the advisory describes is not applicable. There is no patched
-    # release (upstream `patched = []` as of rsa 0.9.10 / 0.10.0-rc); switching
-    # away would change the whole RustCrypto generation pinned in the root
-    # Cargo.toml. Revisit if upstream ever ships a constant-time release.
-    { id = "RUSTSEC-2023-0071", reason = "public-key-only RSA verification on a local, non-network PAM path; no private keys; no upstream patch exists" },
+    # verifier's RS256 / packed-attestation verification (plan §4, D4).
+    #
+    # True rationale: the *production* path is public-key verification only
+    # (no private-key operation, no key generation) and the PAM path is local
+    # and never network-reachable, so the remote-timing sidechannel the advisory
+    # describes is not applicable. RSA private keys do exist — but solely in the
+    # verifier's *test harness* (`tests/common/mod.rs`), which synthesizes
+    # attestation vectors locally; that code is never linked into a shipped
+    # binary. There is no patched release (upstream `patched = []` as of
+    # rsa 0.9.10 / 0.10.0-rc); switching away would change the whole RustCrypto
+    # generation pinned in the root Cargo.toml. Revisit if upstream ever ships a
+    # constant-time release. A regression guard
+    # (`crates/wsl-webauthn-verifier/tests/no_private_key_in_src.rs`) fails if a
+    # production `src/` ever gains an RSA private-key construct.
+    { id = "RUSTSEC-2023-0071", reason = "production path is public-key-only RSA verification on a local, non-network PAM path; RSA private keys exist only in the local test harness for synthesized vectors; upstream patched = []" },
 ]
 
 [licenses]
@@ -53,11 +60,15 @@ exceptions = []
 
 [bans]
 multiple-versions = "warn"
-# Workspace crates depend on each other through `path = "../…"` deps, which
-# cargo-deny reports as "wildcard" requirements. They are internal and pinned
-# by the workspace itself, so allow them; true wildcard *registry* requirements
-# are still denied (only path deps are exempted by this flag).
-wildcards = "allow"
+# Wildcard version requirements (e.g. `serde = "*"`) are denied outright; only
+# *path* dependencies are exempted via `allow-wildcard-paths`. The workspace
+# crates depend on each other through `path = "../…"` deps and are all
+# `publish = false`, so those internal edges stay allowed while a wildcard
+# *registry* requirement fails the check.
+#
+# NOTE: `allow-wildcard-paths` is only consulted when `wildcards != "allow"`.
+# Setting `wildcards = "allow"` would disable the registry wildcard ban too.
+wildcards = "deny"
 allow-wildcard-paths = true
 deny = []
 skip = []
