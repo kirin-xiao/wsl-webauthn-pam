@@ -26,8 +26,8 @@ use wsl_webauthn_verifier::{AssertionCheck, verify_assertion};
 
 use crate::args::ModuleArgs;
 use crate::bindings::{
-    LOG_CRIT, LOG_ERR, LOG_INFO, PAM_ABORT, PAM_AUTH_ERR, PAM_AUTHINFO_UNAVAIL, PAM_SILENT,
-    PAM_SUCCESS, PAM_TEXT_INFO, PAM_USER_UNKNOWN,
+    LOG_CRIT, LOG_ERR, LOG_INFO, LOG_NOTICE, LOG_WARNING, PAM_ABORT, PAM_AUTH_ERR,
+    PAM_AUTHINFO_UNAVAIL, PAM_IGNORE, PAM_SILENT, PAM_SUCCESS, PAM_TEXT_INFO, PAM_USER_UNKNOWN,
 };
 use crate::logger;
 use crate::seam::PamSeam;
@@ -47,7 +47,8 @@ pub enum AuthOutcome {
     Failure {
         /// The PAM return code.
         code: i32,
-        /// Human-readable reason, already logged.
+        /// Human-readable reason. The audit log line built by [`failure_message`] already
+        /// carries it together with the PAM code and its name.
         reason: String,
     },
 }
@@ -192,10 +193,56 @@ fn bridge_error_name(error: BridgeError) -> &'static str {
     }
 }
 
+/// Human-readable name for a PAM return code, for audit logs.
+///
+/// Unknown codes still get their numeric value in [`failure_message`]; this helper only
+/// names the codes the module can return.
+fn pam_code_name(code: i32) -> &'static str {
+    match code {
+        PAM_SUCCESS => "PAM_SUCCESS",
+        PAM_AUTH_ERR => "PAM_AUTH_ERR",
+        PAM_AUTHINFO_UNAVAIL => "PAM_AUTHINFO_UNAVAIL",
+        PAM_USER_UNKNOWN => "PAM_USER_UNKNOWN",
+        PAM_IGNORE => "PAM_IGNORE",
+        PAM_ABORT => "PAM_ABORT",
+        _ => "PAM_UNKNOWN",
+    }
+}
+
+/// The syslog severity for a failure code.
+///
+/// A genuine rejected assertion (`PAM_AUTH_ERR`) is an attack signal: a deliberate
+/// negative decision by the verifier, so it is `LOG_NOTICE`, not `LOG_ERR`. A missing or
+/// unknown identity is a plain `LOG_WARNING`. Every other failure (config, credential
+/// store, bridge pin/transport, entropy — i.e. `PAM_AUTHINFO_UNAVAIL` and friends) is an
+/// infrastructure condition and is logged at `LOG_ERR`.
+fn failure_severity(code: i32) -> i32 {
+    match code {
+        PAM_AUTH_ERR => LOG_NOTICE,
+        PAM_USER_UNKNOWN => LOG_WARNING,
+        _ => LOG_ERR,
+    }
+}
+
+/// Format the audit-log line for a failure.
+///
+/// The PAM code *and* its name are always present, so an admin grepping `authpriv` can
+/// tell a rejected assertion (`PAM_AUTH_ERR`) from an unavailable service
+/// (`PAM_AUTHINFO_UNAVAIL`) from an unknown user (`PAM_USER_UNKNOWN`).
+fn failure_message(code: i32, reason: &str) -> String {
+    format!(
+        "authentication failed: {}({code}): {reason}",
+        pam_code_name(code)
+    )
+}
+
 /// Log and construct a failure outcome.
+///
+/// The returned `reason` is the raw reason; the syslog line adds the PAM code and name
+/// plus the severity selected by [`failure_severity`].
 fn fail(code: i32, reason: impl Into<String>) -> AuthOutcome {
     let reason = reason.into();
-    logger::auth(LOG_ERR, &format!("authentication failed: {reason}"));
+    logger::auth(failure_severity(code), &failure_message(code, &reason));
     AuthOutcome::Failure { code, reason }
 }
 
@@ -547,5 +594,62 @@ mod tests {
         assert_eq!(decode_hex32(&hex.to_uppercase()), Some(digest));
         assert_eq!(decode_hex32("short"), None);
         assert_eq!(decode_hex32(&"z".repeat(64)), None);
+    }
+
+    /// `pam_code_name` must name the codes the module returns and stay honest for the
+    /// rest.
+    #[test]
+    fn pam_code_names_are_stable() {
+        assert_eq!(pam_code_name(PAM_SUCCESS), "PAM_SUCCESS");
+        assert_eq!(pam_code_name(PAM_AUTH_ERR), "PAM_AUTH_ERR");
+        assert_eq!(pam_code_name(PAM_AUTHINFO_UNAVAIL), "PAM_AUTHINFO_UNAVAIL");
+        assert_eq!(pam_code_name(PAM_USER_UNKNOWN), "PAM_USER_UNKNOWN");
+        assert_eq!(pam_code_name(PAM_ABORT), "PAM_ABORT");
+        assert_eq!(pam_code_name(-1234), "PAM_UNKNOWN");
+    }
+
+    /// The audit line must carry both the symbolic name and the numeric code for every
+    /// representative failure class. The logger itself writes straight to `syslog` and
+    /// is not injectable, so this exercises the formatting helper directly; the wiring
+    /// from `fail` to `failure_message` is a one-line call.
+    #[test]
+    fn failure_message_carries_pam_code_and_name() {
+        for (code, name) in [
+            (PAM_USER_UNKNOWN, "PAM_USER_UNKNOWN"),
+            (PAM_AUTHINFO_UNAVAIL, "PAM_AUTHINFO_UNAVAIL"),
+            (PAM_AUTH_ERR, "PAM_AUTH_ERR"),
+        ] {
+            let msg = failure_message(code, "representative reason");
+            assert!(msg.contains(name), "missing name in {msg:?}");
+            assert!(
+                msg.contains(&code.to_string()),
+                "missing numeric code in {msg:?}"
+            );
+            assert!(
+                msg.contains("representative reason"),
+                "missing reason in {msg:?}"
+            );
+            assert!(
+                msg.starts_with("authentication failed:"),
+                "the event name must lead the line: {msg:?}"
+            );
+        }
+        // Distinct classes must render distinct lines.
+        let unknown = failure_message(PAM_USER_UNKNOWN, "r");
+        let unavail = failure_message(PAM_AUTHINFO_UNAVAIL, "r");
+        let auth = failure_message(PAM_AUTH_ERR, "r");
+        assert_ne!(unknown, unavail);
+        assert_ne!(unavail, auth);
+    }
+
+    /// Severity alignment: a rejected assertion is an attack signal (`LOG_NOTICE`), an
+    /// unknown identity is `LOG_WARNING`, and infrastructure unavailability is
+    /// `LOG_ERR`.
+    #[test]
+    fn failure_severity_separates_attack_from_infrastructure() {
+        assert_eq!(failure_severity(PAM_AUTH_ERR), LOG_NOTICE);
+        assert_eq!(failure_severity(PAM_USER_UNKNOWN), LOG_WARNING);
+        assert_eq!(failure_severity(PAM_AUTHINFO_UNAVAIL), LOG_ERR);
+        assert_eq!(failure_severity(PAM_ABORT), LOG_ERR);
     }
 }

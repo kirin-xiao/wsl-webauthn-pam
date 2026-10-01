@@ -143,6 +143,10 @@ pub const LOG_PID: c_int = 0x01;
 pub const LOG_CRIT: c_int = 2;
 /// Error conditions.
 pub const LOG_ERR: c_int = 3;
+/// Warning conditions.
+pub const LOG_WARNING: c_int = 4;
+/// Normal but significant condition.
+pub const LOG_NOTICE: c_int = 5;
 /// Informational.
 pub const LOG_INFO: c_int = 6;
 /// Debug-level messages.
@@ -215,6 +219,8 @@ mod tests {
         assert_eq!(LOG_PID, 1);
         assert_eq!(LOG_CRIT, 2);
         assert_eq!(LOG_ERR, 3);
+        assert_eq!(LOG_WARNING, 4);
+        assert_eq!(LOG_NOTICE, 5);
         assert_eq!(LOG_INFO, 6);
         assert_eq!(LOG_DEBUG, 7);
     }
