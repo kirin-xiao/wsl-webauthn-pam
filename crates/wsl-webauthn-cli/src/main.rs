@@ -339,13 +339,18 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
     // typo or a misplaced flag is a usage error rather than silently ignored.
     let only = |allowed: &[bool]| allowed.iter().all(|b| !b);
     let cmd = match name {
-        "enroll" => Command::Enroll {
-            replace,
-            allow_unattested,
-            user,
-            bridge,
-            win_mnt,
-        },
+        "enroll" => {
+            if dry_run {
+                return Err("`enroll` does not accept --dry-run".to_string());
+            }
+            Command::Enroll {
+                replace,
+                allow_unattested,
+                user,
+                bridge,
+                win_mnt,
+            }
+        }
         "unregister" => {
             if !only(&[replace, allow_unattested, all, dry_run]) {
                 return Err("`unregister` accepts only --user/--yes".to_string());
@@ -1764,6 +1769,7 @@ mod tests {
         assert!(parse(&args(&["status", "--dry-run"])).is_err());
         assert!(parse(&args(&["verify", "--dry-run"])).is_err());
         assert!(parse(&args(&["unregister", "--dry-run"])).is_err());
+        assert!(parse(&args(&["enroll", "--dry-run"])).is_err());
         // `--user` and `--all` are mutually exclusive.
         assert!(parse(&args(&["uninstall", "--user", "a", "--all"])).is_err());
     }
