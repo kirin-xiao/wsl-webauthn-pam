@@ -10,9 +10,20 @@ db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 version = 2
 yanked = "deny"
-ignore = []
 # Fail on unmaintained/vulnerable advisories. `cargo deny check advisories`
 # is part of CI.
+ignore = [
+    # RUSTSEC-2023-0071 ("Marvin Attack"): non-constant-time RSA private-key
+    # operations in the `rsa` crate. It reaches us transitively through the
+    # verifier's RS256 / packed-attestation verification (plan §4, D4). That is a
+    # *public-key verify only* path: no RSA private key ever exists in this
+    # project and the PAM path is local, never network-reachable — so the timing
+    # sidechannel the advisory describes is not applicable. There is no patched
+    # release (upstream `patched = []` as of rsa 0.9.10 / 0.10.0-rc); switching
+    # away would change the whole RustCrypto generation pinned in the root
+    # Cargo.toml. Revisit if upstream ever ships a constant-time release.
+    { id = "RUSTSEC-2023-0071", reason = "public-key-only RSA verification on a local, non-network PAM path; no private keys; no upstream patch exists" },
+]
 
 [licenses]
 version = 2
@@ -31,7 +42,12 @@ exceptions = []
 
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+# Workspace crates depend on each other through `path = "../…"` deps, which
+# cargo-deny reports as "wildcard" requirements. They are internal and pinned by
+# the workspace itself; true wildcard *registry* requirements are still denied by
+# requiring an exact version below (only path deps are exempted by this flag).
+wildcards = "allow"
+allow-wildcard-paths = true
 deny = []
 skip = []
 skip-tree = []

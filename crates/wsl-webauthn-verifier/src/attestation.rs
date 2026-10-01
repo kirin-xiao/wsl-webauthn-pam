@@ -49,10 +49,11 @@ pub(crate) fn verify(
     // 1. clientDataJSON must be a `webauthn.create` for our challenge/origin.
     clientdata::validate(client_data_json, ClientDataKind::Create, expected_challenge)?;
 
-    // 2. Parse the CBOR attestation object.
-    let obj: Value = ciborium::from_reader(attestation_object).map_err(|_| {
+    // 2. Parse the CBOR attestation object. The whole input must be exactly one CBOR
+    //    item: trailing bytes after the map are rejected (`decode_exact`).
+    let obj = crate::cbor::decode_exact(attestation_object).map_err(|()| {
         VerifyError::MalformedAttestationObject {
-            reason: "not valid CBOR",
+            reason: "not valid CBOR, or has trailing bytes",
         }
     })?;
     let map = obj

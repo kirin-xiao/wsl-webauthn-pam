@@ -171,6 +171,11 @@ pub(crate) fn parse_attested_credential_data(
     ciborium::into_writer(&value, &mut encoded).map_err(|_| VerifyError::Internal {
         reason: "re-encoding parsed COSE value failed",
     })?;
+    // The re-encoded form delimits the key. Any bytes after it are either
+    // authenticator extensions (ED=1, which we do not consume) or ignored trailing
+    // data; neither affects a security decision here because the credential key we
+    // return is exactly this self-delimited slice. A re-encode *longer* than the
+    // remaining input means the key was truncated mid-value.
     if encoded.is_empty() || encoded.len() > rest.len() {
         return Err(VerifyError::MalformedCoseKey {
             reason: "credential public key has inconsistent length",

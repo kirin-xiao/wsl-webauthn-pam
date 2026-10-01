@@ -22,6 +22,58 @@
 //! which is trusted **only** after its SHA-256 matches [`MS_TPM_ROOT_2014_SHA256`]
 //! (see [`crate::ms_root`] and [`crate::chain`]).
 //!
+//! # Verified invariants
+//!
+//! | Area | Check |
+//! |---|---|
+//! | clientData | `type` exact (`webauthn.get`/`create`); `challenge` compared on **decoded** bytes; `origin` byte-equal to [`wsl_webauthn_protocol::ORIGIN`]; UTF-8 |
+//! | authData | `rpIdHash == SHA-256(RP_ID)`; `UP=1`; `UV=1`; attested-credential-data length bounds |
+//! | credential id | enrolled (assertion) / reported-vs-attested (enrollment) must match |
+//! | COSE key | allow-list `{-7, -257, -8}`; P-256 uncompressed point-on-curve; RSA `n` 2048..=4096; Ed25519 `x` 32 B |
+//! | signature | ES256 DER; RS256 PKCS#1 v1.5; EdDSA `verify_strict` (raw 64 B) |
+//! | packed/x5c | chain to pinned root; leaf v3 + `CA=false` + `OU="Authenticator Attestation"` + `id-fido-gen-ce-aaguid` == authData AAGUID; `attStmt.alg` == leaf key alg |
+//! | tpm | §8.3: `ver=="2.0"`; `certInfo` magic `TPM_GENERATED` / type `TPM_ST_ATTEST_CERTIFY`; `extraData == H_alg(authData‖clientDataHash)`; attested `name == nameAlg‖H_nameAlg(pubArea)`; AIK `sig` over raw `certInfo`; `pubArea` key == credential key |
+//! | policy | `tpm`/`packed`+x5c accepted under both policies; self/`none` only under [`AttestationPolicy::AllowUnattested`] |
+//! | AAGUID | authData AAGUID must be one of [`STRICT_AAGUIDS`] on every verified path |
+//!
+//! # `tpm` vs `packed` rule asymmetry
+//!
+//! The two AttCA profiles deliberately apply **different leaf rules**, because the
+//! specs differ:
+//!
+//! * `packed` (§8.2.1) requires a non-empty Subject with `OU = "Authenticator
+//!   Attestation"` and an `id-fido-gen-ce-aaguid` extension equal to the authData
+//!   AAGUID.
+//! * `tpm` (§8.3.1) requires an **empty** Subject and carries no AAGUID extension;
+//!   the AAGUID check is instead against the **authData** AAGUID. If a `tpm` leaf does
+//!   carry the extension it must still match. Both profiles require leaf v3,
+//!   `CA=false`, and a valid chain to the pinned root.
+//!
+//! # Empirical Windows Hello facts (baked into the `tpm` path)
+//!
+//! * Windows Hello emits `fmt: "tpm"` with `alg: -65535` (**COSE RS1** = RSA PKCS#1
+//!   v1.5 with SHA-1), so `extraData` is `SHA-1(authData || clientDataHash)`. SHA-1 is
+//!   therefore accepted **only** as the AIK signature/`nameAlg` digest, never for a
+//!   credential signature or a chain link's integrity beyond what the pinned root
+//!   already guarantees.
+//! * The attested `name` is computed over the **bare `TPMT_PUBLIC`** (the CBOR
+//!   `pubArea` field), i.e. with the outer `TPM2B_PUBLIC` two-byte length removed, per
+//!   §8.3's explicit note. SHA-1/256/384/512 are accepted as `nameAlg` (TPM2 defines
+//!   all four; Windows Hello uses SHA-256).
+//! * The bundled root is trusted only through the [`MS_TPM_ROOT_2014_SHA256`] pin; the
+//!   `#[doc(hidden)]` [`verify_attestation_with_anchor`] seam exists solely so the test
+//!   suite can substitute a synthetic root and cannot weaken production.
+//!
+//! # Wave B consumer notes
+//!
+//! * Use [`verify_attestation`] (never `verify_attestation_with_anchor`) and pass the
+//!   [`AttestationPolicy`] chosen from `--allow-unattested`.
+//! * Persist [`EnrollOutcome::sign_count`] and [`AssertionOutcome::sign_count`], but do
+//!   **not** reject on a non-increasing counter: Windows Hello is a zero/constant-counter
+//!   authenticator and the counter is an advisory clone signal, not an authentication
+//!   gate (see [`AssertionOutcome`]).
+//! * Treat every [`VerifyError`] as a failure; there is no partial success.
+//!
 //! # Example
 //!
 //! ```
@@ -46,6 +98,7 @@
 mod assertion;
 mod attestation;
 mod authdata;
+mod cbor;
 mod chain;
 mod clientdata;
 mod cose;

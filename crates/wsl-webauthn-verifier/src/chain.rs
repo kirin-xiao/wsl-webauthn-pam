@@ -221,7 +221,11 @@ pub(crate) fn verify_chain(
         if &ext_aaguid != auth_aaguid {
             return Err(VerifyError::CertificateAaguidMismatch);
         }
-    } else if let Ok(ext_aaguid) = leaf_aaguid(leaf) {
+    } else if let Some(ext) = find_aaguid_extension(leaf) {
+        // §8.3: for `tpm` the extension is optional, but *if present* it MUST match
+        // the authData AAGUID. A present-but-malformed value is therefore rejected
+        // rather than silently skipped.
+        let ext_aaguid = decode_aaguid(ext.extn_value.as_bytes())?;
         if &ext_aaguid != auth_aaguid {
             return Err(VerifyError::CertificateAaguidMismatch);
         }
@@ -295,18 +299,20 @@ fn subject_has_ou(cert: &Certificate, want: &str) -> bool {
 /// the extension; both single (`04 10 …`) and the double-wrapped
 /// (`04 12 04 10 …`) encodings seen in the wild are accepted.
 fn leaf_aaguid(cert: &Certificate) -> Result<[u8; 16], VerifyError> {
-    let extensions = cert
-        .tbs_certificate
+    let ext = find_aaguid_extension(cert).ok_or(VerifyError::CertificateAaguidExtensionMissing)?;
+    decode_aaguid(ext.extn_value.as_bytes())
+}
+
+/// Find the leaf's `id-fido-gen-ce-aaguid` extension, if any.
+fn find_aaguid_extension(cert: &Certificate) -> Option<&x509_cert::ext::Extension> {
+    cert.tbs_certificate
         .extensions
         .as_deref()
-        .ok_or(VerifyError::CertificateAaguidExtensionMissing)?;
-    let ext = extensions
-        .iter()
-        .find(|e| e.extn_id == ID_FIDO_GEN_CE_AAGUID)
-        .ok_or(VerifyError::CertificateAaguidExtensionMissing)?;
-
-    let content = ext.extn_value.as_bytes();
-    decode_aaguid(content)
+        .and_then(|extensions| {
+            extensions
+                .iter()
+                .find(|e| e.extn_id == ID_FIDO_GEN_CE_AAGUID)
+        })
 }
 
 /// Decode an AAGUID, tolerating one or two layers of OCTET STRING wrapping.

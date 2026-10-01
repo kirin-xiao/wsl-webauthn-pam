@@ -145,10 +145,14 @@ impl ParsedCoseKey {
         let ParsedCoseKey::Rs256(key) = self else {
             return false;
         };
-        // Strip a single leading zero byte some encoders add to `n`.
-        let modulus = strip_leading_zero(n);
         let public = AsRef::<rsa::RsaPublicKey>::as_ref(key.as_ref());
-        public.n().to_bytes_be().as_slice() == modulus && public.e().to_bytes_be().as_slice() == e
+        // Compare as integers, not byte strings. `TPMS_RSA_PARMS.exponent` is a
+        // fixed-width big-endian `u32` (the standard 65537 is therefore
+        // `00 01 00 01`), whereas `BigUint::to_bytes_be` yields the minimal form
+        // (`01 00 01`); a TPM modulus may likewise carry leading zero bytes.
+        // Byte-length equality would reject *every* RSA credential.
+        rsa::BigUint::from_bytes_be(n) == *public.n()
+            && rsa::BigUint::from_bytes_be(e) == *public.e()
     }
 }
 
@@ -178,8 +182,8 @@ fn strip_leading_zero(v: &[u8]) -> &[u8] {
 /// Parse a COSE_Key CBOR map and enforce the algorithm allow-list plus structural
 /// constraints (EC point on curve and uncompressed only, RSA modulus size bounds).
 pub(crate) fn parse(cose_key: &[u8]) -> Result<ParsedCoseKey, VerifyError> {
-    let value: Value =
-        ciborium::from_reader(cose_key).map_err(|_| VerifyError::MalformedCoseKey {
+    let value =
+        crate::cbor::decode_exact(cose_key).map_err(|()| VerifyError::MalformedCoseKey {
             reason: "not valid CBOR",
         })?;
     let map = value.as_map().ok_or(VerifyError::MalformedCoseKey {

@@ -738,6 +738,43 @@ pub fn tpm_pub_area_ec(x: &[u8], y: &[u8], name_alg: u16) -> Vec<u8> {
     out
 }
 
+/// Build a bare `TPMT_PUBLIC` for an RSA credential key (no outer size prefix).
+pub fn tpm_pub_area_rsa(n: &[u8], e: u32, name_alg: u16) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&tpm_alg::RSA.to_be_bytes());
+    out.extend_from_slice(&name_alg.to_be_bytes());
+    out.extend_from_slice(&0x0004_0432u32.to_be_bytes()); // objectAttributes
+    out.extend_from_slice(&tpm2b(&[0u8; 32])); // authPolicy
+    // TPMS_RSA_PARMS: symmetric, scheme, keyBits, exponent (fixed-width u32).
+    out.extend_from_slice(&0x0010u16.to_be_bytes()); // symmetric NULL
+    out.extend_from_slice(&0x0010u16.to_be_bytes()); // scheme NULL
+    out.extend_from_slice(&((n.len() * 8) as u16).to_be_bytes()); // keyBits
+    out.extend_from_slice(&e.to_be_bytes()); // exponent
+    out.extend_from_slice(&tpm2b(n)); // unique: modulus
+    out
+}
+
+/// Extract `(n, e)` from an RS256 COSE key (modulus bytes, exponent as u32).
+pub fn rsa_ne_from_cose(cose: &[u8]) -> (Vec<u8>, u32) {
+    let value: Value = ciborium::from_reader(cose).expect("cose cbor");
+    let map = value.as_map().expect("cose map");
+    let get = |label: i64| -> Vec<u8> {
+        map.iter()
+            .find_map(|(k, v)| {
+                (k.as_integer().and_then(|i| i64::try_from(i).ok()) == Some(label))
+                    .then(|| v.as_bytes().cloned())
+                    .flatten()
+            })
+            .expect("cose field")
+    };
+    let n = get(-1);
+    let e_bytes = get(-2);
+    let e = e_bytes
+        .iter()
+        .fold(0u32, |acc, b| (acc << 8) | u32::from(*b));
+    (n, e)
+}
+
 /// Build a `TPMS_ATTEST` (certInfo) for a certify operation.
 pub fn tpm_cert_info(extra_data: &[u8], attested_name: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -828,9 +865,18 @@ pub fn tpm_enrollment(
     };
     let auth_data = build_auth_data(RP_ID, 0x01 | 0x04, 0, Some(&attested));
 
-    // Recover the P-256 affine coordinates from the credential COSE key.
-    let (x, y) = p256_xy_from_cose(&credential.cose);
-    let pub_area = tpm_pub_area_ec(&x, &y, name_alg);
+    // Build the pubArea describing the credential public key (EC or RSA).
+    let pub_area = match credential.alg {
+        -7 => {
+            let (x, y) = p256_xy_from_cose(&credential.cose);
+            tpm_pub_area_ec(&x, &y, name_alg)
+        }
+        -257 => {
+            let (n, e) = rsa_ne_from_cose(&credential.cose);
+            tpm_pub_area_rsa(&n, e, name_alg)
+        }
+        other => panic!("tpm vectors support ES256/RS256 credential keys, got alg {other}"),
+    };
     let name = tpm_name(&pub_area, name_alg);
 
     let att_to_be_signed = signed_message(&auth_data, &client_data_json);

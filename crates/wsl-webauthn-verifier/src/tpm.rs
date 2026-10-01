@@ -234,7 +234,8 @@ fn parse_cert_info(bytes: &[u8]) -> Result<CertInfo<'_>, VerifyError> {
 #[derive(Debug)]
 struct PubArea<'a> {
     ty: u16,
-    name_alg: HashKind,
+    /// Raw `nameAlg` (`TPMI_ALG_HASH`); mapped to a supported digest in [`verify`].
+    name_alg: u16,
     /// ECC `x`/`y`, when `ty == TPM_ALG_ECC`.
     ecc: Option<(&'a [u8], &'a [u8])>,
     /// RSA modulus, when `ty == TPM_ALG_RSA`.
@@ -244,11 +245,12 @@ struct PubArea<'a> {
 }
 
 /// Parse `pubArea` as a bare `TPMT_PUBLIC` (no `TPM2B_PUBLIC` size prefix).
+///
+/// This validates structure only; the `nameAlg` support check happens in [`verify`].
 fn parse_pub_area(bytes: &[u8]) -> Result<PubArea<'_>, VerifyError> {
     let mut c = Cursor::new(bytes);
     let ty = c.u16().map_err(as_pubarea)?;
-    let name_alg_raw = c.u16().map_err(as_pubarea)?;
-    let name_alg = hash_from_tpm_id(name_alg_raw)?;
+    let name_alg = c.u16().map_err(as_pubarea)?;
     let _object_attributes = c.u32().map_err(as_pubarea)?;
     let _auth_policy = c.sized().map_err(as_pubarea)?;
 
@@ -382,9 +384,10 @@ pub(crate) fn verify(check: &TpmCheck<'_>) -> Result<(), VerifyError> {
 
     // 4. Parse pubArea and check the attested Name.
     let pub_area = parse_pub_area(check.pub_area)?;
-    let digest = pub_area.name_alg.digest(check.pub_area);
+    let name_alg = hash_from_tpm_id(pub_area.name_alg)?;
+    let digest = name_alg.digest(check.pub_area);
     let mut expected_name = Vec::with_capacity(2 + digest.len());
-    expected_name.extend_from_slice(&pub_area.name_alg.tpm_id().to_be_bytes());
+    expected_name.extend_from_slice(&name_alg.tpm_id().to_be_bytes());
     expected_name.extend_from_slice(&digest);
     if expected_name.as_slice() != cert_info.name {
         return Err(VerifyError::TpmCertInfoNameMismatch);

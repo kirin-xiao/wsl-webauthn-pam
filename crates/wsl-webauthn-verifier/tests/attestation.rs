@@ -257,6 +257,24 @@ fn negative_malformed_cbor() {
 }
 
 #[test]
+fn negative_attestation_object_trailing_bytes() {
+    // The attestation object must be exactly one CBOR item; trailing bytes appended
+    // to a valid object must be rejected, not silently ignored.
+    let f = positive();
+    let mut obj = f.attestation_object.clone();
+    obj.extend_from_slice(&[0xde, 0xad]);
+    let policy = AttestationPolicy::Strict;
+    let c = EnrollCheck {
+        attestation_object: &obj,
+        ..check(&f, &policy)
+    };
+    assert!(matches!(
+        verify_attestation_with_anchor(&c, &policy, &f.root_fingerprint),
+        Err(VerifyError::MalformedAttestationObject { .. })
+    ));
+}
+
+#[test]
 fn negative_unsupported_format() {
     let f = positive();
     let policy = AttestationPolicy::Strict;
@@ -794,6 +812,30 @@ fn positive_tpm_rs1_windows_hello_shape_strict() {
 fn positive_tpm_rs256_strict() {
     let f = tpm_fixture(TpmSig::Rs256, tpm_alg::SHA256);
     verify_tpm(&f, AttestationPolicy::Strict).expect("rs256 tpm");
+}
+
+#[test]
+fn positive_tpm_rs256_credential_key_strict() {
+    // Regression: an RSA credential key makes `pubArea.unique`/`parameters` describe
+    // an RSA key. `TPMS_RSA_PARMS.exponent` is a fixed-width `u32` (`00 01 00 01` for
+    // 65537) while `BigUint::to_bytes_be` is minimal (`01 00 01`); a byte-length
+    // comparison would reject every RSA credential.
+    let credential = rs256();
+    let aik = rsa_aik();
+    let aik_test_key = rsa_test_key(&aik);
+    let chain = build_tpm_chain(&aik_test_key, &ChainOptions::default());
+    let e = tpm_enrollment(&credential, &aik, &chain, TpmSig::Rs1, tpm_alg::SHA1);
+    let check = EnrollCheck {
+        expected_challenge: &e.challenge,
+        attestation_object: &e.attestation_object,
+        client_data_json: &e.client_data_json,
+        reported_credential_id: &e.credential_id,
+        now: SystemTime::now(),
+    };
+    let outcome =
+        verify_attestation_with_anchor(&check, &AttestationPolicy::Strict, &e.root_fingerprint)
+            .expect("tpm attestation of an RSA credential key");
+    assert_eq!(outcome.attestation.format, "tpm");
 }
 
 #[test]
