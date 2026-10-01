@@ -183,7 +183,10 @@ automatically:
 
 **`--allow-unattested`** exists for TPM-less machines. It admits `self` and
 `none` attestations (recorded as `mode: "unattested-opt-in"`, `verified: false`,
-logged loudly). **What accepting it means:** you are asserting "I trust that
+logged loudly). It is *permissive, not prescriptive*: if the platform still
+returns a fully verified `tpm` (or `packed`/AttCA) attestation, that is recorded
+as `mode: "strict"`, `verified: true` — the flag only widens what is admitted.
+**What accepting it means:** you are asserting "I trust that
 this machine is not lying about not having a TPM." A software key that simply
 *declines* to attest is then accepted. **Only use it on machines you control.**
 It is never a silent fallback.
@@ -217,10 +220,10 @@ It is never a silent fallback.
 
 ## Installation
 
-> The Rust installer (`install` / `uninstall` in the CLI) is the Wave C work
-> item on the plan. The flow below documents the intended, contract behavior
-> (plan §10). Where your build still reports the installer as not yet
-> implemented, use the **manual installation** section instead.
+> The Rust installer (`install` / `uninstall` in the CLI) implements plan §10.
+> The guided flow below is what `sudo wsl-webauthn-pam install` does; the
+> **manual installation** section is the fallback if you prefer to place the
+> files yourself.
 
 ### Guided install
 
@@ -235,11 +238,14 @@ sudo wsl-webauthn-pam install
 `install` (running as root) will:
 
 1. Read `/etc/wsl.conf` (`[automount]`-scoped, CRLF-tolerant) to find the
-   Windows mount root (`/mnt/c` by default), then resolve `%LOCALAPPDATA%` via
-   `cmd.exe` and copy the bridge to
+   Windows mount root (`/mnt/c` by default; override with `--win-mnt`), then
+   resolve `%LOCALAPPDATA%` via `cmd.exe` and copy the bridge to
    `%LOCALAPPDATA%\Programs\wsl-webauthn-pam\WSLWebAuthnBridge.exe`, recording
    its SHA-256 pin.
-2. Install `pam_wsl_webauthn.so` into the module directory.
+2. Install `pam_wsl_webauthn.so` into the module directory (detected via
+   `pam_unix.so`, or pinned with `--module-dir`). The `.so` and bridge are found
+   in the release layout, `target/`, or the current directory; override with
+   `--artifact-dir <DIR>` (or `$WSL_WEBAUTHN_ARTIFACTS`).
 3. Write `/etc/wsl_webauthn/config` (`0600` root) and create
    `/etc/wsl_webauthn/credentials/` (`0700` root).
 4. Install the `pam-auth-update` profile to
@@ -248,7 +254,12 @@ sudo wsl-webauthn-pam install
 5. Offer to remove the legacy `wsl-hello` profile and rewrite stale
    `pam_wsl_hello` references in `/etc/pam.d/*` (with confirmation + backup)
    **before** removing the old module, then require fresh enrollment. It never
-   imports the legacy PEM.
+   imports the legacy PEM. Our module and profile are installed and verified
+   *before* any legacy cleanup, so a failure cannot leave a stale reference.
+6. Offer to enable the profile now (**default no**, matching `Default: no`),
+   print the lockout warning, and **last** offer to enroll the invoking user.
+   Use `--skip-enroll` to stop before the enrollment offer, `--yes` to answer
+   yes to every prompt, and `--non-interactive` to never read stdin.
 
 Then, once:
 
@@ -313,11 +324,29 @@ wsl-webauthn-pam <COMMAND> [OPTIONS]
                  --bridge <PATH>       bridge exe path (else config, else required)
                  --win-mnt <PATH>      Windows mount root (else config, else /mnt/c)
   unregister   Remove one user's credential record (root, per-user only)
+                 --user <NAME>         target user (default: SUDO_USER or current)
+                 --yes                 skip the confirmation prompt
   probe        Report interop / Hello availability and the bridge pin
-  status       List enrolled users and the config summary
+                 --bridge <PATH>       bridge exe path (else config, else required)
+                 --win-mnt <PATH>      Windows mount root (else config, else /mnt/c)
+  status       List enrolled users and the config summary (root for records)
+                 --user <NAME>         show one user's full record
   verify       Self-test the crypto stack against a synthetic ceremony
-  install      Install the module, bridge, config and PAM profile (Wave C)
-  uninstall    Remove it (--user NAME | --all)
+  install      Provision the bridge, config, PAM module and profile (root)
+                 --artifact-dir <DIR>  where to find the .so/.exe (else env/cwd)
+                 --module-dir <DIR>    override the PAM security directory
+                 --win-mnt <PATH>      override the Windows mount root
+                 --allow-unattested    admit self/none attestation at enroll
+                 --skip-enroll         do not offer enrollment at the end
+                 --yes                 answer yes to every prompt
+                 --non-interactive     never read stdin; use question defaults
+  uninstall    Remove a credential or all components (root)
+                 --user <NAME>         remove one user's record (default)
+                 --all                 remove profile, module, config, bridge
+                 --module-dir <DIR>    override the PAM security directory
+                 --win-mnt <PATH>      override the Windows mount root
+                 --yes                 skip confirmations
+                 --non-interactive     never read stdin; use question defaults
 ```
 
 `enroll`, `unregister`, `install`, and `uninstall` require root. `probe` and
@@ -469,6 +498,9 @@ there is no attestation, so the software key is accepted on trust (see
 No. It never edits `sudoers`. It works through the PAM stack; enabling it means
 adding the module (or the `pam-auth-update` profile) to the relevant PAM service
 such as `/etc/pam.d/sudo`.
+
+> The `ISSUES.md` requirement set referenced in the FAQ above is the plan this
+> project was built against; it is not part of this repository.
 
 ---
 

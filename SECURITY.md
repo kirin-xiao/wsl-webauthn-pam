@@ -154,7 +154,10 @@ suite substitute a synthetic root; it cannot weaken the production path.
   `OU="Authenticator Attestation"`, `id-fido-gen-ce-aaguid` matching the
   authData AAGUID, `attStmt.alg` == leaf key alg.
 - Self/`none` attestation: admitted **only** under explicit
-  `AttestationPolicy::AllowUnattested` — never a silent fallback.
+  `AttestationPolicy::AllowUnattested` — never a silent fallback. The policy is
+  permissive, not prescriptive: a fully verified `tpm`/`packed` attestation is
+  still recorded `mode: "strict"`, `verified: true` even when
+  `--allow-unattested` was passed.
 
 The verifier is `#![forbid(unsafe_code)]` and non-panicking on every parse path;
 it is exercised by synthesized positive/negative tests (one negative per

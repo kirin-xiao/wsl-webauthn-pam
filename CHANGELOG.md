@@ -35,8 +35,10 @@ verification performed on the Linux side.
   fail-closed mapping table, the bridge SHA-256 pin, and a `pam_conv` consent
   pre-prompt.
 - **`wsl-webauthn-cli`** (`wsl-webauthn-pam`) — `enroll` (with D3 double-enroll
-  and `--allow-unattested`), `unregister`, `probe`, `status`, `verify`; the
-  installer (`install`/`uninstall`) is tracked for a later wave.
+  and `--allow-unattested`), `unregister`, `probe`, `status`, `verify`, and the
+  installer: `install`/`uninstall` with symlink-hardened atomic writes, the
+  `pam-auth-update` profile, and legacy WSL-Hello-sudo migration (D7: rewrite
+  `/etc/pam.d` references before removing the old module, never import the PEM).
 - **Packaging & CI** — `pam-config` profile (`Default: no`), `install.sh` shim,
   `Makefile`, SHA-pinned `cargo-deny`/actionlint/pam-auth-update-expansion CI,
   and a release workflow producing per-architecture tarballs + `SHA256SUMS`.
