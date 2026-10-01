@@ -211,11 +211,13 @@ fn pam_code_name(code: i32) -> &'static str {
 
 /// The syslog severity for a failure code.
 ///
-/// A genuine rejected assertion (`PAM_AUTH_ERR`) is an attack signal: a deliberate
-/// negative decision by the verifier, so it is `LOG_NOTICE`, not `LOG_ERR`. A missing or
-/// unknown identity is a plain `LOG_WARNING`. Every other failure (config, credential
+/// `PAM_AUTH_ERR` is the authentication-decision class: a rejected/forged assertion, a
+/// malformed response, or a user cancel. `LOG_NOTICE` is the conventional severity for an
+/// authentication decision (it is normal but significant, not an infra fault). A missing
+/// or unknown identity is a plain `LOG_WARNING`. Every other failure (config, credential
 /// store, bridge pin/transport, entropy — i.e. `PAM_AUTHINFO_UNAVAIL` and friends) is an
-/// infrastructure condition and is logged at `LOG_ERR`.
+/// infrastructure condition and is logged at `LOG_ERR`, which is more severe so it still
+/// stands out in alerting.
 fn failure_severity(code: i32) -> i32 {
     match code {
         PAM_AUTH_ERR => LOG_NOTICE,
