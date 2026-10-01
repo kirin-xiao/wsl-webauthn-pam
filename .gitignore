@@ -1,5 +1,8 @@
 /target
 /build
+/spike/*.exe
+__pycache__/
+*.pyc
 tests/vectors/local/
 *.rs.bk
 .idea/
