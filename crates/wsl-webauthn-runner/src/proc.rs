@@ -56,6 +56,16 @@ pub(crate) fn read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     Ok(rc as usize)
 }
 
+/// `write(2)` once, returning the number of bytes written (`0` = peer closed).
+pub(crate) fn write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
+    // SAFETY: `fd` is an owned descriptor and `buf` is a valid readable slice.
+    let rc = unsafe { libc::write(fd, buf.as_ptr().cast::<libc::c_void>(), buf.len()) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(rc as usize)
+}
+
 /// Send `SIGKILL` to `pid`, ignoring a missing process.
 pub(crate) fn kill_sigkill(pid: i32) {
     // SAFETY: kill takes a pid and a signal number; it cannot cause memory unsafety.

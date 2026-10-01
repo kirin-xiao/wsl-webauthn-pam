@@ -36,7 +36,6 @@
 
 mod proc;
 
-use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
@@ -415,23 +414,22 @@ impl Runner {
             })?;
 
         // Write the single framed request, then close stdin. 8 KiB fits comfortably in
-        // the pipe buffer, so this cannot block indefinitely.
+        // the default 64 KiB pipe buffer, but we still make the write non-blocking and
+        // bound it by the deadline: a bridge/child that never reads stdin must never be
+        // able to hang the PAM stack past its deadline.
         {
-            let mut stdin = child.stdin.take().expect("stdin was piped");
-            if let Err(e) = stdin.write_all(&frame).and_then(|()| stdin.flush()) {
-                // The bridge may have died immediately; prefer BridgeFailed if it exited.
+            let stdin = child.stdin.take().expect("stdin was piped");
+            if let Err(e) = self.write_frame(stdin.as_raw_fd(), &frame, deadline) {
                 let status = child.try_wait().ok().flatten();
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_and_reap(&mut child);
                 return Err(match status {
                     Some(status) if !status.success() => RunnerError::BridgeFailed {
                         code: status.code(),
                     },
-                    _ => RunnerError::Transport {
-                        message: format!("writing request to bridge: {e}"),
-                    },
+                    _ => e,
                 });
             }
+            // `stdin` is dropped here, closing the read side of the child's pipe.
         }
 
         let stdout = child.stdout.take().expect("stdout was piped");
@@ -458,6 +456,77 @@ impl Runner {
                 return Err(RunnerError::InteropUnavailable {
                     path: self.interop_path.clone(),
                     detail: "registration does not contain an `enabled` line".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Write `frame` to the child's stdin with a non-blocking, deadline-bounded loop.
+    ///
+    /// The frame (≤ [`MAX_REQUEST_BYTES`]) normally fits the 64 KiB pipe buffer in a
+    /// single `write`, so this returns immediately. It exists so a child that never drains
+    /// its stdin cannot block the PAM stack past `deadline`. On failure the child is left
+    /// for the caller to reap (so a concurrent non-zero exit can still be reported as
+    /// [`RunnerError::BridgeFailed`]).
+    fn write_frame(
+        &self,
+        fd: std::os::fd::RawFd,
+        frame: &[u8],
+        deadline: Duration,
+    ) -> Result<(), RunnerError> {
+        proc::set_nonblocking(fd).map_err(|e| RunnerError::Transport {
+            message: format!("setting stdin non-blocking: {e}"),
+        })?;
+        let start = Instant::now();
+        let mut offset = 0usize;
+        while offset < frame.len() {
+            match proc::write(fd, &frame[offset..]) {
+                Ok(0) => {
+                    return Err(RunnerError::Transport {
+                        message: "bridge closed stdin before the request was written".to_string(),
+                    });
+                }
+                Ok(n) => offset += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    let elapsed = start.elapsed();
+                    if elapsed >= deadline {
+                        return Err(RunnerError::Timeout {
+                            deadline_ms: deadline.as_millis() as u64,
+                            windows_pid: None,
+                            taskkill_attempted: false,
+                        });
+                    }
+                    let remaining = deadline.saturating_sub(elapsed);
+                    let poll_ms = remaining.as_millis().min(POLL_GRANULARITY.as_millis()) as i32;
+                    let mut fds = [libc::pollfd {
+                        fd,
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    }];
+                    match proc::poll(&mut fds, poll_ms) {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) => {
+                            return Err(RunnerError::Transport {
+                                message: format!("poll on bridge stdin: {e}"),
+                            });
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    return Err(RunnerError::Transport {
+                        message: format!("writing request to bridge: {e}"),
+                    });
+                }
+            }
+            // Bound a pathological child that accepts only a byte at a time.
+            if start.elapsed() >= deadline {
+                return Err(RunnerError::Timeout {
+                    deadline_ms: deadline.as_millis() as u64,
+                    windows_pid: None,
+                    taskkill_attempted: false,
                 });
             }
         }
@@ -532,6 +601,17 @@ impl Runner {
                 });
             }
 
+            // Fast path: both pipes reached EOF, so the child has closed its stdio. Reap
+            // it and finish; this avoids lingering until the deadline when a bridge exits
+            // after writing its frame but `try_wait` has not yet observed the exit. The
+            // reap is deadline-bounded and kills a child that closes its pipes but never
+            // exits, so it can never block past the caller's deadline.
+            if out_eof && err_eof {
+                let budget = deadline.saturating_sub(start.elapsed());
+                let status = self.reap_bounded(child, budget, deadline)?;
+                return self.finish(status, &out_buf);
+            }
+
             if let Some(status) = status.take() {
                 // Final drain: the child has closed its write ends, so a complete frame
                 // (and any trailing stderr) is now visible.
@@ -574,6 +654,41 @@ impl Runner {
                     });
                 }
             }
+        }
+    }
+
+    /// Wait for an EOF'd child to exit within `budget`, killing and reaping it on overrun.
+    ///
+    /// Used only after both stdio pipes have reached EOF; a child that closes its pipes
+    /// but stays alive must not block the caller past the deadline. `reported_deadline` is
+    /// the caller-facing deadline echoed in [`RunnerError::Timeout`].
+    fn reap_bounded(
+        &self,
+        child: &mut std::process::Child,
+        budget: Duration,
+        reported_deadline: Duration,
+    ) -> Result<ExitStatus, RunnerError> {
+        let start = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(RunnerError::Transport {
+                        message: format!("waiting for bridge: {e}"),
+                    });
+                }
+            }
+            if start.elapsed() >= budget {
+                kill_and_reap(child);
+                return Err(RunnerError::Timeout {
+                    deadline_ms: reported_deadline.as_millis() as u64,
+                    windows_pid: None,
+                    taskkill_attempted: false,
+                });
+            }
+            let sleep = POLL_GRANULARITY.min(budget.saturating_sub(start.elapsed()));
+            std::thread::sleep(sleep);
         }
     }
 

@@ -79,13 +79,12 @@ impl Default for Opts {
 fn parse_args() -> Opts {
     let mut opts = Opts::default();
     for (i, arg) in std::env::args().skip(1).enumerate() {
-        if !arg.contains('=') {
+        let Some((key, value)) = arg.split_once('=') else {
             if i == 0 {
                 opts.mode = arg;
             }
             continue;
-        }
-        let (key, value) = arg.split_once('=').expect("checked contains =");
+        };
         match key {
             "err" => opts.err = Some(value.to_string()),
             "echo" => opts.echo = value == "1",
@@ -198,9 +197,13 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let Some(req) = request else {
+    let req = match request {
+        Some(req) => req,
+        // `noread` answers a synthesized probe without ever reading stdin, so the runner's
+        // deadline-bounded stdin write can be exercised against a non-reading child.
+        None if opts.noread => Request::Probe { timeout_ms: 1 },
         // No request to answer; behave like a clean empty exit.
-        return ExitCode::SUCCESS;
+        None => return ExitCode::SUCCESS,
     };
 
     let response = match &opts.err {

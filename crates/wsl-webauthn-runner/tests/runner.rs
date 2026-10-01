@@ -358,6 +358,51 @@ fn interop_check_disabled_skips_file() {
 }
 
 // ---------------------------------------------------------------------------
+// stdin handling and the shared interop helper
+// ---------------------------------------------------------------------------
+
+#[test]
+fn non_reading_child_is_still_served() {
+    // The child never reads its stdin; the request still fits the pipe buffer and the
+    // deadline-bounded write path completes without blocking.
+    let dir = cwd_dir();
+    let r = build_runner(dir.path(), &["ok", "noread=1"]);
+    assert!(matches!(
+        r.probe(Duration::from_secs(5)),
+        Ok(RunnerResponse::Probe { .. })
+    ));
+}
+
+#[test]
+fn interop_command_run_captures_stdout_and_status() {
+    let dir = cwd_dir();
+    let out = wsl_webauthn_runner::InteropCommand::run(
+        "/bin/echo",
+        &["hello", "world"],
+        dir.path(),
+        Duration::from_secs(5),
+    )
+    .expect("echo must run");
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"hello world\n");
+}
+
+#[test]
+fn interop_command_run_times_out_and_kills() {
+    let dir = cwd_dir();
+    let start = Instant::now();
+    let err = wsl_webauthn_runner::InteropCommand::run(
+        "/bin/sleep",
+        &["5"],
+        dir.path(),
+        Duration::from_millis(120),
+    )
+    .expect_err("sleep must time out");
+    assert!(matches!(err, RunnerError::Timeout { .. }), "{err:?}");
+    assert!(start.elapsed() < Duration::from_secs(3));
+}
+
+// ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
 
