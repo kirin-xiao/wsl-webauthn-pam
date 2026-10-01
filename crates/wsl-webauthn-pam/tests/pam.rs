@@ -13,11 +13,12 @@ use std::time::Duration;
 
 use support::*;
 
+use pam_wsl_webauthn::ModuleArgs;
 use pam_wsl_webauthn::bindings::{
     PAM_ABORT, PAM_AUTH_ERR, PAM_AUTHINFO_UNAVAIL, PAM_IGNORE, PAM_SILENT, PAM_SUCCESS,
     PAM_USER_UNKNOWN,
 };
-use pam_wsl_webauthn::logic::{FAIL_DELAY_USEC, run};
+use pam_wsl_webauthn::logic::{AuthOutcome, FAIL_DELAY_USEC, authenticate, run};
 use pam_wsl_webauthn::seam::SeamError;
 
 // ---------------------------------------------------------------------------
@@ -426,6 +427,45 @@ fn injected_panic_returns_pam_abort() {
     assert!(
         seam.fail_delays.is_empty(),
         "a panic must not request a fail delay"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Entropy failure → PAM_AUTHINFO_UNAVAIL (not PAM_ABORT)
+// ---------------------------------------------------------------------------
+
+/// An entropy failure must be classified as an unavailable service, not a module
+/// bug: the state machine returns the UNAVAIL outcome and does not panic.
+#[test]
+fn entropy_failure_outcome_is_authinfo_unavail() {
+    let (_f, mut seam, mut deps) = happy();
+    deps.random_error = Some("getrandom: no entropy".to_string());
+    let outcome = authenticate(&mut seam, &deps, 0, &ModuleArgs::default());
+    match outcome {
+        AuthOutcome::Failure { code, reason } => {
+            assert_eq!(code, PAM_AUTHINFO_UNAVAIL);
+            assert!(reason.contains("entropy"), "reason: {reason}");
+        }
+        AuthOutcome::Success { .. } => panic!("entropy failure must not authenticate"),
+    }
+}
+
+/// Through [`run`], the entropy failure maps to `PAM_AUTHINFO_UNAVAIL`, requests the
+/// standard fail delay, and never reaches the `PAM_ABORT` panic path.
+#[test]
+fn entropy_failure_returns_pam_authinfo_unavail_and_no_abort() {
+    let (_f, mut seam, mut deps) = happy();
+    deps.random_error = Some("getrandom: no entropy".to_string());
+    let code = run_basic(&mut seam, &deps, 0, &[]);
+    assert_eq!(code, PAM_AUTHINFO_UNAVAIL);
+    assert_ne!(
+        code, PAM_ABORT,
+        "entropy failure must not abort the PAM stack"
+    );
+    assert_eq!(
+        seam.fail_delays,
+        vec![FAIL_DELAY_USEC],
+        "an entropy failure is a normal failure path and must request the fail delay"
     );
 }
 

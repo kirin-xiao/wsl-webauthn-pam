@@ -27,7 +27,7 @@
 //! | Verified assertion | `PAM_SUCCESS` |
 //! | No credential record for the user (`StoreError::NotFound`) | `PAM_USER_UNKNOWN` |
 //! | Null/empty/invalid username | `PAM_USER_UNKNOWN` |
-//! | Config missing/invalid, store error (ownership, symlink, corrupt, I/O), bridge pin mismatch/missing, `RunnerError` (interop unavailable, bridge missing, spawn, transport, timeout), `BridgeError::{not_available,not_supported,timeout,busy,invalid_parameter,internal}` | `PAM_AUTHINFO_UNAVAIL` |
+//! | Config missing/invalid, store error (ownership, symlink, corrupt, I/O), bridge pin mismatch/missing, OS entropy unavailable for the challenge, `RunnerError` (interop unavailable, bridge missing, spawn, transport, timeout), `BridgeError::{not_available,not_supported,timeout,busy,invalid_parameter,internal}` | `PAM_AUTHINFO_UNAVAIL` |
 //! | `BridgeError::user_cancelled` | `PAM_AUTH_ERR` |
 //! | Any `VerifyError`, echo mismatch, credential-id mismatch, malformed response field | `PAM_AUTH_ERR` |
 //! | Panic in module code | `PAM_ABORT` |

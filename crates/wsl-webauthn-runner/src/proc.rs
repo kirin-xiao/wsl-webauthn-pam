@@ -8,7 +8,15 @@
 //! * `poll(2)` — wait for readability with a computed timeout (never blocks past the
 //!   caller's deadline).
 //! * `read(2)` — drain the pipes once readable.
-//! * `kill(2)` — `SIGKILL` the shim child on deadline expiry.
+//! * `write(2)` — hand the request frame to the child's stdin. Unlike a plain
+//!   `write(2)`, this wrapper blocks `SIGPIPE` for the calling thread and drains any
+//!   pending `SIGPIPE` before restoring the mask, so a closed read end can never
+//!   terminate a non-Rust host.
+//!
+//! The crate is loaded as a `cdylib` into `sudo`/`su`/`sshd`, none of which install a
+//! `SIGPIPE` handler. Rust's runtime normally sets `SIGPIPE` to `SIG_IGN` from its
+//! `main` shim, which never runs here; blocking the signal for our own thread is the
+//! only remedy that does not mutate global process state.
 
 #![allow(unsafe_code)]
 
@@ -56,20 +64,104 @@ pub(crate) fn read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     Ok(rc as usize)
 }
 
-/// `write(2)` once, returning the number of bytes written (`0` = peer closed).
-pub(crate) fn write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
-    // SAFETY: `fd` is an owned descriptor and `buf` is a valid readable slice.
-    let rc = unsafe { libc::write(fd, buf.as_ptr().cast::<libc::c_void>(), buf.len()) };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(rc as usize)
+/// RAII guard that blocks `SIGPIPE` for the calling thread while alive.
+///
+/// Drop restores the previous signal mask, first draining a pending `SIGPIPE` (with a
+/// zero timeout) so a write that raced with the read end closing cannot deliver the
+/// signal the moment the mask is lifted. The mask is per-thread, so this is safe to use
+/// from a threaded PAM host and never changes process-global signal state.
+struct SigpipeGuard {
+    old_mask: libc::sigset_t,
 }
 
-/// Send `SIGKILL` to `pid`, ignoring a missing process.
-pub(crate) fn kill_sigkill(pid: i32) {
-    // SAFETY: kill takes a pid and a signal number; it cannot cause memory unsafety.
+impl SigpipeGuard {
+    /// Block `SIGPIPE` for the current thread, remembering the previous mask.
+    fn block() -> io::Result<SigpipeGuard> {
+        // SAFETY: sigemptyset/sigaddset initialize a local sigset_t; pthread_sigmask
+        // reads the set and writes the old mask into another local.
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGPIPE);
+            let mut old_mask: libc::sigset_t = std::mem::zeroed();
+            // pthread_sigmask returns the error number directly (does not set errno).
+            let rc = libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old_mask);
+            if rc != 0 {
+                return Err(io::Error::from_raw_os_error(rc));
+            }
+            Ok(SigpipeGuard { old_mask })
+        }
+    }
+
+    /// Consume a `SIGPIPE` that a failed write left pending, without blocking.
+    fn drain(&self) {
+        // SAFETY: as above; sigtimedwait with a zero timeout only dequeues an already
+        // pending signal and cannot block.
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGPIPE);
+            let timeout = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            libc::sigtimedwait(&set, std::ptr::null_mut(), &timeout);
+        }
+    }
+}
+
+impl Drop for SigpipeGuard {
+    fn drop(&mut self) {
+        // A write that returned `EPIPE` may have queued a blocked SIGPIPE; consume it
+        // before unblocking, otherwise restoring the mask delivers it immediately.
+        self.drain();
+        // SAFETY: `old_mask` was produced by pthread_sigmask for this thread.
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.old_mask, std::ptr::null_mut());
+        }
+    }
+}
+
+/// `write(2)` once, returning the number of bytes written (`0` = peer closed).
+///
+/// `SIGPIPE` is blocked for the duration of the call and any signal a closed peer
+/// queues is drained before the mask is restored, so this can never terminate a
+/// `SIGPIPE=SIG_DFL` host process. A closed read end is reported as `EPIPE`.
+pub(crate) fn write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
+    let guard = SigpipeGuard::block()?;
+    // SAFETY: `fd` is an owned descriptor and `buf` is a valid readable slice.
+    let rc = unsafe { libc::write(fd, buf.as_ptr().cast::<libc::c_void>(), buf.len()) };
+    let result = if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(rc as usize)
+    };
+    // `guard`'s Drop drains a pending SIGPIPE and restores the previous mask.
+    drop(guard);
+    result
+}
+
+/// Whether `pid` still exists (or is a zombie), used by lifecycle regression tests.
+///
+/// `kill(pid, 0)` performs only the existence/permission check; it delivers no signal.
+#[cfg(test)]
+pub(crate) fn process_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 is the null signal; it only probes for the process.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+/// CPU time consumed by the *calling thread* so far.
+///
+/// Used by regression tests to prove an over-cap descriptor no longer spins the drain
+/// loop; process-wide accounting would be polluted by tests running in parallel.
+#[cfg(test)]
+pub(crate) fn thread_cpu_time() -> std::time::Duration {
+    // SAFETY: clock_gettime writes a timespec into our local.
     unsafe {
-        libc::kill(pid, libc::SIGKILL);
+        let mut ts: libc::timespec = std::mem::zeroed();
+        if libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) != 0 {
+            return std::time::Duration::ZERO;
+        }
+        std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
     }
 }

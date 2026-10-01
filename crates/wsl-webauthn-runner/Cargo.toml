@@ -13,6 +13,12 @@ path = "src/bin/fake_bridge.rs"
 test = false
 bench = false
 
+[[bin]]
+name = "sigpipe-probe"
+path = "src/bin/sigpipe_probe.rs"
+test = false
+bench = false
+
 [dependencies]
 wsl-webauthn-protocol = { path = "../wsl-webauthn-protocol" }
 serde = { workspace = true }

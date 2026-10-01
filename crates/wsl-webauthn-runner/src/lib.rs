@@ -415,7 +415,7 @@ impl Runner {
         }
         let frame = wsl_webauthn_protocol::encode_frame(&payload);
 
-        let mut child = Command::new(&self.bridge)
+        let child = Command::new(&self.bridge)
             .args(&self.args)
             .current_dir(&self.win_mnt)
             .stdin(Stdio::piped())
@@ -427,15 +427,19 @@ impl Runner {
                 source,
             })?;
 
+        // Own the child for the rest of the exchange: every early return below (including
+        // the `?`-propagated ones) now kills and reaps it via `ChildGuard::drop`.
+        let mut guard = ChildGuard::new(child);
+
         // Write the single framed request, then close stdin. 8 KiB fits comfortably in
         // the default 64 KiB pipe buffer, but we still make the write non-blocking and
         // bound it by the deadline: a bridge/child that never reads stdin must never be
         // able to hang the PAM stack past its deadline.
         {
-            let stdin = child.stdin.take().expect("stdin was piped");
+            let stdin = guard.child_mut().stdin.take().expect("stdin was piped");
             if let Err(e) = self.write_frame(stdin.as_raw_fd(), &frame, deadline) {
-                let status = child.try_wait().ok().flatten();
-                kill_and_reap(&mut child);
+                let status = guard.try_wait().ok().flatten();
+                guard.kill_and_reap();
                 return Err(match status {
                     Some(status) if !status.success() => RunnerError::BridgeFailed {
                         code: status.code(),
@@ -446,9 +450,9 @@ impl Runner {
             // `stdin` is dropped here, closing the read side of the child's pipe.
         }
 
-        let stdout = child.stdout.take().expect("stdout was piped");
-        let stderr = child.stderr.take().expect("stderr was piped");
-        self.pump(&mut child, stdout, stderr, deadline)
+        let stdout = guard.child_mut().stdout.take().expect("stdout was piped");
+        let stderr = guard.child_mut().stderr.take().expect("stderr was piped");
+        self.pump(guard, stdout, stderr, deadline)
     }
 
     /// Fast-fail pre-flight checks (no process is spawned if these fail).
@@ -558,161 +562,30 @@ impl Runner {
     }
 
     /// Non-blocking read loop bounded by `deadline`.
+    ///
+    /// Delegates the deadline/poll/drain mechanics to the shared [`drive_child`] engine
+    /// and maps its outcome onto the runner's transport contract.
     fn pump(
         &self,
-        child: &mut std::process::Child,
+        guard: ChildGuard,
         stdout: std::process::ChildStdout,
         stderr: std::process::ChildStderr,
         deadline: Duration,
     ) -> Result<RunnerResponse, RunnerError> {
-        let start = Instant::now();
-        let out_fd = stdout.as_raw_fd();
-        let err_fd = stderr.as_raw_fd();
-        proc::set_nonblocking(out_fd).map_err(|e| RunnerError::Transport {
-            message: format!("setting stdout non-blocking: {e}"),
-        })?;
-        proc::set_nonblocking(err_fd).map_err(|e| RunnerError::Transport {
-            message: format!("setting stderr non-blocking: {e}"),
-        })?;
-
-        let mut out_buf: Vec<u8> = Vec::new();
-        let mut err_buf: Vec<u8> = Vec::new();
-        let mut out_eof = false;
-        let mut err_eof = false;
-        let mut out_overflow = false;
-        let out_cap = MAX_RESPONSE_BYTES + 4; // frame prefix + payload
-
-        let mut fds = [
-            libc::pollfd {
-                fd: out_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: err_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-
-        let mut status: Option<ExitStatus> = None;
-        loop {
-            drain_fd(
-                out_fd,
-                &mut out_buf,
-                &mut out_eof,
-                &mut out_overflow,
-                out_cap,
-            );
-            drain_fd(
-                err_fd,
-                &mut err_buf,
-                &mut err_eof,
-                &mut false,
-                MAX_STDERR_BYTES,
-            );
-
-            if status.is_none() {
-                status = child.try_wait().map_err(|e| RunnerError::Transport {
-                    message: format!("waiting for bridge: {e}"),
-                })?;
-            }
-
-            if out_overflow {
-                kill_and_reap(child);
-                return Err(RunnerError::Transport {
-                    message: format!("response exceeds {MAX_RESPONSE_BYTES} bytes"),
-                });
-            }
-
-            // Fast path: both pipes reached EOF, so the child has closed its stdio. Reap
-            // it and finish; this avoids lingering until the deadline when a bridge exits
-            // after writing its frame but `try_wait` has not yet observed the exit. The
-            // reap is deadline-bounded and kills a child that closes its pipes but never
-            // exits, so it can never block past the caller's deadline.
-            if out_eof && err_eof {
-                let budget = deadline.saturating_sub(start.elapsed());
-                let status = self.reap_bounded(child, budget, deadline)?;
-                return self.finish(status, &out_buf);
-            }
-
-            if let Some(status) = status.take() {
-                // Final drain: the child has closed its write ends, so a complete frame
-                // (and any trailing stderr) is now visible.
-                drain_fd(
-                    out_fd,
-                    &mut out_buf,
-                    &mut out_eof,
-                    &mut out_overflow,
-                    out_cap,
-                );
-                drain_fd(
-                    err_fd,
-                    &mut err_buf,
-                    &mut err_eof,
-                    &mut false,
-                    MAX_STDERR_BYTES,
-                );
-                if out_overflow {
-                    return Err(RunnerError::Transport {
-                        message: format!("response exceeds {MAX_RESPONSE_BYTES} bytes"),
-                    });
-                }
-                return self.finish(status, &out_buf);
-            }
-
-            let elapsed = start.elapsed();
-            if elapsed >= deadline {
-                return self.on_deadline(child, deadline, &err_buf);
-            }
-            let remaining = deadline.saturating_sub(elapsed);
-            let poll_ms = remaining.as_millis().min(POLL_GRANULARITY.as_millis()) as i32;
-
-            match proc::poll(&mut fds, poll_ms) {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    kill_and_reap(child);
-                    return Err(RunnerError::Transport {
-                        message: format!("poll on bridge pipes: {e}"),
-                    });
-                }
-            }
-        }
-    }
-
-    /// Wait for an EOF'd child to exit within `budget`, killing and reaping it on overrun.
-    ///
-    /// Used only after both stdio pipes have reached EOF; a child that closes its pipes
-    /// but stays alive must not block the caller past the deadline. `reported_deadline` is
-    /// the caller-facing deadline echoed in [`RunnerError::Timeout`].
-    fn reap_bounded(
-        &self,
-        child: &mut std::process::Child,
-        budget: Duration,
-        reported_deadline: Duration,
-    ) -> Result<ExitStatus, RunnerError> {
-        let start = Instant::now();
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => return Ok(status),
-                Ok(None) => {}
-                Err(e) => {
-                    return Err(RunnerError::Transport {
-                        message: format!("waiting for bridge: {e}"),
-                    });
-                }
-            }
-            if start.elapsed() >= budget {
-                kill_and_reap(child);
-                return Err(RunnerError::Timeout {
-                    deadline_ms: reported_deadline.as_millis() as u64,
-                    windows_pid: None,
-                    taskkill_attempted: false,
-                });
-            }
-            let sleep = POLL_GRANULARITY.min(budget.saturating_sub(start.elapsed()));
-            std::thread::sleep(sleep);
+        match drive_child(
+            guard,
+            stdout,
+            stderr,
+            deadline,
+            MAX_RESPONSE_BYTES + 4, // frame prefix + payload
+            MAX_STDERR_BYTES,
+        ) {
+            DriveOutcome::Exited { status, stdout, .. } => self.finish(status, &stdout),
+            DriveOutcome::TimedOut { stderr } => self.deadline_error(deadline, &stderr),
+            DriveOutcome::StdoutOverflow => Err(RunnerError::Transport {
+                message: format!("response exceeds {MAX_RESPONSE_BYTES} bytes"),
+            }),
+            DriveOutcome::Failed { message } => Err(RunnerError::Transport { message }),
         }
     }
 
@@ -737,15 +610,14 @@ impl Runner {
         Ok(runner_response(response))
     }
 
-    /// Deadline expired: kill the shim, reap it, and best-effort cancel the Windows PID.
-    fn on_deadline(
+    /// Deadline expired: the child has already been killed and reaped by the [`ChildGuard`]
+    /// inside [`drive_child`]; best-effort cancel the Windows PID reported on stderr.
+    fn deadline_error(
         &self,
-        child: &mut std::process::Child,
         deadline: Duration,
         err_buf: &[u8],
     ) -> Result<RunnerResponse, RunnerError> {
         let windows_pid = parse_pid_line(err_buf);
-        kill_and_reap(child);
         let taskkill_attempted = match windows_pid {
             Some(pid) => {
                 self.taskkill(pid);
@@ -916,46 +788,235 @@ fn runner_response(response: Response) -> RunnerResponse {
     }
 }
 
-/// Read whatever is currently buffered on `fd` into `buf`.
+/// Owns a spawned child and guarantees it is killed and reaped on drop.
 ///
-/// Stops at `WouldBlock` (pipe drained) or EOF. Once `buf` would exceed `cap`, sets
-/// `overflow` and stops accumulating — the caller then kills the child.
-fn drain_fd(
-    fd: std::os::fd::RawFd,
-    buf: &mut Vec<u8>,
-    eof: &mut bool,
-    overflow: &mut bool,
-    cap: usize,
-) {
-    let mut chunk = [0u8; 8192];
-    loop {
-        match proc::read(fd, &mut chunk) {
-            Ok(0) => {
-                *eof = true;
-                return;
-            }
-            Ok(n) => {
-                if buf.len() + n > cap {
-                    *overflow = true;
-                    return;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => {
-                *eof = true;
-                return;
-            }
+/// `std::process::Child` does *not* reap on drop, so every early return in the
+/// spawn/write/drain paths used to leak a running (root-spawned) child. Wrapping the
+/// child in this guard makes those paths safe by construction: whatever `?`/`return`
+/// unwinds, the child is `SIGKILL`ed and waited on.
+struct ChildGuard {
+    child: Option<std::process::Child>,
+}
+
+impl ChildGuard {
+    fn new(child: std::process::Child) -> ChildGuard {
+        ChildGuard { child: Some(child) }
+    }
+
+    /// Access the still-owned child.
+    fn child_mut(&mut self) -> &mut std::process::Child {
+        self.child.as_mut().expect("child is alive until reaped")
+    }
+
+    /// Non-blocking reap. Records the exit so `Drop` will not kill/reap again.
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(None);
+        };
+        let status = child.try_wait()?;
+        if status.is_some() {
+            self.child = None;
+        }
+        Ok(status)
+    }
+
+    /// `SIGKILL` (via `Child::kill`) and reap, ignoring errors. Idempotent.
+    fn kill_and_reap(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            // `Child::kill` sends SIGKILL; `wait` reaps the process so no zombie remains.
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }
 
-/// `SIGKILL` and reap a child, ignoring errors.
-fn kill_and_reap(child: &mut std::process::Child) {
-    proc::kill_sigkill(child.id() as i32);
-    let _ = child.kill();
-    let _ = child.wait();
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        self.kill_and_reap();
+    }
+}
+
+/// Bounded capture of a single non-blocking child descriptor.
+///
+/// `overflow` is a *real* persisted flag: once set, [`DrainState::drain`] stops reading
+/// and [`DrainState::pollin`] reports the fd as inactive, so an over-cap fd is removed
+/// from `poll` instead of staying readable and busy-spinning the loop at ~100% CPU.
+struct DrainState {
+    fd: std::os::fd::RawFd,
+    buf: Vec<u8>,
+    cap: usize,
+    eof: bool,
+    overflow: bool,
+}
+
+impl DrainState {
+    fn new(fd: std::os::fd::RawFd, cap: usize) -> DrainState {
+        DrainState {
+            fd,
+            buf: Vec::new(),
+            cap,
+            eof: false,
+            overflow: false,
+        }
+    }
+
+    /// Read whatever is currently buffered, stopping at EOF, `WouldBlock`, or the cap.
+    fn drain(&mut self) {
+        if self.eof || self.overflow {
+            return;
+        }
+        let mut chunk = [0u8; 8192];
+        loop {
+            match proc::read(self.fd, &mut chunk) {
+                Ok(0) => {
+                    self.eof = true;
+                    return;
+                }
+                Ok(n) => {
+                    if self.buf.len() + n > self.cap {
+                        self.overflow = true;
+                        return;
+                    }
+                    self.buf.extend_from_slice(&chunk[..n]);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    self.eof = true;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Whether this fd still needs to be polled (no EOF, no overflow).
+    fn pollin(&self) -> bool {
+        !self.eof && !self.overflow
+    }
+}
+
+/// Outcome of driving a child's stdio under a deadline.
+enum DriveOutcome {
+    /// The child exited; buffers are final.
+    Exited {
+        status: ExitStatus,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
+    /// The deadline elapsed; the child has been killed and reaped.
+    TimedOut { stderr: Vec<u8> },
+    /// stdout exceeded its cap; the child has been killed and reaped.
+    StdoutOverflow,
+    /// `poll`/`wait`/`fcntl` failed; the child has been killed and reaped.
+    Failed { message: String },
+}
+
+/// Shared bounded-IO engine: drive a child's stdout/stderr to completion under a hard
+/// deadline.
+///
+/// Both [`Runner::pump`] and [`InteropCommand::run`] use this instead of maintaining
+/// duplicate deadline/poll/drain loops. It owns the [`ChildGuard`], so it *always* reaps
+/// the child on every exit path. Per-fd [`DrainState`]s cap the retained bytes and drop
+/// an over-cap descriptor from `poll`, which bounds CPU as well as memory.
+fn drive_child(
+    mut guard: ChildGuard,
+    stdout: std::process::ChildStdout,
+    stderr: std::process::ChildStderr,
+    deadline: Duration,
+    out_cap: usize,
+    err_cap: usize,
+) -> DriveOutcome {
+    let start = Instant::now();
+    let out_fd = stdout.as_raw_fd();
+    let err_fd = stderr.as_raw_fd();
+    if let Err(e) = proc::set_nonblocking(out_fd) {
+        return DriveOutcome::Failed {
+            message: format!("setting stdout non-blocking: {e}"),
+        };
+    }
+    if let Err(e) = proc::set_nonblocking(err_fd) {
+        return DriveOutcome::Failed {
+            message: format!("setting stderr non-blocking: {e}"),
+        };
+    }
+
+    let mut out = DrainState::new(out_fd, out_cap);
+    let mut err = DrainState::new(err_fd, err_cap);
+    let mut fds = [
+        libc::pollfd {
+            fd: out_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: err_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+
+    loop {
+        out.drain();
+        err.drain();
+
+        match guard.try_wait() {
+            Ok(Some(status)) => {
+                // Final drain: the child has closed its write ends, so a complete frame
+                // (and any trailing stderr) is now visible.
+                out.drain();
+                err.drain();
+                if out.overflow {
+                    return DriveOutcome::StdoutOverflow;
+                }
+                return DriveOutcome::Exited {
+                    status,
+                    stdout: out.buf,
+                    stderr: err.buf,
+                };
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return DriveOutcome::Failed {
+                    message: format!("waiting for child: {e}"),
+                };
+            }
+        }
+
+        if out.overflow {
+            return DriveOutcome::StdoutOverflow;
+        }
+
+        let elapsed = start.elapsed();
+        if elapsed >= deadline {
+            return DriveOutcome::TimedOut { stderr: err.buf };
+        }
+        let remaining = deadline.saturating_sub(elapsed);
+
+        let out_active = out.pollin();
+        let err_active = err.pollin();
+        if !out_active && !err_active {
+            // Nothing more can be read (EOF/HUP, or an over-cap stderr fd). Polling would
+            // return immediately and spin; sleep out the remaining budget instead. The
+            // child is reaped above and killed by the guard if the deadline fires.
+            std::thread::sleep(POLL_GRANULARITY.min(remaining));
+            continue;
+        }
+
+        fds[0].fd = if out_active { out_fd } else { -1 };
+        fds[1].fd = if err_active { err_fd } else { -1 };
+        fds[0].revents = 0;
+        fds[1].revents = 0;
+        let poll_ms = remaining.as_millis().min(POLL_GRANULARITY.as_millis()) as i32;
+        match proc::poll(&mut fds, poll_ms) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                return DriveOutcome::Failed {
+                    message: format!("poll on child pipes: {e}"),
+                };
+            }
+        }
+    }
 }
 
 /// Parse `PID <n>` from the first stderr line, if present.
@@ -1058,83 +1119,50 @@ impl InteropCommand {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command.spawn().map_err(|source| RunnerError::Spawn {
+        let child = command.spawn().map_err(|source| RunnerError::Spawn {
             path: resolved,
             source,
         })?;
-        let stdout = child.stdout.take().expect("stdout was piped");
-        let stderr = child.stderr.take().expect("stderr was piped");
-        let start = Instant::now();
-        let out_fd = stdout.as_raw_fd();
-        let err_fd = stderr.as_raw_fd();
-        proc::set_nonblocking(out_fd).map_err(|e| RunnerError::Transport {
-            message: format!("setting stdout non-blocking: {e}"),
-        })?;
-        proc::set_nonblocking(err_fd).map_err(|e| RunnerError::Transport {
-            message: format!("setting stderr non-blocking: {e}"),
-        })?;
-        let mut out_buf = Vec::new();
-        let mut err_buf = Vec::new();
-        let (mut out_eof, mut err_eof) = (false, false);
-        let mut fds = [
-            libc::pollfd {
-                fd: out_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: err_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        loop {
-            drain_fd(
-                out_fd,
-                &mut out_buf,
-                &mut out_eof,
-                &mut false,
-                MAX_RESPONSE_BYTES,
-            );
-            drain_fd(
-                err_fd,
-                &mut err_buf,
-                &mut err_eof,
-                &mut false,
-                MAX_STDERR_BYTES,
-            );
-            if let Some(status) = child.try_wait().map_err(|e| RunnerError::Transport {
-                message: format!("waiting for {program}: {e}"),
-            })? {
-                return Ok(Output {
-                    status,
-                    stdout: out_buf,
-                    stderr: err_buf,
-                });
-            }
-            let elapsed = start.elapsed();
-            if elapsed >= deadline {
-                kill_and_reap(&mut child);
-                return Err(RunnerError::Timeout {
-                    deadline_ms: deadline.as_millis() as u64,
-                    windows_pid: None,
-                    taskkill_attempted: false,
-                });
-            }
-            let remaining = deadline.saturating_sub(elapsed);
-            let poll_ms = remaining.as_millis().min(POLL_GRANULARITY.as_millis()) as i32;
-            match proc::poll(&mut fds, poll_ms) {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    kill_and_reap(&mut child);
-                    return Err(RunnerError::Transport {
-                        message: format!("poll on {program} pipes: {e}"),
-                    });
-                }
-            }
+        let mut guard = ChildGuard::new(child);
+        let stdout = guard.child_mut().stdout.take().expect("stdout was piped");
+        let stderr = guard.child_mut().stderr.take().expect("stderr was piped");
+        match drive_child(
+            guard,
+            stdout,
+            stderr,
+            deadline,
+            MAX_RESPONSE_BYTES,
+            MAX_STDERR_BYTES,
+        ) {
+            DriveOutcome::Exited {
+                status,
+                stdout,
+                stderr,
+            } => Ok(Output {
+                status,
+                stdout,
+                stderr,
+            }),
+            DriveOutcome::TimedOut { .. } => Err(RunnerError::Timeout {
+                deadline_ms: deadline.as_millis() as u64,
+                windows_pid: None,
+                taskkill_attempted: false,
+            }),
+            DriveOutcome::StdoutOverflow => Err(RunnerError::Transport {
+                message: format!("output exceeds {MAX_RESPONSE_BYTES} bytes"),
+            }),
+            DriveOutcome::Failed { message } => Err(RunnerError::Transport { message }),
         }
     }
+}
+
+/// Test-support hook: perform a single `write(2)` through the runner's SIGPIPE-safe path.
+///
+/// Exposed (`#[doc(hidden)]`) so the `sigpipe-probe` helper binary can verify that a
+/// closed read end never delivers `SIGPIPE` to a `SIGPIPE=SIG_DFL` host process.
+#[doc(hidden)]
+pub fn test_write_fd(fd: std::os::fd::RawFd, bytes: &[u8]) -> std::io::Result<usize> {
+    proc::write(fd, bytes)
 }
 
 #[cfg(test)]
@@ -1196,5 +1224,100 @@ mod tests {
             matches!(err, RunnerError::InteropHelperMissing { .. }),
             "{err:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // L2-3 child lifecycle: the guard must kill+reap on every exit path.
+    // -----------------------------------------------------------------------
+
+    /// Dropping the guard around a live child must `SIGKILL` and reap it, so any early
+    /// return that unwinds through the guard cannot leak a root-owned process.
+    #[test]
+    fn child_guard_kills_and_reaps_on_drop() {
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let guard = ChildGuard::new(child);
+        assert!(proc::process_alive(pid), "child should be running");
+        drop(guard);
+        assert!(
+            !proc::process_alive(pid),
+            "child {pid} survived guard drop (not killed/reaped)"
+        );
+    }
+
+    /// A child observed via `try_wait` is marked reaped, so the guard's drop neither
+    /// kills nor double-reaps it, and the process is gone.
+    #[test]
+    fn child_guard_try_wait_reaps_without_kill() {
+        let child = Command::new("/bin/true").spawn().expect("spawn true");
+        let pid = child.id();
+        let mut guard = ChildGuard::new(child);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            matches!(guard.try_wait(), Ok(Some(_))),
+            "should have exited"
+        );
+        drop(guard);
+        assert!(!proc::process_alive(pid), "child {pid} was not reaped");
+    }
+
+    // -----------------------------------------------------------------------
+    // L2-1 = L9-2 bounded IO: an over-cap descriptor must not busy-drain.
+    // -----------------------------------------------------------------------
+
+    /// A child that floods stderr past `MAX_STDERR_BYTES` and then blocks must be waited
+    /// out to the deadline without the drain loop spinning the calling thread.
+    #[test]
+    fn stderr_flood_does_not_spin() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let deadline = Duration::from_millis(400);
+        let runner = Runner::without_interop_check("/bin/sh", dir.path())
+            .args(["-c", "while :; do printf x 1>&2; done"]);
+
+        let cpu_before = proc::thread_cpu_time();
+        let start = Instant::now();
+        let err = runner.probe(deadline).expect_err("must time out");
+        let elapsed = start.elapsed();
+        let cpu = proc::thread_cpu_time().saturating_sub(cpu_before);
+
+        assert!(matches!(err, RunnerError::Timeout { .. }), "{err:?}");
+        assert!(
+            cpu < Duration::from_millis(150),
+            "stderr drain spun the calling thread: cpu={cpu:?} over wall={elapsed:?}"
+        );
+        assert!(
+            elapsed < deadline + Duration::from_secs(2),
+            "timeout should fire near the deadline, took {elapsed:?}"
+        );
+    }
+
+    /// The shared engine gives `InteropCommand::run` real overflow state for *both*
+    /// pipes, so a stdout/stderr flood is bounded instead of a `~100%` CPU spin.
+    #[test]
+    fn interop_command_stderr_flood_does_not_spin() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let deadline = Duration::from_millis(400);
+
+        let cpu_before = proc::thread_cpu_time();
+        let start = Instant::now();
+        let err = InteropCommand::run(
+            "/bin/sh",
+            &["-c", "while :; do printf x 1>&2; done"],
+            dir.path(),
+            deadline,
+        )
+        .expect_err("must time out");
+        let elapsed = start.elapsed();
+        let cpu = proc::thread_cpu_time().saturating_sub(cpu_before);
+
+        assert!(matches!(err, RunnerError::Timeout { .. }), "{err:?}");
+        assert!(
+            cpu < Duration::from_millis(150),
+            "stderr drain spun the calling thread: cpu={cpu:?} over wall={elapsed:?}"
+        );
+        assert!(elapsed < deadline + Duration::from_secs(2));
     }
 }

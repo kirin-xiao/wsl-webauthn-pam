@@ -20,6 +20,9 @@
 //! * `sleep=<ms>` — read the request, then sleep before responding (`sleep=0` + no
 //!   response exercises the timeout path). Combine with `pidline=1` to test escalation.
 //! * `noread=1` — do not read the request (write path only).
+//! * `closestdin=1` — close fd 0 before the runner writes, so the write hits `EPIPE`
+//!   (SIGPIPE-driver test); still answers a synthesized `probe`.
+//! * `stderrflood=<n>` — write `n` bytes of filler to stderr (over-cap drain test).
 //! * `exit=<code>` — exit with the given code without writing a response.
 //! * `garbage=1` — write non-framed bytes, then exit 0.
 //! * `badframe=1` — write a plausible length prefix followed by *too few* bytes, then
@@ -45,6 +48,8 @@ struct Opts {
     pidline: bool,
     sleep_ms: u64,
     noread: bool,
+    closestdin: bool,
+    stderr_flood: Option<usize>,
     exit_code: Option<i32>,
     garbage: bool,
     badframe: bool,
@@ -64,6 +69,8 @@ impl Default for Opts {
             pidline: false,
             sleep_ms: 0,
             noread: false,
+            closestdin: false,
+            stderr_flood: None,
             exit_code: None,
             garbage: false,
             badframe: false,
@@ -91,6 +98,8 @@ fn parse_args() -> Opts {
             "pidline" => opts.pidline = value == "1",
             "sleep" => opts.sleep_ms = value.parse().unwrap_or(0),
             "noread" => opts.noread = value == "1",
+            "closestdin" => opts.closestdin = value == "1",
+            "stderrflood" => opts.stderr_flood = value.parse().ok(),
             "exit" => opts.exit_code = value.parse().ok(),
             "garbage" => opts.garbage = value == "1",
             "badframe" => opts.badframe = value == "1",
@@ -147,6 +156,14 @@ fn write_frame(response: &Response) -> std::io::Result<()> {
 fn main() -> ExitCode {
     let opts = parse_args();
 
+    if opts.closestdin {
+        // Close the read end of the runner's stdin pipe before it writes, so the parent's
+        // write observes EPIPE (the SIGPIPE-driver path). SAFETY: closing an owned fd.
+        unsafe {
+            libc::close(0);
+        }
+    }
+
     if opts.pidline {
         // Mimic the bridge's `PID <n>\n` first stderr line; there is no Windows side
         // here so the Linux pid stands in.
@@ -157,7 +174,19 @@ fn main() -> ExitCode {
         eprintln!("another log line that is not the PID line");
     }
 
-    let request = if opts.noread { None } else { read_request() };
+    if let Some(n) = opts.stderr_flood {
+        // Flood stderr past the runner's `MAX_STDERR_BYTES` cap to exercise the bounded
+        // drain (an over-cap fd must be dropped from poll, not busy-drained).
+        let mut stderr = std::io::stderr();
+        let _ = stderr.write_all(&filler(n));
+        let _ = stderr.flush();
+    }
+
+    let request = if opts.noread || opts.closestdin {
+        None
+    } else {
+        read_request()
+    };
 
     if opts.sleep_ms > 0 {
         std::thread::sleep(Duration::from_millis(opts.sleep_ms));
@@ -199,9 +228,10 @@ fn main() -> ExitCode {
 
     let req = match request {
         Some(req) => req,
-        // `noread` answers a synthesized probe without ever reading stdin, so the runner's
-        // deadline-bounded stdin write can be exercised against a non-reading child.
-        None if opts.noread => Request::Probe { timeout_ms: 1 },
+        // `noread`/`closestdin` answer a synthesized probe without ever reading stdin, so
+        // the runner's deadline-bounded stdin write can be exercised against a
+        // non-reading (or early-closed) child.
+        None if opts.noread || opts.closestdin => Request::Probe { timeout_ms: 1 },
         // No request to answer; behave like a clean empty exit.
         None => return ExitCode::SUCCESS,
     };

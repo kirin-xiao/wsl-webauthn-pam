@@ -632,6 +632,45 @@ fn install_rolls_back_partial_state_on_module_failure() {
     );
 }
 
+#[test]
+fn install_overwrite_failure_restores_previous_module_and_config() {
+    let h = Harness::new();
+    // Simulate an upgrade/re-install over an already-working install: the module and
+    // config already exist with known bytes.
+    let old_module = b"OLD-WORKING-MODULE-BYTES".to_vec();
+    let old_config = b"bridge_path = \"/old/bridge.exe\"\nwin_mnt = \"/mnt/old\"\n".to_vec();
+    write(&h.module_dir.join(MODULE_NAME), &old_module, MODULE_MODE);
+    write(&h.paths.config_path(), &old_config, CONFIG_MODE);
+
+    // Force a *later* step (provision_profile) to fail: its destination is a directory,
+    // so the atomic write is refused.
+    std::fs::create_dir_all(h.paths.profile_path()).unwrap();
+
+    let err = h
+        .run_install(
+            &ScriptedPrompter::always(true),
+            &MockEnroller::default(),
+            &MockCommands::default(),
+            &h.opts(),
+        )
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("profile"), "{err:#}");
+
+    // The pre-existing artifacts must be restored byte-for-byte, not deleted.
+    assert_eq!(
+        std::fs::read(h.module_dir.join(MODULE_NAME)).unwrap(),
+        old_module,
+        "the previous module must be restored, not deleted"
+    );
+    assert_eq!(
+        std::fs::read(h.paths.config_path()).unwrap(),
+        old_config,
+        "the previous config must be restored, not deleted"
+    );
+    // Files this run genuinely created before the failure are still rolled back.
+    assert!(!h.bridge_dest().exists(), "new bridge must be rolled back");
+}
+
 // ---------------------------------------------------------------------------
 // Legacy migration
 // ---------------------------------------------------------------------------
@@ -650,6 +689,22 @@ fn write_pam_d_file(h: &Harness, name: &str, body: &str) -> PathBuf {
     let path = h.paths.pam_d.join(name);
     write(&path, body.as_bytes(), 0o644);
     path
+}
+
+/// The timestamped `/etc/pam.d` backups migration leaves behind, sorted.
+fn pam_d_backups(h: &Harness) -> Vec<PathBuf> {
+    let mut backups: Vec<PathBuf> = std::fs::read_dir(&h.paths.pam_d)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().contains(fsutil::BACKUP_MARKER))
+                .unwrap_or(false)
+        })
+        .collect();
+    backups.sort();
+    backups
 }
 
 #[test]
@@ -834,6 +889,76 @@ fn migration_declining_rewrite_leaves_file_unchanged() {
     assert!(h.module_dir.join(LEGACY_MODULE_NAME).exists());
 }
 
+#[test]
+fn migration_normalizes_unsafe_required_legacy_line() {
+    let h = Harness::new();
+    install_legacy_fixture(&h);
+    // A legacy `required` control: a blind stem swap would gate sudo/su on Hello with no
+    // password fallback.
+    let pam_file = write_pam_d_file(&h, "sudo", "auth required pam_wsl_hello.so\n");
+
+    let prompter = ScriptedPrompter::always(true);
+    h.run_install(
+        &prompter,
+        &MockEnroller::default(),
+        &MockCommands {
+            success: true,
+            ..MockCommands::default()
+        },
+        &h.opts(),
+    )
+    .unwrap();
+
+    let rewritten = std::fs::read_to_string(&pam_file).unwrap();
+    assert!(!rewritten.contains("pam_wsl_hello"), "{rewritten}");
+    assert!(
+        !rewritten.contains("auth required"),
+        "the unsafe control must not be preserved: {rewritten}"
+    );
+    assert_eq!(
+        rewritten,
+        "auth [success=end default=ignore] pam_wsl_webauthn.so\n"
+    );
+    // The fail-safe normalization demanded an explicit second confirmation.
+    assert!(
+        prompter.questions().iter().any(|q| q.contains("fail-safe")),
+        "expected a second confirmation about the unsafe control: {:?}",
+        prompter.questions()
+    );
+}
+
+#[test]
+fn migration_keeps_sufficient_legacy_line_without_second_confirmation() {
+    let h = Harness::new();
+    install_legacy_fixture(&h);
+    let pam_file = write_pam_d_file(&h, "sudo", "auth sufficient pam_wsl_hello.so\n");
+
+    let prompter = ScriptedPrompter::always(true);
+    h.run_install(
+        &prompter,
+        &MockEnroller::default(),
+        &MockCommands {
+            success: true,
+            ..MockCommands::default()
+        },
+        &h.opts(),
+    )
+    .unwrap();
+
+    // A sufficient control is already fail-safe: only the stem changes.
+    assert_eq!(
+        std::fs::read_to_string(&pam_file).unwrap(),
+        "auth sufficient pam_wsl_webauthn.so\n"
+    );
+    assert!(
+        prompter
+            .questions()
+            .iter()
+            .all(|q| !q.contains("fail-safe")),
+        "no normalization prompt expected for a safe control"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Uninstall
 // ---------------------------------------------------------------------------
@@ -915,12 +1040,69 @@ fn uninstall_all_removes_provisioned_artifacts_but_not_legacy() {
         "bridge dir removed"
     );
 
-    // Legacy untouched; leftover pam.d reference untouched (warn only).
+    // Legacy untouched. A *bare* pam.d reference with no migration backup is still
+    // warn-only on uninstall (the restore path is covered by
+    // `uninstall_restores_rewritten_pam_d_from_backup`).
     assert!(h.paths.legacy_config_dir.exists(), "legacy must survive");
+    assert!(pam_d_backups(&h).is_empty(), "no backup to restore here");
     assert!(leftover.exists());
     assert_eq!(
         std::fs::read(&leftover).unwrap(),
         b"auth sufficient pam_wsl_webauthn.so\n"
+    );
+}
+
+#[test]
+fn uninstall_restores_rewritten_pam_d_from_backup() {
+    let h = Harness::new();
+    install_legacy_fixture(&h);
+    let body = "auth sufficient pam_unix.so\nauth sufficient pam_wsl_hello.so debug\n";
+    let pam_file = write_pam_d_file(&h, "common-auth", body);
+
+    // Install migrates `pam_wsl_hello` → `pam_wsl_webauthn` and leaves a backup.
+    h.run_install(
+        &ScriptedPrompter::always(true),
+        &MockEnroller::default(),
+        &MockCommands {
+            success: true,
+            ..MockCommands::default()
+        },
+        &h.opts(),
+    )
+    .unwrap();
+    assert!(
+        std::fs::read_to_string(&pam_file)
+            .unwrap()
+            .contains("pam_wsl_webauthn.so")
+    );
+    assert_eq!(pam_d_backups(&h).len(), 1, "one migration backup expected");
+
+    // Uninstall restores the original before removing our module, then consumes the
+    // backup (idempotent).
+    let code = uninstall_all(
+        &h.paths,
+        &h.interop(),
+        &MockCommands {
+            success: true,
+            ..MockCommands::default()
+        },
+        &ScriptedPrompter::always(true),
+        &UninstallOptions {
+            win_mnt: Some(h.win_mnt.clone()),
+            module_dir: Some(h.module_dir.clone()),
+        },
+    )
+    .unwrap();
+    assert_eq!(code, EXIT_OK);
+    assert_eq!(
+        std::fs::read(&pam_file).unwrap(),
+        body.as_bytes(),
+        "the original pam_wsl_hello line must be restored"
+    );
+    assert!(pam_d_backups(&h).is_empty(), "backup must be consumed");
+    assert!(
+        !h.module_dir.join(MODULE_NAME).exists(),
+        "our module must be removed"
     );
 }
 

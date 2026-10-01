@@ -147,6 +147,9 @@ pub struct TestDeps {
     pub sha256: Sha256Behavior,
     /// Bytes returned by `fill_random` (copied, repeated if needed).
     pub random: [u8; 32],
+    /// When set, `fill_random` reports an entropy failure instead of filling bytes
+    /// (drives the `PAM_AUTHINFO_UNAVAIL` mapping without a real RNG failure).
+    pub random_error: Option<String>,
     /// Runner behaviour.
     pub runner: RunnerBehavior,
     /// When true, `panic_probe` panics (drives the `PAM_ABORT` mapping).
@@ -230,10 +233,14 @@ impl Deps for TestDeps {
         }
     }
 
-    fn fill_random(&self, dest: &mut [u8]) {
+    fn fill_random(&self, dest: &mut [u8]) -> Result<(), String> {
+        if let Some(e) = &self.random_error {
+            return Err(e.clone());
+        }
         for (i, b) in dest.iter_mut().enumerate() {
             *b = self.random[i % self.random.len()];
         }
+        Ok(())
     }
 
     fn authenticate(
@@ -570,6 +577,7 @@ impl Fixture {
             record: RecordReply::NotFound,
             sha256: Sha256Behavior::OfFile,
             random: self.challenge,
+            random_error: None,
             runner: RunnerBehavior {
                 bridge: PathBuf::from(FAKE_BRIDGE),
                 win_mnt: self.tmp.path().to_path_buf(),

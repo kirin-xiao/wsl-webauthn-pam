@@ -17,6 +17,7 @@ use wsl_webauthn_runner::{
 };
 
 const FAKE: &str = env!("CARGO_BIN_EXE_fake-bridge");
+const SIGPIPE_PROBE: &str = env!("CARGO_BIN_EXE_sigpipe-probe");
 
 /// A directory to use as the child's `current_dir` (the Linux-FS cwd trap only affects
 /// real interop; any directory works for the fake bridge).
@@ -385,6 +386,63 @@ fn interop_command_run_captures_stdout_and_status() {
     .expect("echo must run");
     assert!(out.status.success());
     assert_eq!(out.stdout, b"hello world\n");
+}
+
+#[test]
+fn child_closing_stdin_early_is_still_served() {
+    // The child closes fd 0 before the request is written, so the request write may hit
+    // EPIPE; the framed response on stdout is authoritative and must still be honored.
+    let dir = cwd_dir();
+    let r = build_runner(dir.path(), &["ok", "closestdin=1"]);
+    assert!(matches!(
+        r.probe(Duration::from_secs(5)),
+        Ok(RunnerResponse::Probe { .. })
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// SIGPIPE (L9-1): a closed stdin must never kill a SIGPIPE=SIG_DFL host
+// ---------------------------------------------------------------------------
+
+#[test]
+fn closed_stdin_write_cannot_sigpipe_kill_host() {
+    // `sigpipe-probe` resets SIGPIPE to SIG_DFL (as sudo/su/sshd leave it), writes to a
+    // closed pipe through the runner's write path, and drives a stdin-closing fake
+    // bridge. With the fix it exits 0; without it, SIGPIPE terminates it (signal exit).
+    let dir = cwd_dir();
+    let out = std::process::Command::new(SIGPIPE_PROBE)
+        .env("FAKE_BRIDGE", FAKE)
+        .env("FAKE_BRIDGE_CWD", dir.path())
+        .output()
+        .expect("spawn sigpipe-probe");
+    assert!(
+        out.status.success(),
+        "sigpipe-probe failed: status={:?} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Over-cap stderr (L2-1 = L9-2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stderr_flood_times_out_and_is_bounded() {
+    // Flood stderr well past MAX_STDERR_BYTES, then sleep: the over-cap fd must be
+    // dropped from poll, so we reach a Timeout near the deadline instead of spinning.
+    let dir = cwd_dir();
+    let r = build_runner(dir.path(), &["ok", "stderrflood=16384", "sleep=5000"]);
+    let start = Instant::now();
+    let err = r
+        .probe(Duration::from_millis(300))
+        .expect_err("must time out");
+    let elapsed = start.elapsed();
+    assert!(matches!(err, RunnerError::Timeout { .. }), "{err:?}");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "flood should time out promptly, took {elapsed:?}"
+    );
 }
 
 #[test]

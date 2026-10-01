@@ -34,10 +34,11 @@
 //!    enrollment **last**.
 //!
 //! Any step *up to and including verification* that fails rolls back exactly what *this
-//! run* wrote (new files and directories are removed) and returns a non-zero exit.
-//! Nothing after verification is rolled back: committing before migration means a
-//! failure can never remove the module/profile or un-rewrite a `/etc/pam.d` file back
-//! into a stale `pam_wsl_hello` reference.
+//! run* wrote: new files and directories are removed and any file this run *overwrote*
+//! is restored from a pre-write snapshot (so an upgrade/re-install failure cannot delete
+//! a previously-working module/config). Nothing after verification is rolled back:
+//! committing before migration means a failure can never remove the module/profile or
+//! un-rewrite a `/etc/pam.d` file back into a stale `pam_wsl_hello` reference.
 
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -313,13 +314,23 @@ pub(crate) struct UninstallOptions {
 
 /// One reversible action recorded during install.
 ///
-/// Only **new** artifacts are rolled back (the plan's "remove what this run wrote"); an
-/// existing file is never rewritten by provisioning, so no restore action is needed.
+/// Provisioning overwrites destinations (temp file + `rename(2)`), so a rollback cannot
+/// simply delete a path: a file this run *created* is removed, while a file it
+/// *overwrote* is restored from the bytes+mode snapshotted just before the write.
 enum Action {
     /// A file this run created; removing it undoes the action.
     NewFile(PathBuf),
     /// A directory tree this run created; the exe inside is removed recursively.
     NewDir(PathBuf),
+    /// A file this run overwrote; restoring the snapshot undoes the action.
+    Restore {
+        /// The overwritten path.
+        path: PathBuf,
+        /// The pre-write bytes.
+        bytes: Vec<u8>,
+        /// The pre-write mode (low 12 bits).
+        mode: u32,
+    },
 }
 
 /// Records what this run wrote so a failure can undo exactly that.
@@ -336,8 +347,8 @@ impl Rollback {
         }
     }
 
-    fn created_file(&mut self, path: PathBuf) {
-        self.actions.push(Action::NewFile(path));
+    fn push(&mut self, action: Action) {
+        self.actions.push(action);
     }
 
     fn created_dir(&mut self, path: PathBuf) {
@@ -363,8 +374,41 @@ impl Rollback {
                         eprintln!("warning: rollback could not remove {}: {e}", path.display());
                     }
                 }
+                Action::Restore { path, bytes, mode } => {
+                    if let Err(e) = fsutil::atomic_write(&path, &bytes, mode) {
+                        eprintln!(
+                            "warning: rollback could not restore {}: {e}",
+                            path.display()
+                        );
+                    }
+                }
             }
         }
+    }
+}
+
+/// Snapshot how to undo a write to `path`, *before* the write happens.
+///
+/// Returns a [`Action::Restore`] carrying the existing bytes+mode when `path` is an
+/// existing regular file, or [`Action::NewFile`] when it does not exist yet. Returns
+/// `None` when the destination is a symlink or a non-file (the subsequent atomic write
+/// refuses those anyway, so there is nothing to undo).
+///
+/// Callers must only register the returned action after the write actually succeeded.
+fn prepare_write(path: &Path) -> anyhow::Result<Option<Action>> {
+    match fsutil::lstat_opt(path)? {
+        None => Ok(Some(Action::NewFile(path.to_path_buf()))),
+        Some(md) if md.file_type().is_symlink() => Ok(None),
+        Some(md) if md.is_file() => {
+            let bytes = fsutil::read_nofollow(path)
+                .with_context(|| format!("snapshotting {} before overwrite", path.display()))?;
+            Ok(Some(Action::Restore {
+                path: path.to_path_buf(),
+                bytes,
+                mode: fsutil::mode_of(&md),
+            }))
+        }
+        Some(_) => Ok(None),
     }
 }
 
@@ -600,6 +644,111 @@ fn backup_path(path: &Path) -> PathBuf {
     path.with_file_name(format!("{name}{}.{secs}", fsutil::BACKUP_MARKER))
 }
 
+/// The fail-safe PAM control used when a legacy line's control would gate `sudo`/`su`.
+///
+/// `success=end` makes a successful WebAuthn authentication end the stack; `default=ignore`
+/// makes a failed/skipped one fall through to the password modules below. This mirrors the
+/// shipped `pam-config` profile and is the only control under which replacing a legacy
+/// `required`/`requisite` line is lockout-safe.
+const CANONICAL_CONTROL: &str = "[success=end default=ignore]";
+
+/// Control keywords/modifiers that are already fail-safe: a failed WebAuthn attempt still
+/// falls through to the next PAM module.
+fn control_is_safe(control: &str) -> bool {
+    matches!(control, "sufficient" | "optional")
+        || (control.starts_with('[') && control.contains("success="))
+}
+
+/// Rewrite the legacy module stem in one `/etc/pam.d` line, normalizing an unsafe control.
+///
+/// A blind byte substitution would turn `auth required pam_wsl_hello.so` into
+/// `auth required pam_wsl_webauthn.so`, converting a working password fallback into a
+/// Hello-gated required line (lockout). When the control is not fail-safe this replaces the
+/// whole control field with [`CANONICAL_CONTROL`] and records the original control in
+/// `unsafe_controls` so the caller can demand an explicit second confirmation.
+///
+/// Comment/blank/unparseable lines fall back to a plain stem substitution.
+fn rewrite_legacy_line(line: &[u8], unsafe_controls: &mut Vec<String>) -> Vec<u8> {
+    // Split off the line terminator (preserving CRLF) so tokenization is not confused.
+    let (content, ending): (&[u8], &[u8]) = if let Some(rest) = line.strip_suffix(b"\r\n") {
+        (rest, b"\r\n")
+    } else if let Some(rest) = line.strip_suffix(b"\n") {
+        (rest, b"\n")
+    } else {
+        (line, b"")
+    };
+    let simple = || {
+        let mut out = replace_all(content, LEGACY_MODULE_STEM, MODULE_STEM);
+        out.extend_from_slice(ending);
+        out
+    };
+    let Ok(text) = std::str::from_utf8(content) else {
+        return simple();
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return simple();
+    }
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    if tokens.len() < 2 {
+        return simple();
+    }
+    // Find the extent of the control field: a single token, or a bracketed `[...]` that may
+    // contain spaces.
+    let mut ctrl_end = 1usize;
+    if tokens[1].starts_with('[') {
+        while ctrl_end + 1 < tokens.len() && !tokens[ctrl_end].ends_with(']') {
+            ctrl_end += 1;
+        }
+    }
+    let control = tokens[1..=ctrl_end.min(tokens.len() - 1)].join(" ");
+    if control_is_safe(&control) {
+        return simple();
+    }
+    unsafe_controls.push(control);
+    // Rebuild: leading whitespace + auth-type + canonical control + remaining fields.
+    let leading = content
+        .iter()
+        .take_while(|b| b.is_ascii_whitespace())
+        .count();
+    let mut rest = Vec::new();
+    for (i, token) in tokens[ctrl_end + 1..].iter().enumerate() {
+        if i > 0 {
+            rest.push(b' ');
+        }
+        rest.extend_from_slice(token.as_bytes());
+    }
+    let rest = replace_all(&rest, LEGACY_MODULE_STEM, MODULE_STEM);
+    let mut out = Vec::with_capacity(line.len() + CANONICAL_CONTROL.len());
+    out.extend_from_slice(&content[..leading]);
+    out.extend_from_slice(tokens[0].as_bytes());
+    out.extend_from_slice(b" ");
+    out.extend_from_slice(CANONICAL_CONTROL.as_bytes());
+    if !rest.is_empty() {
+        out.push(b' ');
+        out.extend_from_slice(&rest);
+    }
+    out.extend_from_slice(ending);
+    out
+}
+
+/// Apply [`rewrite_legacy_line`] to every line, collecting unsafe original controls.
+fn rewrite_legacy_references(original: &[u8]) -> (Vec<u8>, Vec<String>) {
+    let mut out = Vec::with_capacity(original.len());
+    let mut unsafe_controls = Vec::new();
+    for line in original.split_inclusive(|&b| b == b'\n') {
+        if line
+            .windows(LEGACY_MODULE_STEM.len())
+            .any(|w| w == LEGACY_MODULE_STEM)
+        {
+            out.extend_from_slice(&rewrite_legacy_line(line, &mut unsafe_controls));
+        } else {
+            out.extend_from_slice(line);
+        }
+    }
+    (out, unsafe_controls)
+}
+
 /// Replace every non-overlapping occurrence of `needle` in `haystack`.
 fn replace_all(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
     if needle.is_empty() {
@@ -707,9 +856,12 @@ fn provision_bridge(
         .ok_or_else(|| anyhow!("bridge destination has no parent: {}", dest.display()))?;
     ensure_dir(parent, 0o755, rollback, "bridge directory")?;
 
+    let undo = prepare_write(&dest)?;
     fsutil::copy_file_atomic(source, &dest, BRIDGE_MODE)
         .with_context(|| format!("installing the bridge to {}", dest.display()))?;
-    rollback.created_file(dest.clone());
+    if let Some(action) = undo {
+        rollback.push(action);
+    }
 
     let hash = sha256_file(&dest).unwrap_or_default();
     println!(
@@ -730,9 +882,12 @@ fn provision_config(
     ensure_dir(&paths.etc_wsl_webauthn, 0o755, rollback, "config directory")?;
     let toml = config_toml(bridge_path, win_mnt);
     let config = paths.config_path();
+    let undo = prepare_write(&config)?;
     fsutil::atomic_write(&config, toml.as_bytes(), CONFIG_MODE)
         .with_context(|| format!("writing {}", config.display()))?;
-    rollback.created_file(config.clone());
+    if let Some(action) = undo {
+        rollback.push(action);
+    }
     println!("  config:      {}", config.display());
 
     let creds = paths.credentials_dir();
@@ -748,9 +903,12 @@ fn provision_module(
     rollback: &mut Rollback,
 ) -> anyhow::Result<PathBuf> {
     let dest = module_dir.join(MODULE_NAME);
+    let undo = prepare_write(&dest)?;
     fsutil::copy_file_atomic(source, &dest, MODULE_MODE)
         .with_context(|| format!("installing the module to {}", dest.display()))?;
-    rollback.created_file(dest.clone());
+    if let Some(action) = undo {
+        rollback.push(action);
+    }
     println!("  module:      {}", dest.display());
     Ok(dest)
 }
@@ -759,9 +917,12 @@ fn provision_module(
 fn provision_profile(paths: &InstallPaths, rollback: &mut Rollback) -> anyhow::Result<PathBuf> {
     ensure_dir(&paths.pam_configs, 0o755, rollback, "pam-configs directory")?;
     let dest = paths.profile_path();
+    let undo = prepare_write(&dest)?;
     fsutil::atomic_write(&dest, PROFILE_TEXT.as_bytes(), PROFILE_MODE)
         .with_context(|| format!("installing the profile to {}", dest.display()))?;
-    rollback.created_file(dest.clone());
+    if let Some(action) = undo {
+        rollback.push(action);
+    }
     println!("  profile:     {}", dest.display());
     Ok(dest)
 }
@@ -886,6 +1047,10 @@ pub(crate) fn detect_legacy(paths: &InstallPaths) -> Legacy {
 /// warning (never edited through a link). Idempotent: a second run finds no legacy
 /// references and does nothing.
 ///
+/// A legacy line whose control is not fail-safe (`sufficient`/`optional`/`[success=…]`)
+/// would become a Hello-gated `required`/`requisite` line after a naive stem swap, so the
+/// control is normalized to [`CANONICAL_CONTROL`] behind a loud second confirmation.
+///
 /// This runs *after* [`Rollback::commit`], so a later failure can never roll the rewrite
 /// back into the stale `pam_wsl_hello` state.
 fn migrate_rewrite_pam_d(paths: &InstallPaths, prompter: &dyn Prompter) -> anyhow::Result<usize> {
@@ -929,7 +1094,7 @@ fn migrate_rewrite_pam_d(paths: &InstallPaths, prompter: &dyn Prompter) -> anyho
         {
             continue;
         }
-        let updated = replace_all(&original, LEGACY_MODULE_STEM, MODULE_STEM);
+        let (updated, unsafe_controls) = rewrite_legacy_references(&original);
         if updated == original {
             continue;
         }
@@ -940,6 +1105,31 @@ fn migrate_rewrite_pam_d(paths: &InstallPaths, prompter: &dyn Prompter) -> anyho
         if !prompter.confirm(&question, true)? {
             println!("  left {} unchanged", path.display());
             continue;
+        }
+        if !unsafe_controls.is_empty() {
+            eprintln!();
+            eprintln!(
+                "WARNING: {} contains an unsafe PAM control ({}) on a pam_wsl_hello line.",
+                path.display(),
+                unsafe_controls.join(", ")
+            );
+            eprintln!("         Keeping `required`/`requisite` would gate sudo/su on Hello");
+            eprintln!("         with no password fallback. The control will be normalized to");
+            eprintln!("         `{CANONICAL_CONTROL}` (fail-safe) instead.");
+            let normalize = prompter.confirm(
+                &format!(
+                    "Replace the unsafe control in {} with the fail-safe `{CANONICAL_CONTROL}`?",
+                    path.display()
+                ),
+                true,
+            )?;
+            if !normalize {
+                println!(
+                    "  left {} unchanged: its unsafe control needs manual repair",
+                    path.display()
+                );
+                continue;
+            }
         }
         let mode = fsutil::mode_of(&md);
         let backup = backup_path(&path);
@@ -1294,6 +1484,106 @@ fn win_bridge_dir(interop: &dyn InteropRunner, win_mnt: &Path) -> anyhow::Result
     Ok(confparse::windows_to_wsl(&dest_win, win_mnt))
 }
 
+/// Derive the original path from a timestamped backup
+/// (`<dir>/<name>.wsl-webauthn-bak.<secs>` → `<dir>/<name>`).
+fn original_from_backup(backup: &Path) -> Option<PathBuf> {
+    let name = backup.file_name()?.to_string_lossy();
+    let idx = name.find(fsutil::BACKUP_MARKER)?;
+    let original = &name[..idx];
+    if original.is_empty() {
+        return None;
+    }
+    Some(backup.with_file_name(original))
+}
+
+/// Restore the `/etc/pam.d` originals that migration backed up.
+///
+/// `migrate_rewrite_pam_d` copies each legacy service file to a timestamped
+/// `*.wsl-webauthn-bak.*` sibling before rewriting `pam_wsl_hello` → `pam_wsl_webauthn`.
+/// Uninstall must reverse that: after our module is gone, a service file that still
+/// references it is a libpam load failure on the root path, and the fix (the original
+/// file) is sitting right next to it. Each backup is restored behind a confirmation,
+/// then removed, so the operation is idempotent (a second run finds no backups).
+///
+/// Returns the number of files restored.
+fn restore_pam_d_backups(paths: &InstallPaths, prompter: &dyn Prompter) -> anyhow::Result<usize> {
+    if !paths.pam_d.is_dir() {
+        return Ok(0);
+    }
+    let entries = std::fs::read_dir(&paths.pam_d)
+        .with_context(|| format!("reading {}", paths.pam_d.display()))?;
+    let mut backups: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().contains(fsutil::BACKUP_MARKER))
+                .unwrap_or(false)
+        })
+        .collect();
+    backups.sort();
+
+    let mut restored = 0usize;
+    for backup in backups {
+        let Some(md) = fsutil::lstat_opt(&backup)? else {
+            continue;
+        };
+        if md.file_type().is_symlink() || !md.is_file() {
+            continue;
+        }
+        let Some(original) = original_from_backup(&backup) else {
+            continue;
+        };
+        let bytes = match fsutil::read_nofollow(&backup) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("warning: could not read backup {}: {e}", backup.display());
+                continue;
+            }
+        };
+        if !prompter.confirm(
+            &format!(
+                "Restore {} from backup {}?",
+                original.display(),
+                backup.display()
+            ),
+            true,
+        )? {
+            println!("  left backup {} in place", backup.display());
+            continue;
+        }
+        if let Some(omd) = fsutil::lstat_opt(&original)?
+            && omd.file_type().is_symlink()
+        {
+            eprintln!(
+                "warning: not restoring {} (it is a symlink); backup left at {}",
+                original.display(),
+                backup.display()
+            );
+            continue;
+        }
+        let mode = fsutil::mode_of(&md);
+        if let Err(e) = fsutil::atomic_write(&original, &bytes, mode) {
+            eprintln!("warning: could not restore {}: {e}", original.display());
+            continue;
+        }
+        if let Err(e) = fsutil::remove_file(&backup) {
+            eprintln!(
+                "warning: restored {} but could not remove backup {}: {e}",
+                original.display(),
+                backup.display()
+            );
+        }
+        println!(
+            "  restored {} (from {})",
+            original.display(),
+            backup.display()
+        );
+        restored += 1;
+    }
+    Ok(restored)
+}
+
 /// Warn (never edit) if `/etc/pam.d` still references our module.
 fn warn_pam_d_references(paths: &InstallPaths) {
     if !paths.pam_d.is_dir() {
@@ -1377,7 +1667,14 @@ pub(crate) fn uninstall_all(
         println!("  profile not installed");
     }
 
-    // 2. Module(s).
+    // 2. Restore /etc/pam.d originals that migration backed up, BEFORE removing the
+    // module they reference (a dangling reference is a libpam load failure).
+    let restored = restore_pam_d_backups(paths, prompter)?;
+    if restored > 0 {
+        println!("Restored {restored} pam.d file(s) from backups.");
+    }
+
+    // 3. Module(s).
     for module in find_installed_modules(paths, opts.module_dir.as_deref()) {
         if prompter.confirm(&format!("Remove {}?", module.display()), true)? {
             fsutil::remove_file(&module)?;
@@ -1385,7 +1682,7 @@ pub(crate) fn uninstall_all(
         }
     }
 
-    // 3. Linux config dir.
+    // 4. Linux config dir.
     if fsutil::lstat_opt(&paths.etc_wsl_webauthn)?.is_some()
         && prompter.confirm(
             &format!(
@@ -1399,7 +1696,7 @@ pub(crate) fn uninstall_all(
         println!("  removed {}", paths.etc_wsl_webauthn.display());
     }
 
-    // 4. Windows bridge directory (best effort; report failures).
+    // 5. Windows bridge directory (best effort; report failures).
     match win_bridge_dir(interop, &win_mnt) {
         Ok(dir) => {
             if fsutil::lstat_opt(&dir)?.is_some() {
@@ -1422,10 +1719,11 @@ pub(crate) fn uninstall_all(
         Err(e) => eprintln!("warning: could not resolve the Windows bridge directory: {e}"),
     }
 
-    // 5. Never auto-edit on uninstall: warn about leftover /etc/pam.d references.
+    // 6. Fallback: migrations may not have left a backup (or the file was edited by
+    // hand). Never blind-edit /etc/pam.d on uninstall; warn about leftover references.
     warn_pam_d_references(paths);
 
-    // 6. The legacy /etc/pam_wsl_hello is NEVER removed (it is not ours).
+    // 7. The legacy /etc/pam_wsl_hello is NEVER removed (it is not ours).
     println!();
     println!("Done. The legacy /etc/pam_wsl_hello (if any) was left untouched.");
     Ok(EXIT_OK)

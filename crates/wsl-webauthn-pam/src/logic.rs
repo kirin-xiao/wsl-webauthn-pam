@@ -74,7 +74,11 @@ pub trait Deps {
     /// SHA-256 of the file at `path`.
     fn sha256_file(&self, path: &Path) -> Result<[u8; 32], String>;
     /// Fill `dest` with cryptographically secure random bytes.
-    fn fill_random(&self, dest: &mut [u8]);
+    ///
+    /// Entropy exhaustion is an operational condition, not a bug: implementations
+    /// report it as `Err` rather than panicking, so the state machine can map it to
+    /// `PAM_AUTHINFO_UNAVAIL` instead of letting a panic classify it as `PAM_ABORT`.
+    fn fill_random(&self, dest: &mut [u8]) -> Result<(), String>;
     /// Run the `assert` ceremony against the bridge under a hard deadline.
     fn authenticate(
         &self,
@@ -113,9 +117,14 @@ impl Deps for SystemDeps {
     fn sha256_file(&self, path: &Path) -> Result<[u8; 32], String> {
         sha256_file(path)
     }
-    fn fill_random(&self, dest: &mut [u8]) {
+    fn fill_random(&self, dest: &mut [u8]) -> Result<(), String> {
         use rand::RngCore as _;
-        rand::rngs::OsRng.fill_bytes(dest);
+        // `OsRng::fill_bytes` panics on entropy failure; `try_fill_bytes` propagates
+        // the underlying `getrandom` error instead, which the caller maps to
+        // `PAM_AUTHINFO_UNAVAIL` (service unavailable) rather than `PAM_ABORT`.
+        rand::rngs::OsRng
+            .try_fill_bytes(dest)
+            .map_err(|e| format!("OS entropy unavailable: {e}"))
     }
     fn authenticate(
         &self,
@@ -308,7 +317,16 @@ pub fn authenticate<S: PamSeam, D: Deps>(
 
     // --- 5. Challenge + clientDataJSON -----------------------------------
     let mut challenge = [0u8; 32];
-    deps.fill_random(&mut challenge);
+    if let Err(e) = deps.fill_random(&mut challenge) {
+        // Entropy failure is an operational condition (the kernel CSPRNG is
+        // unavailable), not a module bug: fail closed as "auth info unavailable"
+        // rather than panicking into `PAM_ABORT`, which would tear down the PAM
+        // stack for every service on the host.
+        return fail(
+            PAM_AUTHINFO_UNAVAIL,
+            format!("could not obtain entropy for the challenge: {e}"),
+        );
+    }
     let client_data_json = match build_client_data(ClientDataKind::Get, &challenge) {
         Ok(bytes) => bytes,
         Err(e) => {
