@@ -1,1 +1,714 @@
-//! Linux credential store — implemented in Wave A (plan §6).
+//! Linux credential store and config parsing (plan §6).
+//!
+//! This crate owns the root-owned, symlink-hardened on-disk layout used by the PAM
+//! module (hot path) and the CLI (enrollment):
+//!
+//! ```text
+//! <base>/credentials/          # mode 0700, root:root
+//! <base>/credentials/<user>.json   # mode 0600, root:root
+//! <base>/config                # mode 0600, root:root (TOML)
+//! ```
+//!
+//! The production base dir is `/etc/wsl_webauthn` ([`Store::system`]). Tests and the
+//! installer pass an arbitrary base directory via [`Store::new`]/[`Store::with_owner`].
+//!
+//! # Hardening model (SR-4)
+//!
+//! * The username is validated by hand before it is ever joined to a path; anything
+//!   outside `^[A-Za-z_][A-Za-z0-9._-]{0,31}$` is rejected with
+//!   [`StoreError::InvalidUsername`]. This never reaches the filesystem.
+//! * Every path component from the base down (base dir, `credentials` dir, record file)
+//!   is `lstat`ed; a symlink anywhere is [`StoreError::SymlinkedPath`].
+//! * The `credentials` dir must be **exactly** `0700`, the record/config files **exactly**
+//!   `0600`, all owned by the store's expected owner (root in production). The check is an
+//!   equality test, so any group/other bit (or setuid/setgid/sticky bit) is rejected as
+//!   [`StoreError::BadOwnership`]; stricter than a "no wider than" test, and fail-closed.
+//! * Reads use `open(2)` with `O_RDONLY|O_NOFOLLOW|O_NOCTTY|O_CLOEXEC`, then `fstat` the
+//!   opened descriptor and compare `(dev, ino)` with the earlier `lstat` — a file swapped
+//!   between the two calls is rejected as [`StoreError::PathChanged`]. The post-open
+//!   ownership/mode check is performed on the **opened descriptor's** `fstat`, so a file
+//!   swapped in after the pre-open `lstat` cannot pass with attacker-chosen metadata.
+//! * Reads are capped at 256 KiB (`64 KiB` for the config); the cap is enforced while
+//!   reading (the cap-exceeding byte is observed and never accumulated), so an oversized
+//!   or growing file cannot blow up memory. A larger file is [`StoreError::TooLarge`].
+//!   The content must parse as JSON/TOML or it is [`StoreError::Corrupt`]/[`StoreError::Config`].
+//! * The record's `schema_version` must be exactly 1 and its `linux_user` must equal the
+//!   lookup name; otherwise [`StoreError::Corrupt`]/[`StoreError::RecordUserMismatch`].
+//!   Parsing uses `deny_unknown_fields`, so a record carrying unexpected keys is
+//!   [`StoreError::Corrupt`] (strict, fail-closed). `enrolled_at` is stored but not
+//!   re-validated here (the verifier/PAM trust only the cryptographic fields).
+//! * Writes are atomic: `mkstemp` in the target directory (`.tmp-XXXXXX`), `fchmod 0600`,
+//!   `fsync` the file, then `rename` over the target (or `link` when `replace == false`),
+//!   then `fsync` the directory **on every success path** (durability of the rename). A
+//!   temp file is removed on every error path.
+//!
+//! # JSON schema (`schema_version: 1`)
+//!
+//! ```json
+//! {
+//!   "schema_version": 1,
+//!   "rp_id": "io.github.kirin-xiao.wsl-webauthn-pam",
+//!   "origin": "io.github.kirin-xiao.wsl-webauthn-pam",
+//!   "linux_user": "alice",
+//!   "linux_uid": 1000,
+//!   "credential_id": "<base64url>",
+//!   "cose_public_key": "<base64url>",
+//!   "alg": -7,
+//!   "aaguid": "08987058-cadc-4b81-b6e1-30de50dcbe96",
+//!   "attestation": {
+//!     "format": "packed",
+//!     "mode": "strict",
+//!     "verified": true,
+//!     "leaf_sha256": "<lowercase hex>"
+//!   },
+//!   "windows_identity": { "account": "HOST\\alice", "sid": "S-1-5-21-..." },
+//!   "enrolled_at": "2026-10-01T12:34:56Z",
+//!   "sign_count": 0,
+//!   "bridge_path": "/mnt/c/Users/alice/AppData/Local/Programs/wsl-webauthn-pam/WSLWebAuthnBridge.exe",
+//!   "bridge_sha256": "<lowercase hex>"
+//! }
+//! ```
+//!
+//! `windows_identity` may be `null`. `attestation.mode` is `"strict"` or
+//! `"unattested-opt-in"` (plan D3).
+
+// `forbid` would prevent the audited `sys` module from using `unsafe` at all; we use
+// `deny` crate-wide and a single documented `#[allow(unsafe_code)]` on `sys`.
+#![deny(unsafe_code)]
+#![warn(missing_docs)]
+
+mod record;
+mod sys;
+
+use std::ffi::OsStr;
+use std::io;
+use std::path::{Path, PathBuf};
+
+use thiserror::Error;
+use wsl_webauthn_protocol::b64u_decode;
+
+pub use record::{
+    AttestationRecord, Config, CredentialRecord, MODE_STRICT, MODE_UNATTESTED_OPT_IN,
+    SCHEMA_VERSION, WindowsIdentity,
+};
+
+/// Mode required on the `credentials` directory.
+pub const DIR_MODE: u32 = 0o700;
+/// Mode required on credential record files.
+pub const FILE_MODE: u32 = 0o600;
+/// Mode required on the config file.
+pub const CONFIG_MODE: u32 = 0o600;
+
+/// Maximum size of a credential record file (256 KiB).
+pub const MAX_RECORD_BYTES: usize = 256 * 1024;
+/// Maximum size of the config file (64 KiB).
+pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
+
+/// The production base directory (`/etc/wsl_webauthn`, plan D1).
+pub const SYSTEM_BASE: &str = "/etc/wsl_webauthn";
+
+/// Exhaustive error type for every store operation (plan §6).
+///
+/// The PAM module maps store failures to `PAM_AUTHINFO_UNAVAIL` (fail-closed); a missing
+/// record ([`StoreError::NotFound`]) maps to `PAM_USER_UNKNOWN`. Ceremony vs. transport
+/// distinctions are handled by other crates.
+#[derive(Debug, Error)]
+pub enum StoreError {
+    /// The username did not match `^[A-Za-z_][A-Za-z0-9._-]{0,31}$`.
+    #[error("invalid username")]
+    InvalidUsername,
+    /// A path component (base dir, credentials dir, or record file) is a symbolic link.
+    #[error("refusing to follow symlink at {path}")]
+    SymlinkedPath {
+        /// The offending path.
+        path: PathBuf,
+    },
+    /// A path expected to be a regular file or directory had the wrong type.
+    #[error("unexpected file type at {path}")]
+    NotRegularFile {
+        /// The offending path.
+        path: PathBuf,
+    },
+    /// Ownership or permission bits did not match the required root-owned modes.
+    #[error(
+        "bad ownership/mode at {path}: expected uid {expected_uid} mode {expected_mode:o}, \
+         found uid {actual_uid} mode {actual_mode:o}"
+    )]
+    BadOwnership {
+        /// The offending path.
+        path: PathBuf,
+        /// Expected owner uid.
+        expected_uid: u32,
+        /// Actual owner uid.
+        actual_uid: u32,
+        /// Expected permission bits.
+        expected_mode: u32,
+        /// Actual permission bits.
+        actual_mode: u32,
+    },
+    /// The requested record/config does not exist.
+    #[error("not found: {path}")]
+    NotFound {
+        /// The missing path.
+        path: PathBuf,
+    },
+    /// An existing record was found although `replace == false`.
+    #[error("record already exists: {path}")]
+    AlreadyExists {
+        /// The existing record path.
+        path: PathBuf,
+    },
+    /// A record file existed but was not valid JSON / a supported schema.
+    #[error("corrupt credential record at {path}: {message}")]
+    Corrupt {
+        /// The record path.
+        path: PathBuf,
+        /// Human-readable parse/validation failure.
+        message: String,
+    },
+    /// Content exceeded the configured read cap.
+    #[error("file at {path} exceeds the {cap}-byte cap")]
+    TooLarge {
+        /// The offending path.
+        path: PathBuf,
+        /// The enforced cap in bytes.
+        cap: usize,
+    },
+    /// The file identity changed between `lstat` and `open` (TOCTOU).
+    #[error("path changed during open (possible race): {path}")]
+    PathChanged {
+        /// The offending path.
+        path: PathBuf,
+    },
+    /// A record's `linux_user` did not match the username it was stored/looked up under.
+    #[error("record linux_user {record_user:?} does not match {argument_user:?}")]
+    RecordUserMismatch {
+        /// The value stored in the record.
+        record_user: String,
+        /// The username argument.
+        argument_user: String,
+    },
+    /// The config file is absent (`/etc/wsl_webauthn/config`).
+    #[error("config file missing: {path}")]
+    ConfigMissing {
+        /// The missing config path.
+        path: PathBuf,
+    },
+    /// The config file existed but could not be parsed.
+    #[error("invalid config at {path}: {message}")]
+    Config {
+        /// The config path.
+        path: PathBuf,
+        /// The parse failure.
+        message: String,
+    },
+    /// A record could not be serialized (should not happen for the fixed schema).
+    #[error("failed to encode credential record: {message}")]
+    Encode {
+        /// The serialization failure.
+        message: String,
+    },
+    /// An underlying OS error occurred.
+    #[error("i/o error at {path}: {source}")]
+    Io {
+        /// The path being operated on.
+        path: PathBuf,
+        /// The underlying error.
+        #[source]
+        source: io::Error,
+    },
+}
+
+/// A credential store rooted at an arbitrary base directory.
+///
+/// In production use [`Store::system`], which is rooted at [`SYSTEM_BASE`] and expects
+/// root (`uid 0`) ownership. Tests use [`Store::with_owner`] to expect the current uid.
+#[derive(Debug, Clone)]
+pub struct Store {
+    base: PathBuf,
+    owner_uid: u32,
+}
+
+impl Store {
+    /// Open the production store at [`SYSTEM_BASE`] with root ownership expectations.
+    pub fn system() -> Store {
+        Store::with_owner(SYSTEM_BASE, 0)
+    }
+
+    /// Open a store at `base` with the production default owner expectation (uid 0).
+    ///
+    /// Callers running against a non-root base (tests, or a non-root install) should use
+    /// [`Store::with_owner`] instead.
+    pub fn new(base: impl AsRef<Path>) -> Store {
+        Store::with_owner(base, 0)
+    }
+
+    /// Open a store at `base`, expecting files to be owned by `owner_uid`.
+    ///
+    /// Production passes `0`; tests pass [`current_euid`].
+    pub fn with_owner(base: impl AsRef<Path>, owner_uid: u32) -> Store {
+        Store {
+            base: base.as_ref().to_path_buf(),
+            owner_uid,
+        }
+    }
+
+    /// The base directory this store is rooted at.
+    pub fn base(&self) -> &Path {
+        &self.base
+    }
+
+    /// The expected owner uid.
+    pub fn owner_uid(&self) -> u32 {
+        self.owner_uid
+    }
+
+    /// `<base>/credentials`.
+    pub fn credentials_dir(&self) -> PathBuf {
+        self.base.join("credentials")
+    }
+
+    /// `<base>/config`.
+    pub fn config_path(&self) -> PathBuf {
+        self.base.join("config")
+    }
+
+    /// `<base>/credentials/<username>.json` (username must already be validated).
+    fn record_path(&self, username: &str) -> PathBuf {
+        self.credentials_dir().join(format!("{username}.json"))
+    }
+
+    fn io(&self, path: impl Into<PathBuf>, source: io::Error) -> StoreError {
+        StoreError::Io {
+            path: path.into(),
+            source,
+        }
+    }
+
+    fn check_owner_mode(&self, path: &Path, st: sys::Stat, mode: u32) -> Result<(), StoreError> {
+        if st.uid != self.owner_uid || st.perm_bits() != mode {
+            return Err(StoreError::BadOwnership {
+                path: path.to_path_buf(),
+                expected_uid: self.owner_uid,
+                actual_uid: st.uid,
+                expected_mode: mode,
+                actual_mode: st.perm_bits(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate a directory and return an `O_NOFOLLOW|O_DIRECTORY` handle to it.
+    ///
+    /// This closes the window between the `lstat` checks and subsequent operations:
+    /// the metadata is re-read from the **opened descriptor** (`fstat`) and its
+    /// `(dev, ino)` is compared with the earlier `lstat`, so a directory swapped in
+    /// mid-operation is [`StoreError::PathChanged`] rather than silently trusted.
+    fn open_checked_dir(&self, path: &Path, mode: u32) -> Result<sys::Fd, StoreError> {
+        let before = match sys::lstat(path) {
+            Ok(st) => st,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(StoreError::NotFound {
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(e) => return Err(self.io(path, e)),
+        };
+        if before.is_symlink() {
+            return Err(StoreError::SymlinkedPath {
+                path: path.to_path_buf(),
+            });
+        }
+        if !before.is_dir() {
+            return Err(StoreError::NotRegularFile {
+                path: path.to_path_buf(),
+            });
+        }
+        self.check_owner_mode(path, before, mode)?;
+
+        let fd = sys::open_dir(path).map_err(|e| self.io(path, e))?;
+        let after = sys::fstat(fd.raw()).map_err(|e| self.io(path, e))?;
+        if after.uid != self.owner_uid || after.perm_bits() != mode {
+            return Err(StoreError::BadOwnership {
+                path: path.to_path_buf(),
+                expected_uid: self.owner_uid,
+                actual_uid: after.uid,
+                expected_mode: mode,
+                actual_mode: after.perm_bits(),
+            });
+        }
+        if after.dev != before.dev || after.ino != before.ino {
+            return Err(StoreError::PathChanged {
+                path: path.to_path_buf(),
+            });
+        }
+        Ok(fd)
+    }
+
+    /// Verify the base directory exists, is a directory, and is not a symlink.
+    fn check_base(&self) -> Result<sys::Stat, StoreError> {
+        let st = match sys::lstat(&self.base) {
+            Ok(st) => st,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(StoreError::NotFound {
+                    path: self.base.clone(),
+                });
+            }
+            Err(e) => return Err(self.io(&self.base, e)),
+        };
+        if st.is_symlink() {
+            return Err(StoreError::SymlinkedPath {
+                path: self.base.clone(),
+            });
+        }
+        if !st.is_dir() {
+            return Err(StoreError::NotRegularFile {
+                path: self.base.clone(),
+            });
+        }
+        Ok(st)
+    }
+
+    /// Ensure `<base>/credentials` exists with mode `0700` and the expected owner,
+    /// creating it (and explicitly `fchmod`ing to defeat umask) if missing.
+    ///
+    /// Returns an ownership/mode-validated `O_DIRECTORY|O_NOFOLLOW` handle to the
+    /// directory; callers use it to `fsync` the directory entry after installing a file
+    /// and never re-resolve the path against a potentially swapped directory.
+    fn ensure_credentials_dir(&self) -> Result<sys::Fd, StoreError> {
+        let dir = self.credentials_dir();
+        match sys::lstat(&dir) {
+            Ok(_) => {
+                // Reuse the TOCTOU-safe descriptor checks for an existing directory.
+                self.open_checked_dir(&dir, DIR_MODE)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                self.check_base()?;
+                sys::mkdir(&dir, DIR_MODE).map_err(|e| self.io(&dir, e))?;
+                // mkdir is subject to umask; pin the mode exactly.
+                let fd = sys::open_dir(&dir).map_err(|e| self.io(&dir, e))?;
+                sys::fchmod(fd.raw(), DIR_MODE).map_err(|e| self.io(&dir, e))?;
+                drop(fd);
+                self.open_checked_dir(&dir, DIR_MODE)
+            }
+            Err(e) => Err(self.io(&dir, e)),
+        }
+    }
+
+    /// Open, `fstat`-validate, and read a hardened file with a size cap.
+    fn read_secure_file(
+        &self,
+        path: &Path,
+        mode: u32,
+        cap: usize,
+        missing: impl FnOnce(PathBuf) -> StoreError,
+    ) -> Result<Vec<u8>, StoreError> {
+        let before = match sys::lstat(path) {
+            Ok(st) => st,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(missing(path.to_path_buf()));
+            }
+            Err(e) => return Err(self.io(path, e)),
+        };
+        if before.is_symlink() {
+            return Err(StoreError::SymlinkedPath {
+                path: path.to_path_buf(),
+            });
+        }
+        if !before.is_file() {
+            return Err(StoreError::NotRegularFile {
+                path: path.to_path_buf(),
+            });
+        }
+        self.check_owner_mode(path, before, mode)?;
+
+        let fd = sys::open_readonly(path).map_err(|e| self.io(path, e))?;
+        let after = sys::fstat(fd.raw()).map_err(|e| self.io(path, e))?;
+        if after.uid != self.owner_uid || after.perm_bits() != mode {
+            return Err(StoreError::BadOwnership {
+                path: path.to_path_buf(),
+                expected_uid: self.owner_uid,
+                actual_uid: after.uid,
+                expected_mode: mode,
+                actual_mode: after.perm_bits(),
+            });
+        }
+        if after.dev != before.dev || after.ino != before.ino {
+            return Err(StoreError::PathChanged {
+                path: path.to_path_buf(),
+            });
+        }
+
+        match sys::read_capped(fd.raw(), cap).map_err(|e| self.io(path, e))? {
+            None => Err(StoreError::TooLarge {
+                path: path.to_path_buf(),
+                cap,
+            }),
+            Some(bytes) => Ok(bytes),
+        }
+    }
+
+    /// Load the credential record for `username` (PAM hot path).
+    ///
+    /// Missing record → [`StoreError::NotFound`] (PAM maps this to `PAM_USER_UNKNOWN`);
+    /// any hardening failure is fail-closed.
+    pub fn load(&self, username: &str) -> Result<CredentialRecord, StoreError> {
+        validate_username(username)?;
+        self.check_base()?;
+        let _dir_fd = self.open_checked_dir(&self.credentials_dir(), DIR_MODE)?;
+
+        let path = self.record_path(username);
+        let bytes = self.read_secure_file(&path, FILE_MODE, MAX_RECORD_BYTES, |p| {
+            StoreError::NotFound { path: p }
+        })?;
+        let record: CredentialRecord =
+            serde_json::from_slice(&bytes).map_err(|e| StoreError::Corrupt {
+                path: path.clone(),
+                message: e.to_string(),
+            })?;
+        if !record.schema_supported() {
+            return Err(StoreError::Corrupt {
+                path,
+                message: format!(
+                    "unsupported schema_version {} (expected {SCHEMA_VERSION})",
+                    record.schema_version
+                ),
+            });
+        }
+        if record.linux_user != username {
+            return Err(StoreError::RecordUserMismatch {
+                record_user: record.linux_user,
+                argument_user: username.to_string(),
+            });
+        }
+        // Defense in depth: the two binary fields PAM/verifier will decode must be valid
+        // unpadded base64url *now*, so a corrupt record fails closed at load rather than
+        // deep inside the ceremony. Values are not otherwise constrained here.
+        b64u_decode(&record.credential_id).map_err(|e| StoreError::Corrupt {
+            path: path.clone(),
+            message: format!("credential_id is not valid base64url: {e}"),
+        })?;
+        b64u_decode(&record.cose_public_key).map_err(|e| StoreError::Corrupt {
+            path: path.clone(),
+            message: format!("cose_public_key is not valid base64url: {e}"),
+        })?;
+        Ok(record)
+    }
+
+    /// Atomically write a credential record (enrollment path).
+    ///
+    /// Fails with [`StoreError::AlreadyExists`] if a record exists and `replace` is
+    /// `false`. The destination path is derived from `record.linux_user`; an invalid
+    /// value there is [`StoreError::InvalidUsername`].
+    pub fn save_atomic(&self, record: &CredentialRecord, replace: bool) -> Result<(), StoreError> {
+        validate_username(&record.linux_user)?;
+        self.check_base()?;
+        // Re-validate ownership/mode of the destination directory *before* creating a
+        // temp file in it; the returned, identity-checked handle is used for the final
+        // directory fsync so a swapped directory cannot be silently written into.
+        let dir_fd = self.ensure_credentials_dir()?;
+
+        let dir = self.credentials_dir();
+        let target = self.record_path(&record.linux_user);
+
+        if !replace {
+            match sys::lstat(&target) {
+                Ok(st) if st.is_symlink() => {
+                    return Err(StoreError::SymlinkedPath { path: target });
+                }
+                Ok(_) => {
+                    return Err(StoreError::AlreadyExists { path: target });
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(self.io(&target, e)),
+            }
+        }
+
+        let json = serde_json::to_vec(record).map_err(|e| StoreError::Encode {
+            message: e.to_string(),
+        })?;
+
+        let (fd, temp_path) = sys::mkstemp_in(&dir).map_err(|e| self.io(&dir, e))?;
+        let temp = PathBuf::from(temp_path);
+        let result = self.write_and_install(fd, &temp, &target, &json, replace, &dir_fd);
+        if result.is_err() {
+            // Best-effort cleanup of the temp file on every failure path.
+            let _ = sys::remove_file(&temp);
+        }
+        result
+    }
+
+    fn write_and_install(
+        &self,
+        fd: sys::Fd,
+        temp: &Path,
+        target: &Path,
+        json: &[u8],
+        replace: bool,
+        dir_fd: &sys::Fd,
+    ) -> Result<(), StoreError> {
+        sys::fchmod(fd.raw(), FILE_MODE).map_err(|e| self.io(temp, e))?;
+        sys::write_all(fd.raw(), json).map_err(|e| self.io(temp, e))?;
+        sys::fsync(fd.raw()).map_err(|e| self.io(temp, e))?;
+        drop(fd);
+
+        if replace {
+            sys::rename(temp, target).map_err(|e| self.io(target, e))?;
+        } else {
+            match sys::link(temp, target) {
+                Ok(()) => {
+                    sys::remove_file(temp).map_err(|e| self.io(temp, e))?;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+                    return Err(StoreError::AlreadyExists {
+                        path: target.to_path_buf(),
+                    });
+                }
+                Err(e) => return Err(self.io(temp, e)),
+            }
+        }
+
+        // Persist the directory entry on every success path (both replace and non-replace
+        // go through here); the handle was identity-checked before the temp file existed.
+        sys::fsync(dir_fd.raw()).map_err(|e| self.io(self.credentials_dir(), e))?;
+        Ok(())
+    }
+
+    /// Remove the record for `username`, returning `false` if there was none.
+    ///
+    /// Refuses to act through a symlinked `credentials` directory or on a symlinked
+    /// record. Unlike [`Store::load`], ownership/mode are not re-checked so an
+    /// administrator can clean up a mis-owned record.
+    pub fn remove(&self, username: &str) -> Result<bool, StoreError> {
+        validate_username(username)?;
+        let dir = self.credentials_dir();
+        match sys::lstat(&dir) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(self.io(&dir, e)),
+            Ok(st) => {
+                if st.is_symlink() {
+                    return Err(StoreError::SymlinkedPath { path: dir });
+                }
+                if !st.is_dir() {
+                    return Err(StoreError::NotRegularFile { path: dir });
+                }
+            }
+        }
+
+        let target = self.record_path(username);
+        // Hold the directory open and unlink relative to it, so the symlink check and the
+        // unlink refer to the same directory even under a concurrent swap.
+        let dfd = sys::open_dir(&dir).map_err(|e| self.io(&dir, e))?;
+        let file_name = format!("{username}.json");
+        let name = OsStr::new(&file_name);
+        match sys::fstatat_nofollow(dfd.raw(), name) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(self.io(&target, e)),
+            Ok(st) => {
+                if st.is_symlink() {
+                    return Err(StoreError::SymlinkedPath { path: target });
+                }
+                if !st.is_file() {
+                    return Err(StoreError::NotRegularFile { path: target });
+                }
+                sys::unlinkat(dfd.raw(), name).map_err(|e| self.io(&target, e))?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// List enrolled usernames (sorted, deduplicated) from `<base>/credentials/*.json`.
+    ///
+    /// A missing `credentials` directory yields an empty list. Non-regular files,
+    /// symlinks, and names that fail [`validate_username`] are skipped.
+    pub fn list(&self) -> Result<Vec<String>, StoreError> {
+        let dir = self.credentials_dir();
+        match sys::lstat(&dir) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(self.io(&dir, e)),
+            Ok(st) => {
+                if st.is_symlink() {
+                    return Err(StoreError::SymlinkedPath { path: dir });
+                }
+                if !st.is_dir() {
+                    return Err(StoreError::NotRegularFile { path: dir });
+                }
+            }
+        }
+
+        let mut names = Vec::new();
+        let entries = std::fs::read_dir(&dir).map_err(|e| self.io(&dir, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| self.io(&dir, e))?;
+            let file_type = entry.file_type().map_err(|e| self.io(&dir, e))?;
+            if !file_type.is_file() {
+                continue;
+            }
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            let Some(stem) = file_name.strip_suffix(".json") else {
+                continue;
+            };
+            if validate_username(stem).is_ok() {
+                names.push(stem.to_string());
+            }
+        }
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
+    /// Load and parse `<base>/config` (TOML, mode `0600`, root-owned).
+    ///
+    /// A missing file is [`StoreError::ConfigMissing`]; the installer creates it.
+    pub fn load_config(&self) -> Result<Config, StoreError> {
+        let path = self.config_path();
+        let bytes = self.read_secure_file(&path, CONFIG_MODE, MAX_CONFIG_BYTES, |p| {
+            StoreError::ConfigMissing { path: p }
+        })?;
+        let raw: record::RawConfig =
+            toml::from_str(std::str::from_utf8(&bytes).map_err(|e| StoreError::Config {
+                path: path.clone(),
+                message: format!("config is not valid UTF-8: {e}"),
+            })?)
+            .map_err(|e| StoreError::Config {
+                path: path.clone(),
+                message: e.to_string(),
+            })?;
+        Ok(raw.into())
+    }
+}
+
+/// Validate a Linux username against `^[A-Za-z_][A-Za-z0-9._-]{0,31}$`.
+///
+/// Implemented by hand (no `regex` dependency) and rejects the empty string, anything
+/// longer than 32 bytes, path separators, leading digits/dots/dashes, and NUL bytes.
+pub fn validate_username(username: &str) -> Result<(), StoreError> {
+    let bytes = username.as_bytes();
+    if bytes.is_empty() || bytes.len() > 32 {
+        return Err(StoreError::InvalidUsername);
+    }
+    let first = bytes[0];
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return Err(StoreError::InvalidUsername);
+    }
+    for &b in &bytes[1..] {
+        if !(b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-') {
+            return Err(StoreError::InvalidUsername);
+        }
+    }
+    Ok(())
+}
+
+/// The effective uid of the calling process, for tests and callers that need to build a
+/// non-root [`Store`].
+pub fn current_euid() -> u32 {
+    sys::geteuid()
+}
+
+/// The real uid of the calling process.
+pub fn current_uid() -> u32 {
+    sys::getuid()
+}
