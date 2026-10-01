@@ -140,27 +140,38 @@ pub fn build_assertion_options(
 /// (fast) path does not pay the full timeout in `join()`.
 struct ArmedCancellation {
     state: Arc<(Mutex<bool>, Condvar)>,
+    /// Set **only** when the watchdog actually times out and fires
+    /// [`WebAuthnApi::cancel`]. `finish()` marks `state` without touching this,
+    /// so the flag distinguishes "our watchdog cancelled" from "the ceremony
+    /// ended on its own". Snapshot with [`Self::fired`] *before* `finish`.
+    fired: Arc<Mutex<bool>>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl ArmedCancellation {
     fn arm(api: &Arc<dyn WebAuthnApi>, id: CancellationId, timeout_ms: u32) -> Self {
         let state = Arc::new((Mutex::new(false), Condvar::new()));
+        let fired = Arc::new(Mutex::new(false));
         let watchdog_state = Arc::clone(&state);
+        let watchdog_fired = Arc::clone(&fired);
         let api = Arc::clone(api);
 
         let handle = thread::spawn(move || {
             let (lock, cvar) = &*watchdog_state;
-            let mut fired = lock.lock().unwrap_or_else(|e| e.into_inner());
-            while !*fired {
+            let mut done = lock.lock().unwrap_or_else(|e| e.into_inner());
+            while !*done {
                 let (guard, timeout) = cvar
-                    .wait_timeout(fired, Duration::from_millis(timeout_ms as u64))
+                    .wait_timeout(done, Duration::from_millis(timeout_ms as u64))
                     .unwrap_or_else(|e| e.into_inner());
-                fired = guard;
-                if timeout.timed_out() && !*fired {
-                    // Mark fired so a concurrent `finish` cannot double-cancel.
-                    *fired = true;
-                    drop(fired);
+                done = guard;
+                if timeout.timed_out() && !*done {
+                    // Mark done so a concurrent `finish` cannot double-cancel.
+                    *done = true;
+                    // Publish "our watchdog fired" under the mutex *before*
+                    // cancelling, so the ceremony thread observes it after the
+                    // cancel-induced error returns (mutex gives the ordering).
+                    *watchdog_fired.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                    drop(done);
                     api.cancel(&id);
                     return;
                 }
@@ -169,8 +180,17 @@ impl ArmedCancellation {
 
         ArmedCancellation {
             state,
+            fired,
             handle: Some(handle),
         }
+    }
+
+    /// Was the watchdog's timer what fired (i.e. did we call `cancel`)?
+    ///
+    /// Must be read *before* [`Self::finish`], which otherwise only stops the
+    /// thread and does not imply the timer expired.
+    fn fired(&self) -> bool {
+        *self.fired.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Signal "ceremony over" and join the watchdog. Fast path: the watchdog
@@ -178,13 +198,37 @@ impl ArmedCancellation {
     fn finish(mut self) {
         {
             let (lock, cvar) = &*self.state;
-            let mut fired = lock.lock().unwrap_or_else(|e| e.into_inner());
-            *fired = true;
+            let mut done = lock.lock().unwrap_or_else(|e| e.into_inner());
+            *done = true;
             cvar.notify_all();
         }
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+/// Reclassify a ceremony error when *our* watchdog fired.
+///
+/// Windows returns `NTE_USER_CANCELLED` (`0x80090036`) to the ceremony when the
+/// bridge's own `WebAuthNCancelCurrentOperation` fires, so a watchdog-induced
+/// cancel is indistinguishable from a genuine user cancel at the HRESULT
+/// level. Plan §3 requires the bridge to report `timeout` in that case, so:
+///
+/// * the error was already a [`BridgeError::Timeout`] → stays `Timeout`;
+/// * the error mapped to [`BridgeError::UserCancelled`] **and** our watchdog
+///   fired → `Timeout`;
+/// * any *other* error, and every success, is returned untouched — a ceremony
+///   that completes successfully while the watchdog is cancelling must never be
+///   turned into an error.
+///
+/// `fired` is snapshotted after the ceremony returns and before `finish`.
+fn remap_watchdog_fire<T>(result: Result<T, BridgeError>, fired: bool) -> Result<T, BridgeError> {
+    match result {
+        Err(BridgeError::UserCancelled | BridgeError::Timeout) if fired => {
+            Err(BridgeError::Timeout)
+        }
+        other => other,
     }
 }
 
@@ -194,6 +238,10 @@ impl ArmedCancellation {
 ///   the one the platform accepts for cancellation and the one handed to the
 ///   ceremony through its options.
 /// * `run` executes the blocking platform call on the current thread.
+/// * The watchdog's `fired` flag is snapshotted **after** `run` returns and
+///   **before** the watchdog is disarmed; if our own cancel produced a
+///   user-cancel-shaped error it is reclassified to `timeout` (plan §3). A
+///   successful result is never remapped.
 /// * On completion (success *or* error) the watchdog is disarmed and joined,
 ///   so no thread outlives the ceremony.
 fn run_with_watchdog<T, F>(
@@ -207,8 +255,9 @@ where
     let id = api.get_cancellation_id()?;
     let watchdog = ArmedCancellation::arm(api, id, options.timeout_ms);
     let result = run(id);
+    let watchdog_fired = watchdog.fired();
     watchdog.finish();
-    result
+    remap_watchdog_fire(result, watchdog_fired)
 }
 
 /// Run an enrollment ceremony and build the wire response.
@@ -295,7 +344,10 @@ pub fn dispatch(api: &Arc<dyn WebAuthnApi>, req: &Request) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{AssertionResult, CredentialAttestation, ProbeInfo};
+    use crate::api::{
+        AssertionResult, CredentialAttestation, ERROR_TIMEOUT, Hresult, NTE_USER_CANCELLED,
+        ProbeInfo, hresult_from_win32, map_hresult,
+    };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     // ---- scriptable stub ------------------------------------------------
@@ -304,8 +356,15 @@ mod tests {
         probe: Result<ProbeInfo, BridgeError>,
         make: Result<CredentialAttestation, BridgeError>,
         assert: Result<AssertionResult, BridgeError>,
+        /// When set, both ceremonies return `Err(map_hresult(hr))` immediately
+        /// (models a real platform HRESULT with the watchdog *not* fired).
+        immediate_error: Option<Hresult>,
         /// When true, both ceremonies spin until `cancel` flips `saw_cancel`.
         block_until_cancel: bool,
+        /// Error the simulated platform returns once it observes our cancel.
+        /// `None` models a ceremony that completes successfully despite the
+        /// watchdog having cancelled (the race the remap must not corrupt).
+        unblocked_error: Option<Hresult>,
         cancel_count: AtomicUsize,
         saw_cancel: AtomicBool,
         last_make: Mutex<Option<MakeCredentialOptions>>,
@@ -330,7 +389,9 @@ mod tests {
                     credential_id: vec![9, 9],
                     client_data_json_echo: Some(vec![8]),
                 }),
+                immediate_error: None,
                 block_until_cancel: false,
+                unblocked_error: None,
                 cancel_count: AtomicUsize::new(0),
                 saw_cancel: AtomicBool::new(false),
                 last_make: Mutex::new(None),
@@ -338,25 +399,59 @@ mod tests {
             }
         }
 
+        /// A stub whose ceremony blocks until the watchdog cancels, then
+        /// reports `ERROR_TIMEOUT` (the plan's platform-timeout shape).
         fn blocking() -> Self {
             StubApi {
                 block_until_cancel: true,
+                unblocked_error: Some(hresult_from_win32(ERROR_TIMEOUT)),
                 ..StubApi::new()
             }
         }
 
-        /// Block until the watchdog calls `cancel`, returning the error the
-        /// platform would have produced (or `Internal` if the watchdog never
-        /// fired, which fails the test).
-        fn wait_until_cancelled(&self) -> BridgeError {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while !self.saw_cancel.load(Ordering::SeqCst) {
-                if std::time::Instant::now() > deadline {
-                    return BridgeError::Internal;
-                }
-                thread::sleep(Duration::from_millis(5));
+        /// A stub whose ceremony blocks until the watchdog cancels, then
+        /// reports `NTE_USER_CANCELLED` — the spike-observed Windows behavior
+        /// when *our* `WebAuthNCancelCurrentOperation` fires.
+        fn blocking_user_cancelled() -> Self {
+            StubApi {
+                block_until_cancel: true,
+                unblocked_error: Some(NTE_USER_CANCELLED),
+                ..StubApi::new()
             }
-            BridgeError::Timeout
+        }
+
+        /// A stub whose ceremony blocks until the watchdog cancels, then
+        /// nonetheless succeeds (cancel raced a completing ceremony).
+        fn succeed_after_cancel() -> Self {
+            StubApi {
+                block_until_cancel: true,
+                unblocked_error: None,
+                ..StubApi::new()
+            }
+        }
+
+        /// Block until the watchdog cancels (bounded), then return the
+        /// simulated platform error. Returns `Internal` if the watchdog never
+        /// fired, which fails the tests loudly.
+        fn ceremony<T: Clone>(&self, scripted: &Result<T, BridgeError>) -> Result<T, BridgeError> {
+            if let Some(hr) = self.immediate_error {
+                return Err(map_hresult(hr));
+            }
+            if self.block_until_cancel {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !self.saw_cancel.load(Ordering::SeqCst) {
+                    if std::time::Instant::now() > deadline {
+                        return Err(BridgeError::Internal);
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                return match self.unblocked_error {
+                    Some(hr) => Err(map_hresult(hr)),
+                    // Cancel raced a successful completion: report success.
+                    None => scripted.clone(),
+                };
+            }
+            scripted.clone()
         }
     }
 
@@ -372,20 +467,14 @@ mod tests {
             options: &MakeCredentialOptions,
         ) -> Result<CredentialAttestation, BridgeError> {
             *self.last_make.lock().unwrap_or_else(|e| e.into_inner()) = Some(options.clone());
-            if self.block_until_cancel {
-                return Err(self.wait_until_cancelled());
-            }
-            self.make.clone()
+            self.ceremony(&self.make)
         }
         fn get_assertion(
             &self,
             options: &AssertionOptions,
         ) -> Result<AssertionResult, BridgeError> {
             *self.last_assert.lock().unwrap_or_else(|e| e.into_inner()) = Some(options.clone());
-            if self.block_until_cancel {
-                return Err(self.wait_until_cancelled());
-            }
-            self.assert.clone()
+            self.ceremony(&self.assert)
         }
         fn cancel(&self, _id: &CancellationId) {
             self.cancel_count.fetch_add(1, Ordering::SeqCst);
@@ -658,5 +747,96 @@ mod tests {
         let start = std::time::Instant::now();
         let _ = dispatch(&api, &assert_request(60_000));
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    // ---- watchdog self-cancel reclassification (plan §3) ----------------
+
+    /// (a) Genuine user cancel with the watchdog never fired must stay
+    /// `user_cancelled` — on both the enroll and assert paths.
+    #[test]
+    fn genuine_user_cancel_without_watchdog_stays_user_cancelled() {
+        let stub = StubApi {
+            immediate_error: Some(NTE_USER_CANCELLED),
+            ..StubApi::new()
+        };
+        let api: Arc<dyn WebAuthnApi> = Arc::new(stub);
+        assert_eq!(
+            dispatch(&api, &enroll_request(55_000)),
+            Response::error(BridgeError::UserCancelled)
+        );
+        assert_eq!(
+            dispatch(&api, &assert_request(55_000)),
+            Response::error(BridgeError::UserCancelled)
+        );
+    }
+
+    /// (b) Watchdog fires, Windows reports `NTE_USER_CANCELLED` to the blocked
+    /// ceremony → the bridge MUST report `timeout`.
+    #[test]
+    fn watchdog_self_cancel_of_user_cancelled_error_reports_timeout() {
+        let stub = Arc::new(StubApi::blocking_user_cancelled());
+        let api: Arc<dyn WebAuthnApi> = Arc::clone(&stub) as Arc<dyn WebAuthnApi>;
+        assert_eq!(
+            dispatch(&api, &enroll_request(50)),
+            Response::error(BridgeError::Timeout)
+        );
+        assert_eq!(stub.cancel_count.load(Ordering::SeqCst), 1);
+
+        let stub = Arc::new(StubApi::blocking_user_cancelled());
+        let api: Arc<dyn WebAuthnApi> = Arc::clone(&stub) as Arc<dyn WebAuthnApi>;
+        assert_eq!(
+            dispatch(&api, &assert_request(50)),
+            Response::error(BridgeError::Timeout)
+        );
+        assert_eq!(stub.cancel_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// (c) Platform `ERROR_TIMEOUT` without a watchdog fire stays `timeout`.
+    #[test]
+    fn platform_timeout_without_watchdog_stays_timeout() {
+        let stub = StubApi {
+            immediate_error: Some(hresult_from_win32(ERROR_TIMEOUT)),
+            ..StubApi::new()
+        };
+        let api: Arc<dyn WebAuthnApi> = Arc::new(stub);
+        assert_eq!(
+            dispatch(&api, &enroll_request(55_000)),
+            Response::error(BridgeError::Timeout)
+        );
+        assert_eq!(
+            dispatch(&api, &assert_request(55_000)),
+            Response::error(BridgeError::Timeout)
+        );
+    }
+
+    /// Race guard: a ceremony that *succeeds* while the watchdog cancels must
+    /// not be remapped into an error.
+    #[test]
+    fn success_racing_watchdog_is_not_turned_into_error() {
+        let api: Arc<dyn WebAuthnApi> = Arc::new(StubApi::succeed_after_cancel());
+        match dispatch(&api, &assert_request(50)) {
+            Response::Assert { .. } => {}
+            other => panic!("success was corrupted into an error: {other:?}"),
+        }
+    }
+
+    /// Non-cancel errors are never remapped, even when the watchdog fired.
+    #[test]
+    fn other_errors_are_not_remapped_by_watchdog() {
+        // A non-cancel, non-timeout error is left alone by the pure remap.
+        assert_eq!(
+            remap_watchdog_fire::<()>(Err(BridgeError::NotAvailable), true),
+            Err(BridgeError::NotAvailable)
+        );
+        assert_eq!(
+            remap_watchdog_fire::<()>(Err(BridgeError::InvalidParameter), true),
+            Err(BridgeError::InvalidParameter)
+        );
+        // ...and the remap is a no-op when the watchdog did not fire.
+        assert_eq!(
+            remap_watchdog_fire::<()>(Err(BridgeError::UserCancelled), false),
+            Err(BridgeError::UserCancelled)
+        );
+        assert_eq!(remap_watchdog_fire(Ok(7), true), Ok(7));
     }
 }
