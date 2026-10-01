@@ -302,6 +302,16 @@ pub enum VerifyError {
     #[error("TPM AIK certificate Subject is not empty")]
     TpmAikSubjectNotEmpty,
 
+    /// The TPM AIK leaf certificate lacked the required TCG AIK Extended Key Usage.
+    #[error(
+        "TPM AIK certificate is missing the tcg-kp-AIKCertificate (2.23.133.8.3) Extended Key Usage"
+    )]
+    TpmAikEkuMissing,
+
+    /// The TPM AIK leaf certificate's KeyUsage extension forbade digital signatures.
+    #[error("TPM AIK certificate KeyUsage does not permit digitalSignature")]
+    TpmAikKeyUsageForbidsSignature,
+
     /// A supported operation was invoked with an internally inconsistent input.
     #[error("internal verification inconsistency: {reason}")]
     Internal {

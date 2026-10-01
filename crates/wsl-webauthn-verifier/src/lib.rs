@@ -32,9 +32,9 @@
 //! | COSE key | allow-list `{-7, -257, -8}`; P-256 uncompressed point-on-curve; RSA `n` 2048..=4096; Ed25519 `x` 32 B |
 //! | signature | ES256 DER; RS256 PKCS#1 v1.5; EdDSA `verify_strict` (raw 64 B) |
 //! | packed/x5c | chain to pinned root; leaf v3 + `CA=false` + `OU="Authenticator Attestation"` + `id-fido-gen-ce-aaguid` == authData AAGUID; `attStmt.alg` == leaf key alg |
-//! | tpm | §8.3: `ver=="2.0"`; `certInfo` magic `TPM_GENERATED` / type `TPM_ST_ATTEST_CERTIFY`; `extraData == H_alg(authData‖clientDataHash)`; attested `name == nameAlg‖H_nameAlg(pubArea)`; AIK `sig` over raw `certInfo`; `pubArea` key == credential key |
+//! | tpm | §8.3: `ver=="2.0"`; `certInfo` magic `TPM_GENERATED` / type `TPM_ST_ATTEST_CERTIFY`; `extraData == H_alg(authData‖clientDataHash)`; attested `name == nameAlg‖H_nameAlg(pubArea)`; AIK `sig` over raw `certInfo`; `pubArea` key == credential key; AIK leaf v3 + empty Subject + `CA=false` + TCG AIK EKU (`2.23.133.8.3`) + KeyUsage permitting `digitalSignature` |
 //! | policy | `tpm`/`packed`+x5c accepted under both policies; self/`none` only under [`AttestationPolicy::AllowUnattested`] |
-//! | AAGUID | authData AAGUID must be one of [`STRICT_AAGUIDS`] on every verified path |
+//! | AAGUID | authData AAGUID must be one of [`STRICT_AAGUIDS`] on every verified **attestation** path (assertions never parse an AAGUID); enforced before format dispatch, so no arm can bypass it |
 //!
 //! # `tpm` vs `packed` rule asymmetry
 //!
@@ -44,10 +44,14 @@
 //! * `packed` (§8.2.1) requires a non-empty Subject with `OU = "Authenticator
 //!   Attestation"` and an `id-fido-gen-ce-aaguid` extension equal to the authData
 //!   AAGUID.
-//! * `tpm` (§8.3.1) requires an **empty** Subject and carries no AAGUID extension;
-//!   the AAGUID check is instead against the **authData** AAGUID. If a `tpm` leaf does
-//!   carry the extension it must still match. Both profiles require leaf v3,
-//!   `CA=false`, and a valid chain to the pinned root.
+//! * `tpm` (§8.3.1) requires an **empty** Subject, the TCG AIK Extended Key Usage
+//!   (`2.23.133.8.3`) and, when a KeyUsage extension is present, the `digitalSignature`
+//!   bit; it carries no AAGUID extension, and the AAGUID check is instead against the
+//!   **authData** AAGUID. If a `tpm` leaf does carry the extension it must still match.
+//!   The SubjectAltName content the TCG EK profile specifies is not validated (Windows
+//!   Hello's AIK SAN uses a non-standard critical `directoryName` encoding); this gap
+//!   is documented rather than enforced. Both profiles require leaf v3, `CA=false`, and
+//!   a valid chain to the pinned root.
 //!
 //! # Empirical Windows Hello facts (baked into the `tpm` path)
 //!

@@ -22,6 +22,7 @@ use rand::rngs::OsRng;
 use sha2::{Digest as _, Sha256};
 use x509_cert::Certificate;
 use x509_cert::builder::{Builder as _, CertificateBuilder, Profile};
+use x509_cert::ext::pkix::ExtendedKeyUsage;
 use x509_cert::ext::{AsExtension, Extension};
 use x509_cert::name::Name;
 use x509_cert::serial_number::SerialNumber;
@@ -41,6 +42,10 @@ pub const AAGUID_DISALLOWED: [u8; 16] = [0xAA; 16];
 /// OID `id-fido-gen-ce-aaguid`.
 pub const ID_FIDO_GEN_CE_AAGUID: der::asn1::ObjectIdentifier =
     der::asn1::ObjectIdentifier::new_unwrap("1.3.6.1.4.1.45724.1.1.4");
+
+/// OID `tcg-kp-AIKCertificate` (2.23.133.8.3).
+pub const OID_TCG_KP_AIK_CERTIFICATE: der::asn1::ObjectIdentifier =
+    der::asn1::ObjectIdentifier::new_unwrap("2.23.133.8.3");
 
 // ---------------------------------------------------------------------------
 // Authenticator-data / client-data / attestation-object builders
@@ -306,6 +311,8 @@ pub struct ChainOptions {
     pub break_leaf_signature: bool,
     /// Omit the root from `x5c` (so the pinned anchor cannot be found).
     pub omit_root: bool,
+    /// Emit the TCG AIK Extended Key Usage on the `tpm` leaf (required by §8.3.1).
+    pub include_aik_eku: bool,
     pub leaf_validity: Validity,
     pub intermediate_validity: Validity,
     pub root_validity: Validity,
@@ -322,6 +329,7 @@ impl Default for ChainOptions {
             include_aaguid_ext: true,
             break_leaf_signature: false,
             omit_root: false,
+            include_aik_eku: true,
             leaf_validity: Validity::from_now(Duration::from_secs(3600)).unwrap(),
             intermediate_validity: Validity::from_now(Duration::from_secs(3600)).unwrap(),
             root_validity: Validity::from_now(Duration::from_secs(3600)).unwrap(),
@@ -438,6 +446,7 @@ pub fn build_chain(opts: &ChainOptions) -> TestChain {
 }
 
 /// Build a cert where the issuer's signer and the certificate's own key differ.
+#[allow(clippy::too_many_arguments)]
 fn build_cert_with_signer(
     signing_key: &TestKey,
     subject_key: &TestKey,
@@ -446,6 +455,7 @@ fn build_cert_with_signer(
     validity: Validity,
     subject: Name,
     aaguid: Option<[u8; 16]>,
+    eku: &[der::asn1::ObjectIdentifier],
 ) -> Certificate {
     let spki = subject_key.signer.spki();
     let serial = SerialNumber::from(serial);
@@ -460,6 +470,11 @@ fn build_cert_with_signer(
                 builder
                     .add_extension(&AaguidExtension(aaguid))
                     .expect("ext");
+            }
+            if !eku.is_empty() {
+                builder
+                    .add_extension(&ExtendedKeyUsage(eku.to_vec()))
+                    .expect("eku ext");
             }
             builder
                 .build::<p256::ecdsa::DerSignature>()
@@ -487,6 +502,7 @@ fn build_cert(
         validity,
         subject,
         aaguid,
+        &[],
     )
 }
 
@@ -535,8 +551,15 @@ pub fn build_tpm_chain(aik: &TestKey, opts: &ChainOptions) -> TestChain {
         None,
     );
 
-    // The AIK leaf: signed by the intermediate, own subject key = RSA AIK, empty Subject.
-    let leaf = build_cert(
+    // The AIK leaf: signed by the intermediate, own subject key = RSA AIK, empty
+    // Subject, and (unless disabled) the TCG AIK Extended Key Usage required by
+    // WebAuthn §8.3.1.
+    let aik_eku: &[der::asn1::ObjectIdentifier] = if opts.include_aik_eku {
+        &[OID_TCG_KP_AIK_CERTIFICATE]
+    } else {
+        &[]
+    };
+    let leaf = build_cert_with_signer(
         &intermediate_key,
         aik,
         Profile::Leaf {
@@ -548,6 +571,7 @@ pub fn build_tpm_chain(aik: &TestKey, opts: &ChainOptions) -> TestChain {
         opts.leaf_validity,
         Name::default(),
         None,
+        aik_eku,
     );
 
     let root_der = root.to_der().expect("root der");

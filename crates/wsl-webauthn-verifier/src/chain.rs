@@ -40,6 +40,11 @@ const MAX_CHAIN_LEN: usize = 8;
 pub(crate) const ID_FIDO_GEN_CE_AAGUID: der::asn1::ObjectIdentifier =
     der::asn1::ObjectIdentifier::new_unwrap("1.3.6.1.4.1.45724.1.1.4");
 
+/// OID `tcg-kp-AIKCertificate` (2.23.133.8.3), required in a TPM AIK leaf's
+/// Extended Key Usage (WebAuthn §8.3.1).
+pub(crate) const TCG_KP_AIK_CERTIFICATE: der::asn1::ObjectIdentifier =
+    der::asn1::ObjectIdentifier::new_unwrap("2.23.133.8.3");
+
 /// `ecdsa-with-SHA256` (1.2.840.10045.4.3.2).
 const ECDSA_WITH_SHA256: der::asn1::ObjectIdentifier =
     der::asn1::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
@@ -76,9 +81,13 @@ pub(crate) struct ChainInfo {
 ///
 /// `packed`/AttCA (WebAuthn §8.2.1) requires a non-empty Subject with OU
 /// `Authenticator Attestation` and an `id-fido-gen-ce-aaguid` extension matching the
-/// authData AAGUID. `tpm` (WebAuthn §8.3.1) instead requires an **empty** Subject, a
-/// SubjectAltName and an AIK EKU, and carries no AAGUID extension — so the packed
-/// checks must not be applied to it. Both profiles still pin the AAGUID allow-list
+/// authData AAGUID. `tpm` (WebAuthn §8.3.1) instead requires an **empty** Subject, the
+/// TCG AIK Extended Key Usage (`2.23.133.8.3`) and, when a KeyUsage extension is
+/// present, the `digitalSignature` bit; it carries no AAGUID extension, so the packed
+/// checks must not be applied to it. The SubjectAltName content the TCG EK profile
+/// specifies is **not** validated here (Windows Hello's AIK SAN uses a non-standard
+/// critical `directoryName` encoding that the generic X.509 decoder does not model);
+/// this is a documented gap, not a silent one. Both profiles pin the AAGUID allow-list
 /// against the *authData* AAGUID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChainProfile {
@@ -208,9 +217,15 @@ pub(crate) fn verify_chain(
         return Err(VerifyError::CertificateSubjectOuMismatch);
     }
 
-    // TPM AIK certificates MUST have an empty Subject (WebAuthn §8.3.1).
-    if profile == ChainProfile::Tpm && !leaf.tbs_certificate.subject.0.is_empty() {
-        return Err(VerifyError::TpmAikSubjectNotEmpty);
+    // TPM AIK certificates MUST have an empty Subject (WebAuthn §8.3.1), MUST carry
+    // the TCG AIK Extended Key Usage, and (when KeyUsage is present) MUST permit
+    // digital signatures, since the AIK signs `certInfo`.
+    if profile == ChainProfile::Tpm {
+        if !leaf.tbs_certificate.subject.0.is_empty() {
+            return Err(VerifyError::TpmAikSubjectNotEmpty);
+        }
+        require_aik_extended_key_usage(leaf)?;
+        require_digital_signature_usage(leaf)?;
     }
 
     // AAGUID extension on the leaf, and it must equal the authData AAGUID. The `tpm`
@@ -231,7 +246,9 @@ pub(crate) fn verify_chain(
         }
     }
 
-    // The authData AAGUID must be on the strict allow-list in all cases.
+    // The authData AAGUID must be on the strict allow-list in all cases. `attestation`
+    // enforces this before dispatch, so by the time a chain is walked the AAGUID has
+    // already passed; this is defence in depth for any future caller of `verify_chain`.
     if !STRICT_AAGUIDS.contains(auth_aaguid) {
         return Err(VerifyError::AaguidNotAllowed);
     }
@@ -275,6 +292,46 @@ fn basic_constraints(cert: &Certificate) -> Result<BasicConstraints, VerifyError
         .map(|(_, bc)| bc)
         .ok_or(VerifyError::CertificateMissingBasicConstraints)?;
     Ok(bc)
+}
+
+/// Require the TPM AIK leaf's Extended Key Usage to contain `tcg-kp-AIKCertificate`
+/// (WebAuthn §8.3.1). A missing extension, a duplicate/malformed one, or one that does
+/// not list the AIK OID is rejected.
+fn require_aik_extended_key_usage(cert: &Certificate) -> Result<(), VerifyError> {
+    use x509_cert::ext::pkix::ExtendedKeyUsage;
+
+    let eku = cert
+        .tbs_certificate
+        .get::<ExtendedKeyUsage>()
+        .map_err(|_| VerifyError::MalformedCertificate {
+            reason: "ExtendedKeyUsage extension failed to parse or is duplicated",
+        })?
+        .map(|(_, eku)| eku)
+        .ok_or(VerifyError::TpmAikEkuMissing)?;
+    if !eku.0.contains(&TCG_KP_AIK_CERTIFICATE) {
+        return Err(VerifyError::TpmAikEkuMissing);
+    }
+    Ok(())
+}
+
+/// If the TPM AIK leaf carries a KeyUsage extension, it must permit `digitalSignature`
+/// (the AIK signs `certInfo`). Absent KeyUsage is accepted, matching RFC 5280's
+/// "extension absent means unconstrained" semantics.
+fn require_digital_signature_usage(cert: &Certificate) -> Result<(), VerifyError> {
+    use x509_cert::ext::pkix::KeyUsage;
+
+    let usage =
+        cert.tbs_certificate
+            .get::<KeyUsage>()
+            .map_err(|_| VerifyError::MalformedCertificate {
+                reason: "KeyUsage extension failed to parse or is duplicated",
+            })?;
+    if let Some((_, usage)) = usage {
+        if !usage.digital_signature() {
+            return Err(VerifyError::TpmAikKeyUsageForbidsSignature);
+        }
+    }
+    Ok(())
 }
 
 /// Whether the certificate's Subject contains an OU attribute with UTF8 value `want`.
