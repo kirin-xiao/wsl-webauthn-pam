@@ -6,6 +6,9 @@
 /fuzz/target
 /fuzz/artifacts
 /fuzz/coverage
+# Generated libFuzzer corpus entries. The curated seeds under fuzz/corpus/<target>/
+# are already tracked, so this ignores only new locally-generated entries.
+/fuzz/corpus/*/*
 /spike/*.exe
 __pycache__/
 *.pyc
