@@ -10,8 +10,10 @@
 //! * `status` — list enrolled users and the config summary.
 //! * `verify` — run the verifier against an in-process synthetic attestation+assertion
 //!   to prove the crypto stack works on this machine.
-//! * `install` / `uninstall` — **Wave C** (not implemented here): they print a notice
-//!   and exit `2`.
+//! * `install` — the D6 installer (plan §10): provision the bridge, config, module and
+//!   profile, migrate a legacy WSL-Hello-sudo install (D7), and offer enrollment.
+//! * `uninstall` — remove one user's record (SR-20) or, with `--all`, every provisioned
+//!   component (never the legacy `/etc/pam_wsl_hello`).
 //!
 //! # Design notes
 //!
@@ -34,10 +36,9 @@
 //! persisted `credential_id` always names the second credential. See
 //! [`enroll_with_double_enroll`].
 //!
-//! # Wave C contract (installer)
+//! # Wave C installer (plan §10)
 //!
-//! The not-yet-implemented `install` subcommand (plan §10) MUST, before `enroll`/PAM can
-//! work, write:
+//! The `install` subcommand (plan §10) MUST, before `enroll`/PAM can work, write:
 //!
 //! * `/etc/wsl_webauthn/config` (TOML, `0600` root:root) with `bridge_path` (absolute),
 //!   `win_mnt`, and optional `timeout_secs`;
@@ -49,11 +50,19 @@
 //! * `pam_wsl_webauthn.so` and the `pam-config` profile **before** removing the legacy
 //!   module (D7: a stale reference means a load failure and lockout).
 //!
+//! The implementation lives in [`installer`]; every system path is carried in an
+//! [`installer::InstallPaths`] value so tests are fully tempdir-backed and never touch
+//! `/etc`.
+//!
 //! The `probe`/`status`/`enroll` subcommands read that config via
 //! `wsl_webauthn_store::Store::load_config`; until it exists, `enroll` requires an
 //! explicit `--bridge`.
 
 #![deny(unsafe_code)]
+
+mod confparse;
+mod fsutil;
+mod installer;
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -76,7 +85,6 @@ use wsl_webauthn_verifier::{
 
 /// Default Windows mount root when neither the config nor `--win-mnt` supplies one.
 const DEFAULT_WIN_MNT: &str = "/mnt/c";
-
 /// Hard Linux deadline for a whole enrollment child process (plan §3).
 const ENROLL_DEADLINE: Duration = Duration::from_secs(180);
 
@@ -91,10 +99,6 @@ const CHALLENGE_BYTES: usize = 32;
 
 /// Default COSE algorithm allow-list presented to Windows at enrollment.
 const ENROLL_ALGS: [i32; 2] = [-7, -257];
-
-/// The Wave C notice shown by the not-yet-implemented installer subcommands.
-const WAVE_C_MESSAGE: &str = "not implemented yet (Wave C): the installer must write /etc/wsl_webauthn/config, install \
-     pam_wsl_webauthn.so and the pam-config profile, and pin the bridge exe. See plan §10.";
 
 /// `--help` text.
 const USAGE: &str = "\
@@ -119,8 +123,21 @@ COMMANDS:
     status       List enrolled users and the config summary (root for records)
                    --user <NAME>         show one user's full record
     verify       Self-test the crypto stack against a synthetic ceremony
-    install      Not implemented yet (Wave C)
-    uninstall    Not implemented yet (Wave C)
+    install      Provision the bridge, config, PAM module and profile (root)
+                   --artifact-dir <DIR>   where to find the .so/.exe (else env/cwd)
+                   --module-dir <DIR>     override the PAM security directory
+                   --win-mnt <PATH>       override the Windows mount root
+                   --allow-unattested     admit self/`none` attestation at enroll
+                   --skip-enroll          do not offer enrollment at the end
+                   --yes                  answer yes to every prompt
+                   --non-interactive      never read stdin; use question defaults
+    uninstall    Remove a credential or all components (root)
+                   --user <NAME>         remove one user's record (default)
+                   --all                 remove profile, module, config, bridge
+                   --module-dir <DIR>     override the PAM security directory
+                   --win-mnt <PATH>       override the Windows mount root
+                   --yes                 skip confirmations
+                   --non-interactive     never read stdin; use question defaults
 
 GLOBAL:
     -h, --help       Print this help
@@ -218,10 +235,22 @@ enum Command {
         user: Option<String>,
     },
     Verify,
-    Install,
+    Install {
+        allow_unattested: bool,
+        skip_enroll: bool,
+        non_interactive: bool,
+        yes: bool,
+        module_dir: Option<PathBuf>,
+        win_mnt: Option<PathBuf>,
+        artifact_dir: Option<PathBuf>,
+    },
     Uninstall {
         user: Option<String>,
         all: bool,
+        non_interactive: bool,
+        yes: bool,
+        module_dir: Option<PathBuf>,
+        win_mnt: Option<PathBuf>,
     },
 }
 
@@ -254,9 +283,13 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
     let mut allow_unattested = false;
     let mut yes = false;
     let mut all = false;
+    let mut skip_enroll = false;
+    let mut non_interactive = false;
     let mut user: Option<String> = None;
     let mut bridge: Option<PathBuf> = None;
     let mut win_mnt: Option<PathBuf> = None;
+    let mut module_dir: Option<PathBuf> = None;
+    let mut artifact_dir: Option<PathBuf> = None;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -267,9 +300,17 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
             "--allow-unattested" => allow_unattested = true,
             "--yes" | "-y" => yes = true,
             "--all" => all = true,
+            "--skip-enroll" => skip_enroll = true,
+            "--non-interactive" => non_interactive = true,
             "--user" => user = Some(take_value(args, &mut i, "--user")?.to_string()),
             "--bridge" => bridge = Some(PathBuf::from(take_value(args, &mut i, "--bridge")?)),
             "--win-mnt" => win_mnt = Some(PathBuf::from(take_value(args, &mut i, "--win-mnt")?)),
+            "--module-dir" => {
+                module_dir = Some(PathBuf::from(take_value(args, &mut i, "--module-dir")?));
+            }
+            "--artifact-dir" => {
+                artifact_dir = Some(PathBuf::from(take_value(args, &mut i, "--artifact-dir")?));
+            }
             other if other.starts_with("--user=") => {
                 user = Some(other["--user=".len()..].to_string());
             }
@@ -278,6 +319,12 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
             }
             other if other.starts_with("--win-mnt=") => {
                 win_mnt = Some(PathBuf::from(&other["--win-mnt=".len()..]));
+            }
+            other if other.starts_with("--module-dir=") => {
+                module_dir = Some(PathBuf::from(&other["--module-dir=".len()..]));
+            }
+            other if other.starts_with("--artifact-dir=") => {
+                artifact_dir = Some(PathBuf::from(&other["--artifact-dir=".len()..]));
             }
             other => return Err(format!("unknown argument {other:?} for `{name}`")),
         }
@@ -333,23 +380,44 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
             Command::Verify
         }
         "install" => {
-            if !only(&[replace, allow_unattested, yes, all])
-                || user.is_some()
-                || bridge.is_some()
-                || win_mnt.is_some()
-            {
-                return Err("`install` takes no arguments".to_string());
+            if replace || bridge.is_some() || user.is_some() || all {
+                return Err("`install` accepts only \
+                     --artifact-dir/--module-dir/--win-mnt/--allow-unattested/--skip-enroll/--yes/--non-interactive"
+                    .to_string());
             }
-            Command::Install
+            Command::Install {
+                allow_unattested,
+                skip_enroll,
+                non_interactive,
+                yes,
+                module_dir,
+                win_mnt,
+                artifact_dir,
+            }
         }
         "uninstall" => {
-            if !only(&[replace, allow_unattested, yes]) || bridge.is_some() || win_mnt.is_some() {
-                return Err("`uninstall` accepts only --user/--all".to_string());
+            if replace
+                || allow_unattested
+                || skip_enroll
+                || bridge.is_some()
+                || artifact_dir.is_some()
+            {
+                return Err(
+                    "`uninstall` accepts only --user/--all/--module-dir/--win-mnt/--yes/--non-interactive"
+                        .to_string(),
+                );
             }
             if user.is_some() && all {
                 return Err("`uninstall` accepts only one of --user/--all".to_string());
             }
-            Command::Uninstall { user, all }
+            Command::Uninstall {
+                user,
+                all,
+                non_interactive,
+                yes,
+                module_dir,
+                win_mnt,
+            }
         }
         other => return Err(format!("unknown subcommand {other:?}")),
     };
@@ -429,10 +497,33 @@ fn run(command: Command) -> anyhow::Result<i32> {
         Command::Probe { bridge, win_mnt } => cmd_probe(bridge, win_mnt),
         Command::Status { user } => cmd_status(user),
         Command::Verify => cmd_verify(),
-        Command::Install | Command::Uninstall { .. } => {
-            eprintln!("{WAVE_C_MESSAGE}");
-            Ok(EXIT_USAGE)
-        }
+        Command::Install {
+            allow_unattested,
+            skip_enroll,
+            non_interactive,
+            yes,
+            module_dir,
+            win_mnt,
+            artifact_dir,
+        } => installer::cmd_install(
+            installer::InstallOptions {
+                allow_unattested,
+                skip_enroll,
+                module_dir,
+                win_mnt,
+                artifact_dir,
+            },
+            yes,
+            non_interactive,
+        ),
+        Command::Uninstall {
+            user,
+            all,
+            non_interactive,
+            yes,
+            module_dir,
+            win_mnt,
+        } => installer::cmd_uninstall(user, all, yes, win_mnt, module_dir, non_interactive),
     }
 }
 
@@ -993,61 +1084,12 @@ fn uuid_string(aaguid: &[u8; 16]) -> String {
 fn cmd_unregister(user: Option<String>, yes: bool) -> anyhow::Result<i32> {
     require_root("unregister")?;
     let target = resolve_target_user(user)?;
-    let store = Store::system();
-
-    let existing = match store.load(&target.name) {
-        Ok(record) => Some(record),
-        Err(StoreError::NotFound { .. }) => None,
-        Err(error) => {
-            eprintln!("warning: could not read the existing record: {error}");
-            None
-        }
+    // Share the per-user removal logic with `uninstall` (SR-20: one user at a time).
+    let prompter = installer::StdPrompter {
+        assume_yes: yes,
+        non_interactive: false,
     };
-
-    if existing.is_none() && !yes {
-        bail!("no credential record for \"{}\"", target.name);
-    }
-
-    println!(
-        "About to remove the credential for \"{}\" (uid {}).",
-        target.name, target.uid
-    );
-    if let Some(record) = &existing {
-        if let Some(identity) = &record.windows_identity {
-            if !identity.account.is_empty() {
-                println!("  windows account: {}", identity.account);
-            }
-        }
-        println!("  enrolled at:     {}", record.enrolled_at);
-    } else {
-        println!("  (no readable record; removal will be a no-op if absent)");
-    }
-
-    if !yes {
-        print!("Remove this credential? [y/N] ");
-        std::io::Write::flush(&mut std::io::stdout()).ok();
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line)?;
-        if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-            println!("Aborted.");
-            return Ok(EXIT_FAIL);
-        }
-    }
-
-    match store.remove(&target.name) {
-        Ok(true) => {
-            println!("Removed the credential for \"{}\".", target.name);
-            Ok(EXIT_OK)
-        }
-        Ok(false) => {
-            println!(
-                "No credential record for \"{}\" (nothing to do).",
-                target.name
-            );
-            Ok(EXIT_FAIL)
-        }
-        Err(error) => bail!("failed to remove credential: {error}"),
-    }
+    installer::uninstall_user(&Store::system(), &target.name, yes, &prompter)
 }
 
 // ---------------------------------------------------------------------------
@@ -1699,12 +1741,14 @@ mod tests {
         assert!(parse(&args(&["probe", "--user", "alice"])).is_err());
         // `verify` takes no flags.
         assert!(parse(&args(&["verify", "--yes"])).is_err());
-        // `install` takes no flags.
+        // `install` accepts only its documented flags.
         assert!(parse(&args(&["install", "--replace"])).is_err());
         assert!(parse(&args(&["install", "--all"])).is_err());
-        // `uninstall` accepts only --user/--all.
+        assert!(parse(&args(&["install", "--user", "alice"])).is_err());
+        // `uninstall` accepts only --user/--all/--module-dir/--win-mnt/--yes/--non-interactive.
         assert!(parse(&args(&["uninstall", "--bridge", "/x"])).is_err());
         assert!(parse(&args(&["uninstall", "--replace"])).is_err());
+        assert!(parse(&args(&["uninstall", "--allow-unattested"])).is_err());
         // `--user` and `--all` are mutually exclusive.
         assert!(parse(&args(&["uninstall", "--user", "a", "--all"])).is_err());
     }
@@ -1713,20 +1757,60 @@ mod tests {
     fn parse_uninstall_and_install() {
         assert_eq!(
             parse(&args(&["install"])).unwrap(),
-            Parsed::Run(Command::Install)
+            Parsed::Run(Command::Install {
+                allow_unattested: false,
+                skip_enroll: false,
+                non_interactive: false,
+                yes: false,
+                module_dir: None,
+                win_mnt: None,
+                artifact_dir: None,
+            })
+        );
+        assert_eq!(
+            parse(&args(&[
+                "install",
+                "--allow-unattested",
+                "--skip-enroll",
+                "--yes",
+                "--non-interactive",
+                "--module-dir=/usr/lib/x/security",
+                "--win-mnt",
+                "/mnt/d",
+                "--artifact-dir",
+                "/art",
+            ]))
+            .unwrap(),
+            Parsed::Run(Command::Install {
+                allow_unattested: true,
+                skip_enroll: true,
+                non_interactive: true,
+                yes: true,
+                module_dir: Some(PathBuf::from("/usr/lib/x/security")),
+                win_mnt: Some(PathBuf::from("/mnt/d")),
+                artifact_dir: Some(PathBuf::from("/art")),
+            })
         );
         assert_eq!(
             parse(&args(&["uninstall", "--user", "alice"])).unwrap(),
             Parsed::Run(Command::Uninstall {
                 user: Some("alice".into()),
                 all: false,
+                non_interactive: false,
+                yes: false,
+                module_dir: None,
+                win_mnt: None,
             })
         );
         assert_eq!(
-            parse(&args(&["uninstall", "--all"])).unwrap(),
+            parse(&args(&["uninstall", "--all", "--yes"])).unwrap(),
             Parsed::Run(Command::Uninstall {
                 user: None,
                 all: true,
+                non_interactive: false,
+                yes: true,
+                module_dir: None,
+                win_mnt: None,
             })
         );
     }
