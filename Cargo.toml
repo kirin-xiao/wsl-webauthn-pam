@@ -56,3 +56,13 @@ const-oid = "0.9.6"
 
 # Test-only
 proptest = "1.11.0"
+
+# L5-7 / L10-7 / L15-11: shipped release binaries used to be unstripped with no
+# cross-crate optimization. `strip` removes debug/symbol tables and `thin` LTO
+# optimizes across the crate boundary without the full `fat`-LTO build-time
+# blowup. `panic` deliberately stays at its default (`unwind`): the PAM mapping
+# to `PAM_ABORT` and the bridge's graceful failure both require unwinding, and
+# each crate root carries a `#[cfg(not(panic = "unwind"))] compile_error!`.
+[profile.release]
+strip = true
+lto = "thin"

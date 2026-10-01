@@ -20,7 +20,7 @@ ACTIONLINT ?= $(HOME)/.local/bin/actionlint
 
 WORKFLOWS := .github/workflows/ci.yaml .github/workflows/release.yaml
 
-.PHONY: all bridge test check fmt clippy deny pam-profile lint-actions release clean
+.PHONY: all bridge test check fmt clippy deny pam-profile crlf lint-actions release clean
 
 # Default: Linux module + CLI (linked against libpam0g-dev) and the Windows exe.
 all:
@@ -41,7 +41,7 @@ test:
 	$(CARGO) test --workspace --locked
 
 # Local pre-flight: everything CI gates on, best-effort for tools not installed.
-check: fmt clippy test deny
+check: fmt clippy test crlf deny
 	@echo ">> check complete"
 
 fmt:
@@ -60,6 +60,16 @@ deny:
 pam-profile:
 	python3 .github/scripts/check-pam-profile.py --self-test
 	python3 .github/scripts/check-pam-profile.py --profile pam-config
+
+# L15-7: no tracked text file may contain CR. A CRLF committed into install.sh
+# or pam-config breaks them on Windows checkouts (autocrlf). `git grep -I` skips
+# binaries; the pattern is a literal CR built portably (dash has no $'…').
+crlf:
+	@if git grep -I -l "$$(printf '\r')" -- . ; then \
+		echo ">> CR (CRLF) found in tracked text files above" >&2; \
+		exit 1; \
+	fi
+	@echo ">> no CR in tracked text files"
 
 # Lint the workflow YAML with a pinned actionlint, downloading it if needed.
 lint-actions: $(ACTIONLINT)

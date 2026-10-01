@@ -37,7 +37,8 @@ cargo test --workspace --locked
 
 Or, where available, `make check` (adds `cargo-deny`). CI additionally runs
 `cargo-deny check`, `actionlint`, the `pam-auth-update` profile-expansion guard,
-the Windows bridge build/tests, and an aarch64 `cargo check`. See
+the Windows bridge build/tests, and a native aarch64 `cargo build --release`
+(which really links the PAM `cdylib`, not just `cargo check`). See
 `.github/workflows/ci.yaml`.
 
 Notes:

@@ -6,7 +6,13 @@ name: Release
 # from the *tag* ref (actions/checkout defaults to the triggering ref), so the
 # artifacts are exactly the tagged commit.
 #
+# `publish` is gated on a `gate` job that re-runs fmt/clippy/test on the tagged
+# commit, so a tag cannot publish bytes whose test/lint jobs never ran (L15-3).
+# (Tag pushes do not trigger ci.yaml, hence the in-workflow re-run.)
+#
 # Every `uses:` is pinned to a full 40-char commit SHA (see ci.yaml header).
+# Release binaries are built with `[profile.release] strip=true, lto="thin"`
+# (root Cargo.toml), preserving `panic = "unwind"`.
 #
 # Runner choice for aarch64: we use the native GitHub-hosted ARM runners
 # (`ubuntu-24.04-arm`, `windows-11-arm`) rather than cross-compiling. This
@@ -128,12 +134,48 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  gate:
+    name: gate (fmt, clippy, test)
+    # L15-3: the release workflow was not gated on CI. A tag push does not run
+    # ci.yaml (it triggers on pushes to main and on PRs), so a tag could publish
+    # a commit whose fmt/clippy/test never ran or failed. Re-run the gate here on
+    # the *tagged* commit (checkout defaults to the tag ref = GITHUB_SHA) and
+    # make `publish` depend on it. Cost: one ubuntu-latest job per tag.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install libpam0g-dev
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: test
+        run: cargo test --workspace --locked
+
   publish:
     name: publish release
-    needs: [build-linux, build-windows]
+    needs: [gate, build-linux, build-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Required by actions/attest-build-provenance below (L5-7/L10-7/L15-11).
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -172,6 +214,16 @@ jobs:
             echo "::error::tag ${GITHUB_REF_NAME} does not match workspace version ${manifest}"
             exit 1
           fi
+
+      # L5-7/L10-7/L15-11: attach a signed SLSA build-provenance attestation to
+      # the published tarballs and SHA256SUMS, so a downloader can verify which
+      # workflow + commit produced them (`gh attestation verify <file> -R …`).
+      - name: attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/wsl-webauthn-pam-*.tar.gz
+            dist/SHA256SUMS
 
       - name: publish GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
