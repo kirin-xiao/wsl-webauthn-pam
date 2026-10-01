@@ -166,7 +166,10 @@ pub(crate) fn open_dir(path: &Path) -> io::Result<Fd> {
 }
 
 /// `close(2)`.
-pub(crate) fn close(fd: RawFd) {
+///
+/// Private to this module: the only caller is [`Fd`]'s `Drop`, so a descriptor it owns
+/// can never be closed out from under the guard.
+fn close(fd: RawFd) {
     // SAFETY: `fd` is an owned descriptor; closing twice is caller error, and all
     // callers close exactly once.
     unsafe {
@@ -175,8 +178,14 @@ pub(crate) fn close(fd: RawFd) {
 }
 
 /// RAII guard closing a raw fd exactly once.
+///
+/// The inner descriptor is **private**. Callers cannot reach in with `fd.0`, re-wrap the
+/// raw integer in a second guard, or otherwise extract the descriptor and defeat the
+/// "close exactly once" guarantee. The only way to observe it is [`Fd::raw`] (a borrowed
+/// `RawFd`), and the only way to close it is dropping the guard. This turns the property
+/// from a convention into one the type enforces.
 #[derive(Debug)]
-pub(crate) struct Fd(pub RawFd);
+pub(crate) struct Fd(RawFd);
 
 impl Fd {
     pub fn raw(&self) -> RawFd {
@@ -357,4 +366,34 @@ pub(crate) fn geteuid() -> u32 {
 #[allow(dead_code)]
 pub(crate) fn is_symlink(path: &Path) -> bool {
     lstat(path).map(Stat::is_symlink).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Dropping an [`Fd`] closes the underlying descriptor, so the guard can never leak
+    /// it. A private field is what makes `Drop` the only close path: no caller can reach
+    /// in and close/duplicate the descriptor out from under the guard.
+    #[test]
+    fn fd_drop_closes_the_descriptor() {
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: `fds` is a valid two-element array for `pipe(2)` to fill.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+
+        let owned = Fd(read_fd);
+        assert_eq!(owned.raw(), read_fd, "raw() exposes the owned descriptor");
+        drop(owned);
+
+        // The read end is now closed: writing to the paired write end fails with `EPIPE`
+        // (the Rust test harness ignores `SIGPIPE`, so no signal is delivered). If `Fd`'s
+        // `Drop` had not closed the descriptor, the write would succeed instead.
+        let n = unsafe { libc::write(write_fd, b"x".as_ptr().cast::<libc::c_void>(), 1) };
+        let err = io::Error::last_os_error();
+        // SAFETY: closing the write end, which this test still owns.
+        unsafe { libc::close(write_fd) };
+        assert_eq!(n, -1, "write must fail after the read end was closed");
+        assert_eq!(err.raw_os_error(), Some(libc::EPIPE), "{err}");
+    }
 }

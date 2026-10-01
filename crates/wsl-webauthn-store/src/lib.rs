@@ -19,6 +19,9 @@
 //!   [`StoreError::InvalidUsername`]. This never reaches the filesystem.
 //! * Every path component from the base down (base dir, `credentials` dir, record file)
 //!   is `lstat`ed; a symlink anywhere is [`StoreError::SymlinkedPath`].
+//! * The base directory must be owned by the store's expected owner and must not be
+//!   group/other-writable (it has no exact-mode requirement); otherwise
+//!   [`StoreError::InsecureBase`].
 //! * The `credentials` dir must be **exactly** `0700`, the record/config files **exactly**
 //!   `0600`, all owned by the store's expected owner (root in production). The check is an
 //!   equality test, so any group/other bit (or setuid/setgid/sticky bit) is rejected as
@@ -143,6 +146,26 @@ pub enum StoreError {
         actual_uid: u32,
         /// Expected permission bits.
         expected_mode: u32,
+        /// Actual permission bits.
+        actual_mode: u32,
+    },
+    /// The base directory is owned by the wrong user or is group/other-writable.
+    ///
+    /// Unlike `credentials/` (which must be exactly `0700`), the base directory has no
+    /// fixed mode, but it must be owned by the expected user and must not be writable by
+    /// group or other, or an attacker could replace the `credentials` directory or the
+    /// `config` file underneath it.
+    #[error(
+        "insecure base directory {path}: expected uid {expected_uid}, \
+         found uid {actual_uid} mode {actual_mode:o}"
+    )]
+    InsecureBase {
+        /// The offending base directory.
+        path: PathBuf,
+        /// Expected owner uid.
+        expected_uid: u32,
+        /// Actual owner uid.
+        actual_uid: u32,
         /// Actual permission bits.
         actual_mode: u32,
     },
@@ -345,7 +368,14 @@ impl Store {
         Ok(fd)
     }
 
-    /// Verify the base directory exists, is a directory, and is not a symlink.
+    /// Verify the base directory exists, is a directory, is not a symlink, is owned by
+    /// the expected user, and is not group/other-writable.
+    ///
+    /// The base directory deliberately has **no** exact-mode requirement (an admin may
+    /// use `0755`), but if it were writable by group or other an attacker could swap in
+    /// their own `credentials/` directory or `config` file, so that is refused as
+    /// [`StoreError::InsecureBase`]. The same two checks fail closed at `load` and
+    /// `save_atomic` before any record is read or written.
     fn check_base(&self) -> Result<sys::Stat, StoreError> {
         let st = match sys::lstat(&self.base) {
             Ok(st) => st,
@@ -364,6 +394,14 @@ impl Store {
         if !st.is_dir() {
             return Err(StoreError::NotRegularFile {
                 path: self.base.clone(),
+            });
+        }
+        if st.uid != self.owner_uid || st.perm_bits() & 0o022 != 0 {
+            return Err(StoreError::InsecureBase {
+                path: self.base.clone(),
+                expected_uid: self.owner_uid,
+                actual_uid: st.uid,
+                actual_mode: st.perm_bits(),
             });
         }
         Ok(st)
