@@ -1,0 +1,19 @@
+[package]
+name = "wsl-webauthn-cli"
+description = "Command-line tool wsl-webauthn-pam: enroll/unregister/probe/verify/status/install/uninstall"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "wsl-webauthn-pam"
+path = "src/main.rs"
+
+[dependencies]
+wsl-webauthn-protocol = { path = "../wsl-webauthn-protocol" }
+wsl-webauthn-store = { path = "../wsl-webauthn-store" }
+wsl-webauthn-runner = { path = "../wsl-webauthn-runner" }
+wsl-webauthn-verifier = { path = "../wsl-webauthn-verifier" }
+anyhow = { workspace = true }

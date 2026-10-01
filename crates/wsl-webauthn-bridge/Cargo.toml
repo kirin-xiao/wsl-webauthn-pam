@@ -1,0 +1,17 @@
+[package]
+name = "wsl-webauthn-bridge"
+description = "Windows bridge (WSLWebAuthnBridge.exe): drives the Windows Hello platform authenticator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "WSLWebAuthnBridge"
+path = "src/main.rs"
+
+[dependencies]
+wsl-webauthn-protocol = { path = "../wsl-webauthn-protocol" }
+serde = { workspace = true }
+serde_json = { workspace = true }

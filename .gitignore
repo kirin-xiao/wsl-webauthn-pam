@@ -1,0 +1,7 @@
+/target
+/build
+tests/vectors/local/
+*.rs.bk
+.idea/
+.vscode/
+release*/

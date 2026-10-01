@@ -1,0 +1,22 @@
+[package]
+name = "wsl-webauthn-pam"
+description = "PAM module pam_wsl_webauthn.so (Linux cdylib)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pam_wsl_webauthn"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wsl-webauthn-protocol = { path = "../wsl-webauthn-protocol" }
+wsl-webauthn-store = { path = "../wsl-webauthn-store" }
+wsl-webauthn-runner = { path = "../wsl-webauthn-runner" }
+wsl-webauthn-verifier = { path = "../wsl-webauthn-verifier" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+libc = { workspace = true }
+rand = { workspace = true }

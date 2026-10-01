@@ -1,0 +1,27 @@
+[package]
+name = "wsl-webauthn-verifier"
+description = "Security core: pure-Rust WebAuthn assertion/attestation verification"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+wsl-webauthn-protocol = { path = "../wsl-webauthn-protocol" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+thiserror = { workspace = true }
+ciborium = { workspace = true }
+sha2 = { workspace = true }
+p256 = { workspace = true }
+ecdsa = { workspace = true }
+rsa = { workspace = true }
+ed25519-dalek = { workspace = true }
+x509-cert = { workspace = true }
+der = { workspace = true }
+const-oid = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
