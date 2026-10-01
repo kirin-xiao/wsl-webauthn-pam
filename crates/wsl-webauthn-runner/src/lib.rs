@@ -20,9 +20,11 @@
 //!   bridge printed its Windows PID as the first stderr line (`PID <n>`), a best-effort
 //!   `taskkill.exe /F /PID <n>` is spawned with `current_dir = win_mnt` under a 5 s
 //!   budget. Failures are ignored.
-//! * **Pre-flight.** [`RunnerError::BridgeMissing`] if the bridge path does not exist,
+//! * **Pre-flight.** [`RunnerError::BridgeMissing`] only if the bridge path genuinely
+//!   does not exist (`NotFound`); any other `stat` failure (e.g. `EACCES` on an
+//!   unreadable parent) is [`RunnerError::Spawn`] carrying the real `io::Error`.
 //!   [`RunnerError::InteropUnavailable`] if the WSL interop binfmt entry is absent or not
-//!   `enabled`. Both fail fast without spawning.
+//!   `enabled`. All fail fast without spawning.
 //! * **Ceremony vs. transport.** A well-formed `ok:false` framed response is returned as
 //!   [`RunnerResponse::Error`] inside `Ok`. Transport problems (non-zero exit, malformed
 //!   framing, oversize, EOF) become [`RunnerError`].
@@ -96,12 +98,15 @@ pub enum RunnerError {
         /// Maximum accepted payload length.
         cap: usize,
     },
-    /// The child process could not be spawned.
+    /// The bridge could not be inspected or spawned.
+    ///
+    /// Covers both an `exec` failure and a pre-flight `stat` that failed for a reason
+    /// other than `NotFound` (e.g. `EACCES` on an unreadable parent directory).
     #[error("failed to spawn bridge {path}: {source}")]
     Spawn {
         /// The bridge path.
         path: PathBuf,
-        /// The underlying spawn error.
+        /// The underlying stat/exec error.
         #[source]
         source: std::io::Error,
     },
@@ -457,10 +462,23 @@ impl Runner {
 
     /// Fast-fail pre-flight checks (no process is spawned if these fail).
     fn preflight(&self) -> Result<(), RunnerError> {
-        if !self.bridge.exists() {
-            return Err(RunnerError::BridgeMissing {
-                path: self.bridge.clone(),
-            });
+        // `Path::exists()` collapses *every* `stat` failure into "missing" (ENOENT, but
+        // also EACCES on an unreadable parent, ENAMETOOLONG, …). Use `metadata` so only a
+        // genuine `NotFound` is reported as [`RunnerError::BridgeMissing`]; any other OS
+        // error is surfaced with its real `io::Error` instead of being disguised.
+        match std::fs::metadata(&self.bridge) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(RunnerError::BridgeMissing {
+                    path: self.bridge.clone(),
+                });
+            }
+            Err(source) => {
+                return Err(RunnerError::Spawn {
+                    path: self.bridge.clone(),
+                    source,
+                });
+            }
         }
         if self.check_interop {
             let contents = std::fs::read_to_string(&self.interop_path).map_err(|e| {
@@ -603,6 +621,19 @@ impl Runner {
             read_frame(&mut cursor, MAX_RESPONSE_BYTES).map_err(|e| RunnerError::Transport {
                 message: format!("reading response frame: {e}"),
             })?;
+        // The exchange is exactly one frame. Anything after it means the child emitted
+        // extra bytes (a second frame, or garbage); treat that as a transport failure
+        // rather than silently ignoring it.
+        let consumed = cursor.position() as usize;
+        if consumed != out_buf.len() {
+            return Err(RunnerError::Transport {
+                message: format!(
+                    "trailing bytes after response frame: {} unread of {}",
+                    out_buf.len() - consumed,
+                    out_buf.len()
+                ),
+            });
+        }
         let response: Response =
             serde_json::from_slice(&payload).map_err(|e| RunnerError::Transport {
                 message: format!("parsing response JSON: {e}"),
@@ -634,7 +665,16 @@ impl Runner {
 
     /// Best-effort `taskkill.exe /F /PID <pid>` with `cwd = win_mnt`, 5 s budget.
     ///
-    /// All failures are ignored: this is a backstop, not a security control.
+    /// # Untrusted PID
+    ///
+    /// `pid` is parsed from the bridge's stderr and is **not authenticated**: a malicious
+    /// or spoofed bridge can print any `PID <n>` it likes. This is therefore only a
+    /// best-effort cancellation hint and is never used for any trust decision. It runs
+    /// only after a Linux-side timeout, and the bridge already executes with the invoking
+    /// user's privileges, so the escalation grants an attacker no privilege they did not
+    /// already have — but it *can* terminate an arbitrary process owned by that same user
+    /// on the Windows side. All failures are ignored: this is a backstop, not a security
+    /// control.
     fn taskkill(&self, pid: u32) {
         let Some(resolved) = resolve_interop_program(&self.taskkill_program, &self.win_mnt) else {
             return;
@@ -1020,11 +1060,19 @@ fn drive_child(
 }
 
 /// Parse `PID <n>` from the first stderr line, if present.
+///
+/// # Security
+///
+/// The value is **untrusted**: it comes from the bridge's stderr, which a compromised or
+/// spoofed bridge fully controls. It is only a best-effort escalation hint for
+/// [`Runner::taskkill`] and never feeds a trust decision. `0`, a negative value, or one
+/// that does not fit a `u32` yields `None` (no escalation).
 fn parse_pid_line(stderr: &[u8]) -> Option<u32> {
     let text = std::str::from_utf8(stderr).ok()?;
     let first = text.lines().next()?.trim();
     let rest = first.strip_prefix("PID ")?;
-    rest.trim().parse::<u32>().ok()
+    // `0` is not a valid Windows PID and is a common sentinel; reject it too.
+    rest.trim().parse::<u32>().ok().filter(|&pid| pid != 0)
 }
 
 /// Public wrapper over the bridge PID-line parser: returns the Windows PID if the first

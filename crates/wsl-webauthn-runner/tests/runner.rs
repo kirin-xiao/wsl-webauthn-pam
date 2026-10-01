@@ -6,6 +6,7 @@
 //! runner's injectable interop check at a temp file, or by disabling it.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -251,6 +252,51 @@ fn missing_bridge_is_bridge_missing() {
 }
 
 #[test]
+fn bridge_inside_unreadable_dir_is_permission_error_not_missing() {
+    // Root bypasses directory DAC, so this scenario is only observable as a normal user.
+    // SAFETY: geteuid is always safe to call.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping: root bypasses directory permissions");
+        return;
+    }
+    let dir = cwd_dir();
+    let locked = dir.path().join("locked");
+    fs::create_dir(&locked).unwrap();
+    let bridge = locked.join("bridge.exe");
+    fs::write(&bridge, b"not a real bridge").unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let r = Runner::without_interop_check(&bridge, dir.path());
+    let result = r.probe(Duration::from_secs(1));
+
+    // Restore permissions so the tempdir can be cleaned up.
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+
+    match result.unwrap_err() {
+        RunnerError::Spawn { source, .. } => {
+            assert_eq!(
+                source.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "the real EACCES must be surfaced, not disguised as BridgeMissing: {source}"
+            );
+        }
+        other => panic!("expected a permission Spawn error, got {other:?}"),
+    }
+}
+
+#[test]
+fn trailing_bytes_after_frame_are_transport() {
+    let dir = cwd_dir();
+    let r = build_runner(dir.path(), &["ok", "trailing=1"]);
+    match r.probe(Duration::from_secs(5)).unwrap_err() {
+        RunnerError::Transport { message } => {
+            assert!(message.contains("trailing"), "{message}");
+        }
+        other => panic!("expected Transport, got {other:?}"),
+    }
+}
+
+#[test]
 fn nonzero_exit_is_bridge_failed() {
     let dir = cwd_dir();
     let r = build_runner(dir.path(), &["exit=3"]);
@@ -473,6 +519,25 @@ fn parse_pid_helper() {
     assert_eq!(wsl_webauthn_runner::parse_pid(b"not a pid line\n"), None);
     assert_eq!(wsl_webauthn_runner::parse_pid(b""), None);
     assert_eq!(wsl_webauthn_runner::parse_pid(b"PID abc\n"), None);
+}
+
+#[test]
+fn parse_pid_rejects_garbage_zero_and_out_of_range() {
+    // The PID is untrusted; only an in-range, non-zero u32 is accepted as a hint.
+    assert_eq!(wsl_webauthn_runner::parse_pid(b"PID 0\n"), None);
+    assert_eq!(wsl_webauthn_runner::parse_pid(b"PID -1\n"), None);
+    assert_eq!(wsl_webauthn_runner::parse_pid(b"PID \n"), None);
+    // u32::MAX + 1 overflows.
+    assert_eq!(wsl_webauthn_runner::parse_pid(b"PID 4294967296\n"), None);
+    assert_eq!(
+        wsl_webauthn_runner::parse_pid(b"PID 99999999999999999999\n"),
+        None
+    );
+    // The largest representable PID is merely untrusted, not invalid.
+    assert_eq!(
+        wsl_webauthn_runner::parse_pid(b"PID 4294967295\n"),
+        Some(u32::MAX)
+    );
 }
 
 #[test]

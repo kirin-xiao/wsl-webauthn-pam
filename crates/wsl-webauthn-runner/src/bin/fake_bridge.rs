@@ -30,6 +30,7 @@
 //! * `oversize=1` — write a valid prefix declaring > 64 KiB and then that many bytes.
 //! * `oversize_declared=1` — write only a prefix declaring > 64 KiB, then exit.
 //! * `empty=1` — exit 0 with no output at all.
+//! * `trailing=1` — write a valid frame followed by extra bytes, then exit 0.
 //! * `noisy=1` — emit extra stderr chatter after the PID line.
 //! * `payload=<n>` — number of filler bytes in a valid enroll/assert success response.
 
@@ -56,6 +57,7 @@ struct Opts {
     oversize: bool,
     oversize_declared: bool,
     empty: bool,
+    trailing: bool,
     noisy: bool,
     payload: usize,
 }
@@ -77,6 +79,7 @@ impl Default for Opts {
             oversize: false,
             oversize_declared: false,
             empty: false,
+            trailing: false,
             noisy: false,
             payload: 0,
         }
@@ -106,6 +109,7 @@ fn parse_args() -> Opts {
             "oversize" => opts.oversize = value == "1",
             "oversize_declared" => opts.oversize_declared = value == "1",
             "empty" => opts.empty = value == "1",
+            "trailing" => opts.trailing = value == "1",
             "noisy" => opts.noisy = value == "1",
             "payload" => opts.payload = value.parse().unwrap_or(0),
             _ => {}
@@ -253,6 +257,13 @@ fn main() -> ExitCode {
     if let Err(e) = write_frame(&response) {
         eprintln!("fake-bridge: write failed: {e}");
         return ExitCode::from(2);
+    }
+    if opts.trailing {
+        // A valid frame plus junk: the runner must reject the trailing bytes rather than
+        // silently accepting the frame.
+        let mut stdout = std::io::stdout();
+        let _ = stdout.write_all(b"trailing-garbage-after-frame");
+        let _ = stdout.flush();
     }
     ExitCode::SUCCESS
 }

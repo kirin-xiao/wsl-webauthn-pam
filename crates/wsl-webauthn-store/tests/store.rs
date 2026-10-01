@@ -282,15 +282,77 @@ fn remove_refuses_symlinked_record() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn load_rejects_wrong_owner() {
+fn load_rejects_wrong_base_owner() {
     let (d, store) = fresh();
     store.save_atomic(&sample_record("alice"), false).unwrap();
-    // Expect a uid that is definitely not ours (wrapping is fine).
+    // Expect a uid that is definitely not ours (wrapping is fine); the base dir itself is
+    // checked first, so this fails at the base rather than the record.
     let wrong = Store::with_owner(d.path(), current_euid().wrapping_add(1));
     assert!(matches!(
         wrong.load("alice"),
-        Err(StoreError::BadOwnership { .. })
+        Err(StoreError::InsecureBase { .. })
     ));
+}
+
+#[test]
+fn group_writable_base_dir_is_refused() {
+    let (d, store) = fresh();
+    store.save_atomic(&sample_record("alice"), false).unwrap();
+    // No exact-mode requirement, but group/other-writable is refused on both paths.
+    fs::set_permissions(d.path(), fs::Permissions::from_mode(0o770)).unwrap();
+    assert!(matches!(
+        store.load("alice"),
+        Err(StoreError::InsecureBase { .. })
+    ));
+    assert!(matches!(
+        store.save_atomic(&sample_record("bob"), false),
+        Err(StoreError::InsecureBase { .. })
+    ));
+}
+
+#[test]
+fn other_writable_base_dir_is_refused() {
+    let (d, store) = fresh();
+    fs::set_permissions(d.path(), fs::Permissions::from_mode(0o702)).unwrap();
+    assert!(matches!(
+        store.save_atomic(&sample_record("alice"), false),
+        Err(StoreError::InsecureBase { .. })
+    ));
+}
+
+#[test]
+fn read_only_base_dir_is_allowed() {
+    // A non-writable-but-owner-controlled base (e.g. 0755) is fine; only the
+    // group/other *write* bits are the hazard.
+    let (d, store) = fresh();
+    fs::set_permissions(d.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    store.save_atomic(&sample_record("alice"), false).unwrap();
+    assert_eq!(store.load("alice").unwrap().linux_user, "alice");
+}
+
+#[test]
+fn insecure_base_is_refused_by_list_and_remove() {
+    // `list`/`remove` do not re-check the `credentials` dir owner/mode, so the base
+    // check is their only guard against a swapped-in attacker-controlled directory.
+    let (d, store) = fresh();
+    store.save_atomic(&sample_record("alice"), false).unwrap();
+    fs::set_permissions(d.path(), fs::Permissions::from_mode(0o770)).unwrap();
+    assert!(matches!(store.list(), Err(StoreError::InsecureBase { .. })));
+    assert!(matches!(
+        store.remove("alice"),
+        Err(StoreError::InsecureBase { .. })
+    ));
+}
+
+#[test]
+fn missing_base_lists_empty_and_removes_nothing() {
+    // A base that is absent is not an *insecure* base: preserve the prior behaviour of
+    // treating it as "nothing enrolled" rather than erroring.
+    let d = TempDir::new().unwrap();
+    let missing = d.path().join("does-not-exist");
+    let store = Store::with_owner(&missing, current_euid());
+    assert!(store.list().unwrap().is_empty());
+    assert!(!store.remove("alice").unwrap());
 }
 
 #[test]
