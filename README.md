@@ -227,12 +227,23 @@ It is never a silent fallback.
 
 ### Guided install
 
+From a **release tarball**, `install.sh` sits next to the CLI and can be run
+directly:
+
+```sh
+tar xzf wsl-webauthn-pam-<version>-<arch>.tar.gz && cd wsl-webauthn-pam-<version>-<arch>
+sudo ./install.sh                      # thin shim: exec sudo ./wsl-webauthn-pam install
+```
+
+From a **source checkout**, build first (the shim runs the CLI from its own
+directory):
+
 ```sh
 git clone https://github.com/kirin-xiao/wsl-webauthn-pam
 cd wsl-webauthn-pam
-sudo ./install.sh                      # thin shim: exec sudo wsl-webauthn-pam install
-# or, equivalently:
-sudo wsl-webauthn-pam install
+make                                    # or: cargo build --release --locked
+sudo ./build/release/install.sh         # after `make release`, or:
+sudo wsl-webauthn-pam install           # if the CLI is on PATH
 ```
 
 `install` (running as root) will:
