@@ -5,7 +5,7 @@
 //! | alg   | name  | kty | params                        |
 //! |-------|-------|-----|-------------------------------|
 //! | `-7`  | ES256 | 2   | P-256 (`crv` 1), `x`/`y` 32 B |
-//! | `-257`| RS256 | 3   | `n`/`e`, modulus 2048..=4096  |
+//! | `-257`| RS256 | 3   | `n`/`e`, modulus 2048..=4096, `e` ∈ {3, 65537} |
 //! | `-8`  | EdDSA | 1   | OKP `crv` 6 (Ed25519), `x` 32 B |
 //!
 //! Everything else — including COSE keys whose `alg` is absent or is a string — is
@@ -273,9 +273,15 @@ fn parse_rs256(map: &[(Value, Value)]) -> Result<ParsedCoseKey, VerifyError> {
             reason: "RSA modulus has a leading zero byte",
         });
     }
+    // The exponent must use its minimal big-endian encoding; a leading zero byte is a
+    // non-canonical encoding of the same integer and is rejected.
+    if e[0] == 0 {
+        return Err(VerifyError::MalformedCoseKey {
+            reason: "RSA exponent has a leading zero byte",
+        });
+    }
 
     let modulus = rsa::BigUint::from_bytes_be(n);
-    let exponent = rsa::BigUint::from_bytes_be(e);
     let bits: u64 = modulus
         .bits()
         .try_into()
@@ -284,6 +290,15 @@ fn parse_rs256(map: &[(Value, Value)]) -> Result<ParsedCoseKey, VerifyError> {
         })?;
     if !(RSA_MIN_BITS..=RSA_MAX_BITS).contains(&bits) {
         return Err(VerifyError::CoseKeyModulusSize { bits });
+    }
+
+    // Only the two exponents defined for use with RSA in FIDO/CTAP (`e = 3` and
+    // `e = 65537`) are accepted. This rejects `e = 1`/`e = 2`/oversized exponents that
+    // `RsaPublicKey::new` would otherwise admit, which would let a trivially weak or
+    // degenerate key through the allow-list.
+    let exponent = rsa::BigUint::from_bytes_be(e);
+    if exponent != rsa::BigUint::from(3u32) && exponent != rsa::BigUint::from(65537u32) {
+        return Err(VerifyError::CoseKeyExponentNotAllowed);
     }
 
     // `RsaPublicKey::new` applies the `rsa` crate's own minimum key-size policy,
@@ -426,6 +441,59 @@ mod tests {
     fn rejects_malformed_cbor() {
         assert!(matches!(
             parse(&[0xff, 0x00]),
+            Err(VerifyError::MalformedCoseKey { .. })
+        ));
+    }
+
+    /// Encode an RSA COSE key with an arbitrary modulus/exponent.
+    fn rsa_cose(n: &[u8], e: &[u8]) -> Vec<u8> {
+        let map = vec![
+            (Value::from(1i64), Value::from(3i64)),
+            (Value::from(3i64), Value::from(-257i64)),
+            (Value::from(-1i64), Value::Bytes(n.to_vec())),
+            (Value::from(-2i64), Value::Bytes(e.to_vec())),
+        ];
+        let mut out = Vec::new();
+        ciborium::into_writer(&Value::Map(map), &mut out).unwrap();
+        out
+    }
+
+    /// A fixed odd 2048-bit modulus (exactly at the floor of the accepted range).
+    fn rsa_modulus_2048() -> Vec<u8> {
+        let mut n = vec![0xC1u8; 256];
+        n[255] = 0x0F; // keep it odd
+        n
+    }
+
+    #[test]
+    fn rsa_exponent_allow_list() {
+        let n = rsa_modulus_2048();
+        // e = 1, 2, 16777217, and a large arbitrary value are all rejected.
+        for bad in [
+            vec![0x01u8],
+            vec![0x02],
+            vec![0x01, 0x00, 0x00, 0x01],
+            vec![0xff; 8],
+        ] {
+            assert_eq!(
+                parse(&rsa_cose(&n, &bad)).unwrap_err(),
+                VerifyError::CoseKeyExponentNotAllowed,
+                "e={bad:?} must be rejected"
+            );
+        }
+        // The two documented exponents are accepted.
+        for good in [vec![0x03u8], vec![0x01, 0x00, 0x01]] {
+            let key = parse(&rsa_cose(&n, &good)).expect("allowed exponent");
+            assert_eq!(key.alg(), ALG_RS256);
+        }
+    }
+
+    #[test]
+    fn rsa_exponent_non_minimal_encoding_rejected() {
+        let n = rsa_modulus_2048();
+        // 65537 with a leading zero byte is a non-canonical encoding.
+        assert!(matches!(
+            parse(&rsa_cose(&n, &[0x00, 0x01, 0x00, 0x01])),
             Err(VerifyError::MalformedCoseKey { .. })
         ));
     }

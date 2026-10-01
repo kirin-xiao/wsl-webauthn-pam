@@ -128,8 +128,9 @@ authenticate.
 Overriding the root is impossible in production: `verify_attestation` always
 uses the pinned fingerprint, and the bundled root certificate is trusted **only**
 after its bytes hash to that pin (`crates/wsl-webauthn-verifier/src/ms_root.rs`).
-A `#[doc(hidden)]` test-only seam (`verify_attestation_with_anchor`) lets the test
-suite substitute a synthetic root; it cannot weaken the production path.
+A compile-time test-only seam (`verify_attestation_with_anchor`, compiled only under
+the `test-anchor` feature) lets the test suite substitute a synthetic root; downstream
+crates never enable that feature, so it cannot weaken the production path.
 
 ### Verified invariants (assertion)
 

@@ -15,7 +15,9 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-wsl-webauthn-verifier = { path = "../crates/wsl-webauthn-verifier" }
+# The attestation fuzz target drives the full verifier through the test-only
+# anchor-injection seam, so it must enable `test-anchor`.
+wsl-webauthn-verifier = { path = "../crates/wsl-webauthn-verifier", features = ["test-anchor"] }
 wsl-webauthn-protocol = { path = "../crates/wsl-webauthn-protocol" }
 p256 = { version = "0.13.2", features = ["ecdsa"] }
 ciborium = "0.2.2"

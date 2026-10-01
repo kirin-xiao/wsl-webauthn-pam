@@ -18,11 +18,13 @@
 //!    `x5c[0]`. The signature scheme is taken from `attStmt.alg` when it maps to a
 //!    scheme compatible with the AIK key type; otherwise a small compatible set is
 //!    tried and the signature must verify under one of them (Windows Hello reports
-//!    `alg: -65535` = COSE `RS1`, i.e. RSA PKCS#1 v1.5 with SHA-1).
+//!    `alg: -65535` = COSE `RS1`, i.e. RSA PKCS#1 v1.5 with SHA-1). The digest that
+//!    actually verified is returned and is the **only** digest accepted for
+//!    `extraData` below.
 //! 4. `certInfo` (TPMS_ATTEST) is parsed: `magic == TPM_GENERATED`,
 //!    `type == TPM_ST_ATTEST_CERTIFY`, and `extraData == H(authData || clientDataHash)`
-//!    where `H` is the digest of the signature scheme (SHA-1 for `RS1`, SHA-256 for
-//!    `RS256`, …).
+//!    where `H` is exactly the digest that verified the AIK signature (SHA-1 for
+//!    `RS1`, SHA-256 for `RS256`, …).
 //! 5. The `name` attested inside `TPMS_CERTIFY_INFO` equals `nameAlg || H_name(pubArea)`
 //!    (TPM 2.0 Part 1 §16). The Name is computed over the **entire** `pubArea` bytes
 //!    *without* any outer `TPM2B` size prefix (the CBOR field is the bare
@@ -242,6 +244,8 @@ struct PubArea<'a> {
     rsa_modulus: Option<&'a [u8]>,
     /// RSA public exponent (already defaulted to 65537 when TPM encoded 0).
     rsa_exponent: u32,
+    /// The `keyBits` declared in `TPMS_RSA_PARMS` (0 for ECC keys).
+    key_bits: u16,
 }
 
 /// Parse `pubArea` as a bare `TPMT_PUBLIC` (no `TPM2B_PUBLIC` size prefix).
@@ -257,6 +261,7 @@ fn parse_pub_area(bytes: &[u8]) -> Result<PubArea<'_>, VerifyError> {
     let mut ecc = None;
     let mut rsa_modulus = None;
     let mut rsa_exponent = 65537u32;
+    let mut key_bits = 0u16;
 
     match ty {
         TPM_ALG_ECC => {
@@ -279,7 +284,7 @@ fn parse_pub_area(bytes: &[u8]) -> Result<PubArea<'_>, VerifyError> {
             // TPMS_RSA_PARMS: symmetric(2) scheme(2) keyBits(2) exponent(4).
             let _symmetric = c.u16().map_err(as_pubarea)?;
             let _scheme = c.u16().map_err(as_pubarea)?;
-            let _key_bits = c.u16().map_err(as_pubarea)?;
+            key_bits = c.u16().map_err(as_pubarea)?;
             let exponent = c.u32().map_err(as_pubarea)?;
             rsa_exponent = if exponent == 0 { 65537 } else { exponent };
             // TPMS_RSA unique: TPM2B_PUBLIC_KEY_RSA (modulus).
@@ -305,6 +310,7 @@ fn parse_pub_area(bytes: &[u8]) -> Result<PubArea<'_>, VerifyError> {
         ecc,
         rsa_modulus,
         rsa_exponent,
+        key_bits,
     })
 }
 
@@ -357,28 +363,19 @@ pub(crate) fn verify(check: &TpmCheck<'_>) -> Result<(), VerifyError> {
         return Err(VerifyError::TpmAlgorithmUnsupported { alg: check.alg });
     }
 
-    // 1. Verify the AIK signature over the raw certInfo bytes.
-    verify_aik_signature(check.sig, check.cert_info, check.aik_spki, scheme)?;
+    // 1. Verify the AIK signature over the raw certInfo bytes. The returned
+    //    `HashKind` is the digest that actually verified; it is the only digest the
+    //    `extraData` check below accepts, so `attStmt.alg` (or, for an unrecognised
+    //    alg, the scheme that genuinely verified) binds the hash deterministically.
+    let verified_hash = verify_aik_signature(check.sig, check.cert_info, check.aik_spki, scheme)?;
 
     // 2. Parse and validate certInfo.
     let cert_info = parse_cert_info(check.cert_info)?;
 
-    // 3. extraData must equal H(attToBeSigned) under the scheme's digest (or, for an
-    //    unrecognised alg, under any supported digest).
-    let extra_ok = match scheme {
-        Some(Scheme::Rsa(h)) | Some(Scheme::Ecdsa(h)) => {
-            h.digest(check.att_to_be_signed) == cert_info.extra_data
-        }
-        None => [
-            HashKind::Sha1,
-            HashKind::Sha256,
-            HashKind::Sha384,
-            HashKind::Sha512,
-        ]
-        .iter()
-        .any(|h| h.digest(check.att_to_be_signed) == cert_info.extra_data),
-    };
-    if !extra_ok {
+    // 3. extraData must equal H(attToBeSigned) under exactly the digest that verified
+    //    the AIK signature. Accepting any other supported digest would decouple the
+    //    declared scheme from the attested transcript.
+    if verified_hash.digest(check.att_to_be_signed) != cert_info.extra_data {
         return Err(VerifyError::TpmCertInfoExtraDataMismatch);
     }
 
@@ -393,7 +390,10 @@ pub(crate) fn verify(check: &TpmCheck<'_>) -> Result<(), VerifyError> {
         return Err(VerifyError::TpmCertInfoNameMismatch);
     }
 
-    // 5. pubArea must describe the same key as the credential.
+    // 5. pubArea must describe the same key as the credential. For RSA, the declared
+    //    `keyBits` must also agree with the modulus actually present in `unique`, so a
+    //    mismatch between the two attested fields is rejected even though `matches_rsa`
+    //    compares only `(n, e)`.
     let key_matches = match pub_area.ty {
         TPM_ALG_ECC => match pub_area.ecc {
             Some((x, y)) => check.credential_key.matches_ec_p256(x, y),
@@ -401,6 +401,13 @@ pub(crate) fn verify(check: &TpmCheck<'_>) -> Result<(), VerifyError> {
         },
         TPM_ALG_RSA => match pub_area.rsa_modulus {
             Some(n) => {
+                let actual_bits: u64 = rsa::BigUint::from_bytes_be(n).bits() as u64;
+                if actual_bits != u64::from(pub_area.key_bits) {
+                    return Err(VerifyError::TpmPubAreaKeyBitsMismatch {
+                        declared: pub_area.key_bits,
+                        actual: actual_bits,
+                    });
+                }
                 let e = pub_area.rsa_exponent.to_be_bytes();
                 check.credential_key.matches_rsa(n, &e)
             }
@@ -429,12 +436,14 @@ fn alg_is_trialable(alg: i64) -> bool {
 ///
 /// When `scheme` is `Some`, only that scheme is tried. Otherwise every scheme
 /// compatible with the key type is tried and the signature must verify under one.
+/// Returns the [`HashKind`] that actually verified, which the caller binds to the
+/// `extraData` check.
 fn verify_aik_signature(
     sig: &[u8],
     message: &[u8],
     spki: &SubjectPublicKeyInfoOwned,
     scheme: Option<Scheme>,
-) -> Result<(), VerifyError> {
+) -> Result<HashKind, VerifyError> {
     const OID_EC_PUBLIC_KEY: der::asn1::ObjectIdentifier =
         der::asn1::ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
     const OID_RSA_ENCRYPTION: der::asn1::ObjectIdentifier =
@@ -452,18 +461,21 @@ fn verify_aik_signature(
         return verify_ecdsa(sig, message, spki_ref, scheme);
     }
     if oid == OID_ED25519 {
-        return verify_ed25519(sig, message, spki);
+        verify_ed25519(sig, message, spki)?;
+        // EdDSA has no pre-hash; TPM does not use it. Pin SHA-256 as the extraData
+        // digest so the check stays deterministic rather than accepting any hash.
+        return Ok(HashKind::Sha256);
     }
     Err(VerifyError::UnsupportedCertificateAlgorithm)
 }
 
-/// Verify an RSA PKCS#1 v1.5 AIK signature.
+/// Verify an RSA PKCS#1 v1.5 AIK signature, returning the digest that verified.
 fn verify_rsa(
     sig: &[u8],
     message: &[u8],
     spki: x509_cert::spki::SubjectPublicKeyInfoRef<'_>,
     scheme: Option<Scheme>,
-) -> Result<(), VerifyError> {
+) -> Result<HashKind, VerifyError> {
     use rsa::pkcs1v15::{Signature as RsaSignature, VerifyingKey as RsaVerifyingKey};
     use rsa::signature::Verifier as _;
 
@@ -491,8 +503,8 @@ fn verify_rsa(
         }
     };
 
-    let ok = match scheme {
-        Some(Scheme::Rsa(h)) => try_hash(h),
+    let verified = match scheme {
+        Some(Scheme::Rsa(h)) => try_hash(h).then_some(h),
         Some(Scheme::Ecdsa(_)) => {
             // An ECDSA algorithm cannot be valid for an RSA AIK.
             return Err(VerifyError::TpmAlgorithmUnsupported {
@@ -500,23 +512,19 @@ fn verify_rsa(
             });
         }
         None => [HashKind::Sha1, HashKind::Sha256]
-            .iter()
-            .any(|h| try_hash(*h)),
+            .into_iter()
+            .find(|h| try_hash(*h)),
     };
-    if ok {
-        Ok(())
-    } else {
-        Err(VerifyError::SignatureInvalid)
-    }
+    verified.ok_or(VerifyError::SignatureInvalid)
 }
 
-/// Verify an ECDSA (P-256) AIK signature.
+/// Verify an ECDSA (P-256) AIK signature (always SHA-256), returning its digest.
 fn verify_ecdsa(
     sig: &[u8],
     message: &[u8],
     spki: x509_cert::spki::SubjectPublicKeyInfoRef<'_>,
     scheme: Option<Scheme>,
-) -> Result<(), VerifyError> {
+) -> Result<HashKind, VerifyError> {
     use ecdsa::signature::hazmat::PrehashVerifier as _;
 
     let key = p256::ecdsa::VerifyingKey::try_from(spki).map_err(|_| {
@@ -541,7 +549,8 @@ fn verify_ecdsa(
         }
     }
     key.verify_prehash(&Sha256::digest(message), &sig)
-        .map_err(|_| VerifyError::SignatureInvalid)
+        .map_err(|_| VerifyError::SignatureInvalid)?;
+    Ok(HashKind::Sha256)
 }
 
 /// Verify an Ed25519 AIK signature (not used by Windows Hello TPMs; supported defensively).

@@ -11,10 +11,10 @@
 //! ## Test-only anchor injection
 //!
 //! Because no test can forge a real Microsoft-root certificate, the anchor
-//! fingerprint is threaded through as a parameter. The public entry points use
-//! [`MS_TPM_ROOT_2014_SHA256`]; [`crate::verify_attestation_with_anchor`] lets the
-//! test suite substitute a synthetic root's fingerprint. The production default is
-//! unchanged and documented on that function.
+//! fingerprint is threaded through as a parameter. The public entry point uses
+//! [`MS_TPM_ROOT_2014_SHA256`]; the feature-gated `verify_attestation_with_anchor`
+//! seam lets the test suite substitute a synthetic root's fingerprint. The production
+//! default is unchanged and documented on that function.
 
 use std::time::SystemTime;
 

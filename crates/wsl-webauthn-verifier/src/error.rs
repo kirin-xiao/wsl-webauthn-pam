@@ -126,6 +126,11 @@ pub enum VerifyError {
         bits: u64,
     },
 
+    /// The COSE RSA public exponent was not one of the accepted values (`3` or
+    /// `65537`), or was encoded non-minimally.
+    #[error("COSE RSA public exponent is not an accepted value (3 or 65537)")]
+    CoseKeyExponentNotAllowed,
+
     /// The COSE key type is not supported.
     #[error("unsupported COSE key type: {kty}")]
     UnsupportedKeyType {
@@ -290,6 +295,16 @@ pub enum VerifyError {
     /// The public key described by `pubArea` did not match the credential public key.
     #[error("TPM pubArea public key does not match the credential public key")]
     TpmPubAreaKeyMismatch,
+
+    /// The `keyBits` declared in `TPMS_RSA_PARMS` disagreed with the bit length of the
+    /// RSA modulus in `pubArea.unique`.
+    #[error("TPM pubArea declared keyBits {declared} disagrees with the modulus ({actual} bits)")]
+    TpmPubAreaKeyBitsMismatch {
+        /// The `keyBits` value declared in the `pubArea` parameters.
+        declared: u16,
+        /// The actual bit length of the `pubArea` modulus.
+        actual: u64,
+    },
 
     /// The `attStmt.alg` could not be mapped to a signature scheme and hash.
     #[error("unsupported TPM attestation algorithm: {alg}")]

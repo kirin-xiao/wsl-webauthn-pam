@@ -309,6 +309,81 @@ fn negative_tpm_format_without_tpm_fields() {
     );
 }
 
+#[test]
+fn negative_duplicate_fmt_rejected() {
+    // `{"fmt":"none",...,"fmt":"tpm"}` must not be accepted: a first-wins lookup would
+    // read `none` and could bypass the format's checks.
+    let f = positive();
+    let obj = duplicate_top_level_key(&f.attestation_object, "fmt");
+    let policy = AttestationPolicy::Strict;
+    let c = EnrollCheck {
+        attestation_object: &obj,
+        ..check(&f, &policy)
+    };
+    assert!(matches!(
+        verify_attestation_with_anchor(&c, &policy, &f.root_fingerprint),
+        Err(VerifyError::MalformedAttestationObject {
+            reason: "duplicate CBOR map key"
+        })
+    ));
+}
+
+#[test]
+fn negative_duplicate_auth_data_rejected() {
+    let f = positive();
+    let obj = duplicate_top_level_key(&f.attestation_object, "authData");
+    let policy = AttestationPolicy::Strict;
+    let c = EnrollCheck {
+        attestation_object: &obj,
+        ..check(&f, &policy)
+    };
+    assert!(matches!(
+        verify_attestation_with_anchor(&c, &policy, &f.root_fingerprint),
+        Err(VerifyError::MalformedAttestationObject {
+            reason: "duplicate CBOR map key"
+        })
+    ));
+}
+
+#[test]
+fn negative_none_duplicate_attstmt_cannot_bypass_empty_check() {
+    // A `none` object whose `attStmt` appears twice — first empty, then non-empty —
+    // must be rejected, not accepted because the first-wins lookup saw an empty map.
+    let f = none_attestation(vec![], AAGUID_ALLOWED);
+    let obj = duplicate_top_level_key_with(
+        &f.attestation_object,
+        "attStmt",
+        Value::Map(vec![(Value::from("alg"), Value::from(-7i64))]),
+    );
+    let policy = AttestationPolicy::AllowUnattested;
+    let c = EnrollCheck {
+        attestation_object: &obj,
+        ..check(&f, &policy)
+    };
+    assert!(matches!(
+        verify_attestation_with_anchor(&c, &policy, &f.root_fingerprint),
+        Err(VerifyError::MalformedAttestationObject {
+            reason: "duplicate CBOR map key"
+        })
+    ));
+}
+
+#[test]
+fn negative_unknown_attstmt_member_rejected() {
+    // A `packed` statement carrying a member outside its allow-set is not well-formed.
+    let f = positive();
+    let obj = add_att_stmt_member(&f.attestation_object, "unexpected", Value::from(true));
+    let policy = AttestationPolicy::Strict;
+    let c = EnrollCheck {
+        attestation_object: &obj,
+        ..check(&f, &policy)
+    };
+    assert_eq!(
+        verify_attestation_with_anchor(&c, &policy, &f.root_fingerprint),
+        Err(VerifyError::InvalidAttestationStatement)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // packed self-attestation
 // ---------------------------------------------------------------------------
@@ -975,6 +1050,49 @@ fn negative_tpm_pub_area_key_mismatch() {
 }
 
 #[test]
+fn negative_tpm_pub_area_key_bits_mismatch() {
+    // The `pubArea` RSA modulus has 2048 bits, but `TPMS_RSA_PARMS.keyBits` is patched
+    // to 1024. The declared keyBits disagreeing with `unique` must be rejected even
+    // though the modulus/exponent still match the credential key.
+    let credential = rs256();
+    let aik = rsa_aik();
+    let aik_test_key = rsa_test_key(&aik);
+    let chain = build_tpm_chain(&aik_test_key, &ChainOptions::default());
+    let e = tpm_enrollment(&credential, &aik, &chain, TpmSig::Rs1, tpm_alg::SHA1);
+
+    let mut pub_area = tpm_pub_area_bytes(&e.attestation_object);
+    // keyBits lives in TPMS_RSA_PARMS: after ty(2)+nameAlg(2)+attributes(4)+
+    // authPolicy(2+32)+symmetric(2)+scheme(2) => offset 46..48.
+    pub_area[46..48].copy_from_slice(&1024u16.to_be_bytes());
+    let name = tpm_name(&pub_area, tpm_alg::SHA1);
+    let extra = sha1_of(&signed_message(&e.auth_data, &e.client_data_json));
+    let cert_info = tpm_cert_info(&extra, &name);
+    let sig = TpmSig::Rs1.sign(&aik, &cert_info);
+    let obj = set_tpm_fields(
+        &e.attestation_object,
+        &pub_area,
+        &cert_info,
+        Some(&sig),
+        None,
+    );
+
+    let check = EnrollCheck {
+        expected_challenge: &e.challenge,
+        attestation_object: &obj,
+        client_data_json: &e.client_data_json,
+        reported_credential_id: &e.credential_id,
+        now: SystemTime::now(),
+    };
+    assert_eq!(
+        verify_attestation_with_anchor(&check, &AttestationPolicy::Strict, &e.root_fingerprint),
+        Err(VerifyError::TpmPubAreaKeyBitsMismatch {
+            declared: 1024,
+            actual: 2048,
+        })
+    );
+}
+
+#[test]
 fn negative_tpm_magic() {
     // Corrupt magic (bytes 0..4) and re-sign: expect TpmCertInfoMagic.
     let f = tpm_fixture(TpmSig::Rs1, tpm_alg::SHA1);
@@ -1063,7 +1181,8 @@ fn negative_tpm_eddsa_alg_rejected() {
 
 #[test]
 fn positive_tpm_unknown_alg_trial_verifies() {
-    // An unrecognised alg that still verifies under the AIK key (RS1 here) is accepted.
+    // An unrecognised alg that still verifies under the AIK key (RS1 here) is accepted;
+    // the digest that actually verified (SHA-1) is the one bound to extraData.
     let f = tpm_fixture(TpmSig::Rs1, tpm_alg::SHA1);
     let obj = set_tpm_fields(
         &f.attestation_object,
@@ -1079,6 +1198,28 @@ fn positive_tpm_unknown_alg_trial_verifies() {
     };
     verify_attestation_with_anchor(&check, &policy, &f.root_fingerprint)
         .expect("unknown alg that verifies is accepted");
+}
+
+#[test]
+fn negative_tpm_unknown_alg_extra_data_hash_binding() {
+    // With an unrecognised alg the AIK RS1 signature verifies under SHA-1, so extraData
+    // MUST be SHA-1(attToBeSigned). A certInfo that instead carries SHA-256 must be
+    // rejected, rather than accepted by trial-verifying every supported digest.
+    let f = tpm_fixture(TpmSig::Rs1, tpm_alg::SHA1);
+    let pub_area = tpm_pub_area_bytes(&f.attestation_object);
+    let name = tpm_name(&pub_area, f.name_alg);
+    let cert_info = tpm_cert_info(&sha256_of(&att_to_be_signed(&f)), &name);
+    let obj = f.rebuild(&pub_area, &cert_info);
+    let obj = set_tpm_fields(&obj, &[], &[], None, Some(("alg", 12345)));
+    let policy = AttestationPolicy::Strict;
+    let check = EnrollCheck {
+        attestation_object: &obj,
+        ..tpm_check(&f)
+    };
+    assert_eq!(
+        verify_attestation_with_anchor(&check, &policy, &f.root_fingerprint),
+        Err(VerifyError::TpmCertInfoExtraDataMismatch)
+    );
 }
 
 #[test]
@@ -1419,6 +1560,43 @@ fn encode_object(map: Vec<(ciborium::value::Value, ciborium::value::Value)>) -> 
     let mut out = Vec::new();
     ciborium::into_writer(&Value::Map(map), &mut out).expect("cbor");
     out
+}
+
+/// Append a second copy of an existing top-level key (CBOR duplicate-key probe).
+fn duplicate_top_level_key(obj: &[u8], key: &str) -> Vec<u8> {
+    let map = parse_object(obj);
+    let existing = map
+        .iter()
+        .find(|(k, _)| k.as_text() == Some(key))
+        .cloned()
+        .expect("key present");
+    duplicate_top_level_key_with(obj, key, existing.1)
+}
+
+/// Append a second copy of a top-level key with a chosen value.
+fn duplicate_top_level_key_with(obj: &[u8], key: &str, value: Value) -> Vec<u8> {
+    let mut map = parse_object(obj);
+    map.push((Value::from(key), value));
+    encode_object(map)
+}
+
+/// Append an extra member to the `attStmt` map.
+fn add_att_stmt_member(obj: &[u8], key: &str, value: Value) -> Vec<u8> {
+    let mut map = parse_object(obj);
+    for (k, v) in map.iter_mut() {
+        if k.as_text() == Some("attStmt")
+            && let Some(stmt) = v.as_map_mut()
+        {
+            stmt.push((Value::from(key), value.clone()));
+        }
+    }
+    encode_object(map)
+}
+
+/// SHA-256 helper for the TPM digest-binding test.
+fn sha256_of(bytes: &[u8]) -> Vec<u8> {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(bytes).to_vec()
 }
 
 fn rewrite_fmt(obj: &[u8], fmt: &str) -> Vec<u8> {
