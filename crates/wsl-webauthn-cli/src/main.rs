@@ -29,11 +29,13 @@
 //!
 //! # D3 double-enroll
 //!
-//! The first-ever enrollment for the pinned RP ID yields a `none`-attested credential
-//! from Windows (spike-confirmed). Under Strict the verifier rejects it; the CLI runs
-//! exactly one further ceremony with a **fresh** challenge and verifies that instead.
-//! The first ceremony's outcome is **discarded** and can never reach the record — the
-//! persisted `credential_id` always names the second credential. See
+//! Windows *can* return a `none`-attested credential on the first-ever enrollment for an
+//! RP ID. The spike observed this for one of two RP IDs (the other returned `tpm` even on
+//! its first enrollment), so it is a real but not guaranteed quirk. Under Strict the
+//! verifier rejects `none` because of the format; the CLI then runs exactly one further
+//! ceremony with a **fresh** challenge and verifies that instead — belt-and-braces for the
+//! quirk. The first ceremony's outcome is **discarded** and can never reach the record —
+//! the persisted `credential_id` always names the second credential. See
 //! [`enroll_with_double_enroll`].
 //!
 //! # Wave C installer (plan §10)
@@ -356,9 +358,13 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
 
 /// Parse one subcommand's flags.
 ///
-/// Every flag is checked against [`allowed_flags`] as it is recognised, so a flag the
-/// subcommand does not consume is rejected with a usage error (exit `2`) rather than
-/// being silently dropped or surfacing later as a confusing root-check failure.
+/// Every recognised flag is recorded as it is parsed and then checked against
+/// [`allowed_flags`] once the argument vector is exhausted, so a flag the subcommand does
+/// not consume is rejected with a usage error (exit `2`) rather than being silently
+/// dropped or surfacing later as a confusing root-check failure. Deferring the check
+/// keeps `-h`/`--help` reachable in any position: it is honoured even when a misplaced
+/// flag appears before it, exactly as before the table existed. Unknown arguments still
+/// fail immediately.
 fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
     let Some(allowed) = allowed_flags(name) else {
         return Err(format!("unknown subcommand {name:?}"));
@@ -382,6 +388,11 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
     let mut win_mnt: Option<PathBuf> = None;
     let mut module_dir: Option<PathBuf> = None;
     let mut artifact_dir: Option<PathBuf> = None;
+    // Recognised flags in the order seen; checked against the allow-list after the loop.
+    // Rejecting only after the whole argument vector is parsed keeps `-h`/`--help`
+    // reachable in any position (a later help wins over an earlier misplaced flag),
+    // matching the pre-table parser.
+    let mut seen: Vec<Flag> = Vec::new();
 
     let mut i = 0usize;
     while i < args.len() {
@@ -389,72 +400,77 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
         match arg {
             "-h" | "--help" => return Ok(Parsed::Help),
             "--replace" => {
-                reject(Flag::Replace)?;
+                seen.push(Flag::Replace);
                 replace = true;
             }
             "--allow-unattested" => {
-                reject(Flag::AllowUnattested)?;
+                seen.push(Flag::AllowUnattested);
                 allow_unattested = true;
             }
             "--yes" | "-y" => {
-                reject(Flag::Yes)?;
+                seen.push(Flag::Yes);
                 yes = true;
             }
             "--all" => {
-                reject(Flag::All)?;
+                seen.push(Flag::All);
                 all = true;
             }
             "--skip-enroll" => {
-                reject(Flag::SkipEnroll)?;
+                seen.push(Flag::SkipEnroll);
                 skip_enroll = true;
             }
             "--non-interactive" => {
-                reject(Flag::NonInteractive)?;
+                seen.push(Flag::NonInteractive);
                 non_interactive = true;
             }
             "--user" => {
-                reject(Flag::User)?;
+                seen.push(Flag::User);
                 user = Some(take_value(args, &mut i, "--user")?.to_string());
             }
             "--bridge" => {
-                reject(Flag::Bridge)?;
+                seen.push(Flag::Bridge);
                 bridge = Some(PathBuf::from(take_value(args, &mut i, "--bridge")?));
             }
             "--win-mnt" => {
-                reject(Flag::WinMnt)?;
+                seen.push(Flag::WinMnt);
                 win_mnt = Some(PathBuf::from(take_value(args, &mut i, "--win-mnt")?));
             }
             "--module-dir" => {
-                reject(Flag::ModuleDir)?;
+                seen.push(Flag::ModuleDir);
                 module_dir = Some(PathBuf::from(take_value(args, &mut i, "--module-dir")?));
             }
             "--artifact-dir" => {
-                reject(Flag::ArtifactDir)?;
+                seen.push(Flag::ArtifactDir);
                 artifact_dir = Some(PathBuf::from(take_value(args, &mut i, "--artifact-dir")?));
             }
             other if other.starts_with("--user=") => {
-                reject(Flag::User)?;
+                seen.push(Flag::User);
                 user = Some(other["--user=".len()..].to_string());
             }
             other if other.starts_with("--bridge=") => {
-                reject(Flag::Bridge)?;
+                seen.push(Flag::Bridge);
                 bridge = Some(PathBuf::from(&other["--bridge=".len()..]));
             }
             other if other.starts_with("--win-mnt=") => {
-                reject(Flag::WinMnt)?;
+                seen.push(Flag::WinMnt);
                 win_mnt = Some(PathBuf::from(&other["--win-mnt=".len()..]));
             }
             other if other.starts_with("--module-dir=") => {
-                reject(Flag::ModuleDir)?;
+                seen.push(Flag::ModuleDir);
                 module_dir = Some(PathBuf::from(&other["--module-dir=".len()..]));
             }
             other if other.starts_with("--artifact-dir=") => {
-                reject(Flag::ArtifactDir)?;
+                seen.push(Flag::ArtifactDir);
                 artifact_dir = Some(PathBuf::from(&other["--artifact-dir=".len()..]));
             }
             other => return Err(format!("unknown argument {other:?} for `{name}`")),
         }
         i += 1;
+    }
+
+    // Enforce the allow-list once the whole vector parsed, so `--help` anywhere still wins.
+    for &flag in &seen {
+        reject(flag)?;
     }
 
     // Only allowed flags can be set at this point; map them into the concrete command.
@@ -904,12 +920,14 @@ type VerifyCeremony =
 
 /// Run the enrollment ceremony, implementing the D3 double-enroll quirk.
 ///
-/// The **first-ever** enrollment for the pinned RP ID returns `fmt:"none"` from Windows
-/// (spike-confirmed). Under Strict that is rejected by the verifier because of the
-/// format; we then run exactly **one** second ceremony with a fresh challenge and verify
-/// again. If it is still unattested we fail with a clear `--allow-unattested` hint.
-/// Under `--allow-unattested` a single ceremony suffices. Exactly one retry is attempted
-/// on every path, so this cannot loop.
+/// Windows *can* return a `none`-attested credential (`fmt:"none"`, empty `attStmt`) on a
+/// first-ever enrollment for an RP ID. The spike observed it for one of two RP IDs; the
+/// other returned `tpm` even on its first enrollment, and a re-enrollment on either RP
+/// returned `tpm`. Under Strict the verifier rejects `none` because of the format; we then
+/// run exactly **one** second ceremony with a fresh challenge and verify again. If it is
+/// still unattested we fail with a clear `--allow-unattested` hint. Under
+/// `--allow-unattested` a single ceremony suffices. Exactly one retry is attempted on
+/// every path, so this cannot loop.
 ///
 /// **First-credential discard (critical).** The credential created by ceremony #1 exists
 /// on the Windows side and is *never* trusted. Its [`CeremonyOutcome`] is dropped the
@@ -936,6 +954,13 @@ fn enroll_with_double_enroll(
 ///
 /// The check is policy-independent: `--allow-unattested` never implies "may overwrite an
 /// existing record".
+///
+/// **Fail closed.** Only [`StoreError::NotFound`] means "no record": a valid existing
+/// record is refused with the `--replace` hint, and *any other* store error (corrupt
+/// record, bad ownership, symlink, I/O) is refused too. Treating such an error as "no
+/// record" would run a ceremony that `save_atomic` then rejects, orphaning the Windows
+/// credential exactly as in the `AlreadyExists` case. `--replace` bypasses the check and
+/// lets [`Store::save_atomic`] decide.
 fn enroll_checked(
     store: &Store,
     runner: &dyn EnrollCeremony,
@@ -944,11 +969,19 @@ fn enroll_checked(
     allow_unattested: bool,
     replace: bool,
 ) -> anyhow::Result<EnrollOutcome> {
-    if !replace && store.load(&target.name).is_ok() {
-        bail!(
-            "a credential for \"{}\" already exists; pass --replace to overwrite it",
-            target.name
-        );
+    if !replace {
+        match store.load(&target.name) {
+            Ok(_) => bail!(
+                "a credential for \"{}\" already exists; pass --replace to overwrite it",
+                target.name
+            ),
+            Err(StoreError::NotFound { .. }) => {}
+            Err(error) => bail!(
+                "refusing to enroll \"{}\": the credential store is not readable ({error}); \
+                 fix or remove the existing record, or pass --replace",
+                target.name
+            ),
+        }
     }
     enroll_with_double_enroll(runner, target, policy, allow_unattested)
 }
@@ -1856,6 +1889,22 @@ mod tests {
         assert!(parse(&args(&["uninstall", "--user", "a", "--all"])).is_err());
     }
 
+    /// A misplaced flag must not hide `--help`: help wins whenever it is reached, exactly
+    /// as it did before the allow-list table existed.
+    #[test]
+    fn parse_help_wins_over_an_earlier_misplaced_flag() {
+        assert_eq!(
+            parse(&args(&["status", "--skip-enroll", "--help"])).unwrap(),
+            Parsed::Help
+        );
+        assert_eq!(
+            parse(&args(&["uninstall", "--skip-enroll", "-h"])).unwrap(),
+            Parsed::Help
+        );
+        // An unknown argument still fails immediately, before help can be reached.
+        assert!(parse(&args(&["status", "--nope", "--help"])).is_err());
+    }
+
     /// The allow-list contract: for *every* subcommand and *every* recognised flag, the
     /// flag is accepted iff the subcommand consumes it. The expected table is written
     /// out independently here so a drift in production's [`allowed_flags`] fails.
@@ -1940,12 +1989,17 @@ mod tests {
             }
         }
 
-        // The specific crossings cited by the audit.
+        // The specific crossings cited by the audit, in both value forms: rejection must
+        // also fire for `--flag=value`, not just `--flag value`.
         for bad in [
             vec!["enroll", "--module-dir", "x"],
+            vec!["enroll", "--module-dir=x"],
             vec!["unregister", "--skip-enroll"],
             vec!["status", "--module-dir", "x"],
+            vec!["status", "--module-dir=x"],
+            vec!["status", "--bridge=/x"],
             vec!["probe", "--artifact-dir", "x"],
+            vec!["probe", "--artifact-dir=x"],
             vec!["verify", "--non-interactive"],
         ] {
             assert!(parse(&args(&bad)).is_err(), "{bad:?} must be rejected");
@@ -2353,6 +2407,38 @@ mod tests {
                 "no Windows Hello ceremony when the record exists and --replace is absent"
             );
         }
+    }
+
+    /// A store error other than `NotFound` must fail closed: treating a corrupt record as
+    /// "no record" would run a ceremony that `save_atomic` then rejects, orphaning the
+    /// Windows credential just like the plain `AlreadyExists` case.
+    #[test]
+    fn enroll_fails_closed_on_an_unreadable_store() {
+        let (_dir, store) = tempdir_store();
+        store
+            .save_atomic(&sample_record("alice", 1000), false)
+            .unwrap();
+        // Keep the 0600/owner bits `save_atomic` set, but invalidate the contents.
+        std::fs::write(store.credentials_dir().join("alice.json"), b"not json").unwrap();
+        let ceremony = ScriptedCeremony::none_attestation();
+        let error = enroll_checked(
+            &store,
+            &ceremony,
+            &test_target(),
+            &AttestationPolicy::Strict,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("not readable"),
+            "the refusal must explain the store problem: {error}"
+        );
+        assert_eq!(
+            ceremony.calls.get(),
+            0,
+            "no Windows Hello ceremony when the store cannot be read"
+        );
     }
 
     /// `--replace` re-runs the ceremony (and the atomic write is still the second guard).
