@@ -127,6 +127,20 @@ pub enum RunnerError {
         /// Whether a `taskkill.exe` escalation was attempted.
         taskkill_attempted: bool,
     },
+    /// A bare interop helper name could not be resolved to an absolute path.
+    ///
+    /// Bare names are not portable under `sudo`'s `secure_path`, which hides the Windows
+    /// mount; the kernel's binfmt handoff needs an absolute path.
+    #[error(
+        "cannot resolve Windows interop helper {program:?}: not found under {win_mnt} or on \
+PATH (when running under sudo, secure_path can hide the Windows mount; use the absolute path)"
+    )]
+    InteropHelperMissing {
+        /// The bare helper name that could not be resolved.
+        program: String,
+        /// The Windows mount root it was searched under.
+        win_mnt: PathBuf,
+    },
 }
 
 /// A decoded, protocol-valid response from the bridge.
@@ -750,7 +764,10 @@ impl Runner {
     ///
     /// All failures are ignored: this is a backstop, not a security control.
     fn taskkill(&self, pid: u32) {
-        let mut command = Command::new(&self.taskkill_program);
+        let Some(resolved) = resolve_interop_program(&self.taskkill_program, &self.win_mnt) else {
+            return;
+        };
+        let mut command = Command::new(resolved);
         command
             .arg("/F")
             .arg("/PID")
@@ -966,6 +983,51 @@ pub fn decode_probe(response: &RunnerResponse) -> Option<(bool, u32)> {
     }
 }
 
+/// Candidate absolute paths for a bare interop helper name, in priority order.
+///
+/// An already-absolute `program` is returned as the sole candidate. Otherwise the
+/// `win_mnt`-derived `Windows/System32` and `Windows` directories are tried first (so a
+/// custom mount root works), then the conventional `/mnt/c/WINDOWS` locations, then every
+/// directory on `path_env`.
+fn interop_candidates(
+    program: &std::ffi::OsStr,
+    win_mnt: &Path,
+    path_env: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
+    if Path::new(program).is_absolute() {
+        return vec![PathBuf::from(program)];
+    }
+    let mut candidates = vec![
+        win_mnt.join("Windows").join("System32").join(program),
+        win_mnt.join("Windows").join(program),
+        Path::new("/mnt/c/WINDOWS/system32").join(program),
+        Path::new("/mnt/c/WINDOWS").join(program),
+    ];
+    if let Some(path) = path_env {
+        candidates.extend(std::env::split_paths(path).map(|dir| dir.join(program)));
+    }
+    candidates
+}
+
+/// Resolve a bare Windows interop helper name (`cmd.exe`, `whoami.exe`, `taskkill.exe`)
+/// to an absolute Linux path under `win_mnt`, the conventional `/mnt/c` locations, or
+/// `$PATH`.
+///
+/// A bare name is not portable under `sudo`'s `secure_path` (which omits the Windows
+/// mount): the kernel resolves the name against `PATH` at `execve` and returns `ENOENT`
+/// before the binfmt handler can hand it to WSL. Passing an absolute path sidesteps that.
+///
+/// Returns the first candidate that exists as a file, or `None` if none do.
+pub fn resolve_interop_program(
+    program: impl AsRef<std::ffi::OsStr>,
+    win_mnt: &Path,
+) -> Option<PathBuf> {
+    let path_env = std::env::var_os("PATH");
+    interop_candidates(program.as_ref(), win_mnt, path_env.as_deref())
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+}
+
 /// Convenience: run `whoami.exe`-style helper commands with a deadline.
 ///
 /// Used by the CLI to capture the Windows identity (§9); exposed here so the interop
@@ -983,7 +1045,13 @@ impl InteropCommand {
         win_mnt: &Path,
         deadline: Duration,
     ) -> Result<Output, RunnerError> {
-        let mut command = Command::new(program);
+        let resolved = resolve_interop_program(program, win_mnt).ok_or_else(|| {
+            RunnerError::InteropHelperMissing {
+                program: program.to_string(),
+                win_mnt: win_mnt.to_path_buf(),
+            }
+        })?;
+        let mut command = Command::new(&resolved);
         command
             .args(args)
             .current_dir(win_mnt)
@@ -991,7 +1059,7 @@ impl InteropCommand {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn().map_err(|source| RunnerError::Spawn {
-            path: PathBuf::from(program),
+            path: resolved,
             source,
         })?;
         let stdout = child.stdout.take().expect("stdout was piped");
@@ -1066,5 +1134,67 @@ impl InteropCommand {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    /// A bare helper name under a stripped `PATH` (no Windows dirs) must resolve to the
+    /// `win_mnt`-derived `Windows/System32` candidate, not fall through to `ENOENT`.
+    #[test]
+    fn resolve_interop_program_prefers_win_mnt_system32() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let system32 = root.path().join("Windows").join("System32");
+        std::fs::create_dir_all(&system32).expect("mkdir System32");
+        std::fs::write(system32.join("whoami.exe"), b"").expect("write fake helper");
+
+        let candidates = interop_candidates(
+            OsStr::new("whoami.exe"),
+            root.path(),
+            Some(OsStr::new("/usr/bin:/bin")),
+        );
+        let first_existing = candidates
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+            .expect("a candidate must exist");
+        assert_eq!(first_existing, system32.join("whoami.exe"));
+    }
+
+    /// When no candidate exists, resolution fails rather than returning a bare name.
+    #[test]
+    fn resolve_interop_program_missing_returns_none() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        assert!(
+            resolve_interop_program("definitely-not-a-helper.exe", root.path()).is_none(),
+            "an unresolvable helper must return None"
+        );
+    }
+
+    /// An absolute path short-circuits the search (used by the test override and by
+    /// callers that already pass a Linux path such as `/bin/echo`).
+    #[test]
+    fn interop_candidates_absolute_is_returned_as_is() {
+        let candidates = interop_candidates(OsStr::new("/bin/echo"), Path::new("/mnt/c"), None);
+        assert_eq!(candidates, vec![PathBuf::from("/bin/echo")]);
+    }
+
+    /// The clear error surfaces instead of a raw `ENOENT` spawn failure.
+    #[test]
+    fn interop_command_missing_helper_reports_clear_error() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let err = InteropCommand::run(
+            "definitely-not-a-helper.exe",
+            &[],
+            root.path(),
+            Duration::from_secs(1),
+        )
+        .expect_err("an unresolvable helper must fail");
+        assert!(
+            matches!(err, RunnerError::InteropHelperMissing { .. }),
+            "{err:?}"
+        );
     }
 }
