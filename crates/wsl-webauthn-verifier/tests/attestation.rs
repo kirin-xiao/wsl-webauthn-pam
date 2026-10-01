@@ -1140,6 +1140,21 @@ fn negative_tpm_aik_key_usage_forbids_signature() {
 }
 
 #[test]
+fn positive_tpm_aik_no_key_usage_extension() {
+    // RFC 5280: an absent KeyUsage imposes no restriction. The AIK leaf still has
+    // the required AIK EKU, so it must verify.
+    let f = tpm_fixture_with_opts(
+        TpmSig::Rs1,
+        tpm_alg::SHA1,
+        ChainOptions {
+            omit_aik_key_usage: true,
+            ..Default::default()
+        },
+    );
+    verify_tpm(&f, AttestationPolicy::Strict).expect("absent KeyUsage is unconstrained");
+}
+
+#[test]
 fn negative_tpm_missing_x5c() {
     let f = tpm_fixture(TpmSig::Rs1, tpm_alg::SHA1);
     let obj = remove_field(&f.attestation_object, "x5c");

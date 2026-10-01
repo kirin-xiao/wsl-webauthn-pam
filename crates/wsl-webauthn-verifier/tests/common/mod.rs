@@ -316,6 +316,8 @@ pub struct ChainOptions {
     /// Replace the `tpm` leaf's KeyUsage with one that omits `digitalSignature`, so
     /// the "KeyUsage forbids signatures" rejection can be exercised.
     pub aik_key_usage_forbids_signature: bool,
+    /// Remove the `tpm` leaf's KeyUsage extension entirely (absent is allowed).
+    pub omit_aik_key_usage: bool,
     pub leaf_validity: Validity,
     pub intermediate_validity: Validity,
     pub root_validity: Validity,
@@ -334,6 +336,7 @@ impl Default for ChainOptions {
             omit_root: false,
             include_aik_eku: true,
             aik_key_usage_forbids_signature: false,
+            omit_aik_key_usage: false,
             leaf_validity: Validity::from_now(Duration::from_secs(3600)).unwrap(),
             intermediate_validity: Validity::from_now(Duration::from_secs(3600)).unwrap(),
             root_validity: Validity::from_now(Duration::from_secs(3600)).unwrap(),
@@ -510,18 +513,16 @@ fn build_cert(
     )
 }
 
-/// Replace a certificate's KeyUsage extension with one carrying exactly `flags`,
-/// re-signing the TBS with `issuer` so the certificate stays a valid chain link.
+/// Set (or, with `None`, remove) a certificate's KeyUsage extension, re-signing the
+/// TBS with `issuer` so the certificate stays a valid chain link.
 ///
 /// `Profile::Leaf` hard-codes `digitalSignature | nonRepudiation`; this is the only
-/// way to synthesize a leaf whose KeyUsage forbids signing, which the verifier's
-/// `tpm` profile must reject.
-fn replace_key_usage(cert: Certificate, issuer: &Signer, flags: KeyUsages) -> Certificate {
+/// way to synthesize a leaf whose KeyUsage forbids signing (which the verifier's
+/// `tpm` profile must reject) or one that omits KeyUsage entirely (which it must
+/// accept, per RFC 5280).
+fn set_key_usage(cert: Certificate, issuer: &Signer, usage: Option<KeyUsages>) -> Certificate {
     use der::Encode as _;
 
-    let replacement = KeyUsage(flags.into())
-        .to_extension(&cert.tbs_certificate.subject, &[])
-        .expect("keyusage extension");
     let mut tbs = cert.tbs_certificate.clone();
     let extensions = tbs
         .extensions
@@ -531,7 +532,16 @@ fn replace_key_usage(cert: Certificate, issuer: &Signer, flags: KeyUsages) -> Ce
         .iter()
         .position(|e| e.extn_id == <KeyUsage as const_oid::AssociatedOid>::OID)
         .expect("leaf carries a KeyUsage extension");
-    extensions[index] = replacement;
+    match usage {
+        Some(flags) => {
+            extensions[index] = KeyUsage(flags.into())
+                .to_extension(&cert.tbs_certificate.subject, &[])
+                .expect("keyusage extension");
+        }
+        None => {
+            extensions.remove(index);
+        }
+    }
 
     let tbs_der = tbs.to_der().expect("tbs der");
     let signature =
@@ -610,10 +620,16 @@ pub fn build_tpm_chain(aik: &TestKey, opts: &ChainOptions) -> TestChain {
         None,
         aik_eku,
     );
-    // Profile::Leaf always emits a KeyUsage containing `digitalSignature`; for the
-    // one negative test that needs a forbidding KeyUsage, replace it (and re-sign).
-    let leaf = if opts.aik_key_usage_forbids_signature {
-        replace_key_usage(leaf, &intermediate_key.signer, KeyUsages::KeyAgreement)
+    // Profile::Leaf always emits a KeyUsage containing `digitalSignature`; the
+    // KeyUsage tests replace it with one that forbids signing, or remove it.
+    let leaf = if opts.omit_aik_key_usage {
+        set_key_usage(leaf, &intermediate_key.signer, None)
+    } else if opts.aik_key_usage_forbids_signature {
+        set_key_usage(
+            leaf,
+            &intermediate_key.signer,
+            Some(KeyUsages::KeyAgreement),
+        )
     } else {
         leaf
     };
