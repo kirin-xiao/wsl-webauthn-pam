@@ -430,6 +430,10 @@ Verify downloads against `SHA256SUMS`. (`make release` assembles the same
 contents under `build/` and additionally writes a `SHA256SUMS` file next to the
 tarball.)
 
+Releases produced by CI also carry a signed build-provenance attestation (the
+release binaries are stripped with thin LTO). Verify a download with
+`gh attestation verify <file> -R kirin-xiao/wsl-webauthn-pam`.
+
 ---
 
 ## Troubleshooting

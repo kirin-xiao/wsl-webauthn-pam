@@ -1,0 +1,17 @@
+# Line-ending policy (L15-7).
+#
+# The project explicitly supports checking the repo out on Windows (the bridge
+# is built with a native cargo.exe). A Windows `git clone` defaults to
+# `core.autocrlf=true`, which would rewrite `install.sh` and `pam-config` to
+# CRLF and break them: the installer's shebang and the PAM profile parser both
+# expect LF. Force LF for tracked text files regardless of the local setting.
+#
+# Rules are evaluated in order, last match wins, so the explicit `pam-config`
+# rule below re-asserts LF against `* text=auto` and binary files are opted out.
+* text=auto eol=lf
+*.sh text eol=lf
+pam-config text eol=lf
+
+# Binaries must never be line-ending-normalized.
+*.exe binary
+*.so binary
