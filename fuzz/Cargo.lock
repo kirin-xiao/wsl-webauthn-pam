@@ -847,6 +847,7 @@ dependencies = [
  "ciborium",
  "libfuzzer-sys",
  "p256",
+ "sha2",
  "wsl-webauthn-protocol",
  "wsl-webauthn-verifier",
 ]
