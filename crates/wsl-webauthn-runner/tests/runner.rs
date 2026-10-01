@@ -1,0 +1,389 @@
+//! Runner integration tests against the `fake-bridge` test double (plan §7).
+//!
+//! The fake bridge is a normal binary built from this package; its path is provided by
+//! Cargo as `CARGO_BIN_EXE_fake-bridge`. Environment-global concerns (the WSL interop
+//! binfmt entry does not exist on GitHub's non-WSL runners) are handled by pointing the
+//! runner's injectable interop check at a temp file, or by disabling it.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use tempfile::TempDir;
+
+use wsl_webauthn_protocol::{BridgeError, MAX_RESPONSE_BYTES};
+use wsl_webauthn_runner::{
+    AssertParams, EnrollParams, Runner, RunnerError, RunnerResponse, decode_probe,
+};
+
+const FAKE: &str = env!("CARGO_BIN_EXE_fake-bridge");
+
+/// A directory to use as the child's `current_dir` (the Linux-FS cwd trap only affects
+/// real interop; any directory works for the fake bridge).
+fn cwd_dir() -> TempDir {
+    TempDir::new().expect("tempdir")
+}
+
+/// A runner that skips the environment-global interop pre-flight.
+///
+/// The taskkill escalation is pointed at `/bin/true` so tests never invoke a real
+/// `taskkill.exe` (which exists on WSL hosts and could otherwise be aimed at an
+/// unrelated Windows PID).
+fn build_runner(dir: &Path, args: &[&str]) -> Runner {
+    Runner::without_interop_check(FAKE, dir)
+        .taskkill_program("/bin/true")
+        .args(args.to_vec())
+}
+
+fn enroll_params() -> EnrollParams {
+    EnrollParams::new(
+        "eyJ0eXBlIjoid2VibGF1dGhuLmNyZWF0ZSJ9",
+        "YWxpY2U",
+        "alice",
+        "alice",
+    )
+}
+
+fn assert_params() -> AssertParams {
+    AssertParams::new("eyJ0eXBlIjoid2ViYXV0aG4uZ2V0In0", vec!["YWJjZGVm".into()])
+}
+
+/// Write an `enabled` binfmt file and return its path.
+fn enabled_interop_file(dir: &Path) -> PathBuf {
+    let path = dir.join("WSLInterop");
+    fs::write(&path, "enabled\ninterpreter /init\nflags: P\n").unwrap();
+    path
+}
+
+// ---------------------------------------------------------------------------
+// Happy paths
+// ---------------------------------------------------------------------------
+
+#[test]
+fn probe_happy_path() {
+    let dir = cwd_dir();
+    let r = build_runner(dir.path(), &["ok"]);
+    let resp = r.probe(Duration::from_secs(5)).expect("probe");
+    match resp {
+        RunnerResponse::Probe {
+            uv_platform_available,
+            api_version,
+        } => {
+            assert!(uv_platform_available);
+            assert_eq!(api_version, 7);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn enroll_happy_path() {
+    let dir = cwd_dir();
+    let r = build_runner(dir.path(), &["ok", "payload=64"]);
+    let resp = r
+        .enroll(enroll_params(), Duration::from_secs(5))
+        .expect("enroll");
+    match &resp {
+        RunnerResponse::Enroll {
+            format,
+            attestation_object,
+            credential_id,
+        } => {
+            assert_eq!(format, "packed");
+            assert!(!attestation_object.is_empty());
+            assert_eq!(credential_id, "YWJjZGVm");
+            assert_eq!(
+                resp.decode_attestation_object().unwrap().len(),
+                64,
+                "payload filler length"
+            );
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn assert_happy_path_with_echo() {
+    let dir = cwd_dir();
+    let r = build_runner(dir.path(), &["ok", "echo=1"]);
+    let resp = r
+        .authenticate(assert_params(), Duration::from_secs(5))
+        .expect("assert");
+    match &resp {
+        RunnerResponse::Assert {
+            client_data_json_echo,
+            ..
+        } => {
+            assert_eq!(
+                client_data_json_echo.as_deref(),
+                Some("eyJ0eXBlIjoid2ViYXV0aG4uZ2V0In0")
+            );
+            let echo = resp.decode_client_data_json_echo().unwrap().unwrap();
+            assert_eq!(echo, b"{\"type\":\"webauthn.get\"}");
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn assert_without_echo_returns_none() {
+    let dir = cwd_dir();
+    let r = build_runner(dir.path(), &["ok"]);
+    let resp = r
+        .authenticate(assert_params(), Duration::from_secs(5))
+        .expect("assert");
+    match &resp {
+        RunnerResponse::Assert {
+            client_data_json_echo,
+            ..
+        } => assert!(client_data_json_echo.is_none()),
+        other => panic!("unexpected: {other:?}"),
+    }
+    assert!(resp.decode_client_data_json_echo().unwrap().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Ceremony errors pass through as RunnerResponse::Error (never RunnerError)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_bridge_error_passes_through() {
+    for (wire, expected) in [
+        ("not_available", BridgeError::NotAvailable),
+        ("not_supported", BridgeError::NotSupported),
+        ("user_cancelled", BridgeError::UserCancelled),
+        ("timeout", BridgeError::Timeout),
+        ("busy", BridgeError::Busy),
+        ("invalid_parameter", BridgeError::InvalidParameter),
+        ("internal", BridgeError::Internal),
+    ] {
+        let dir = cwd_dir();
+        let r = build_runner(dir.path(), &["ok", &format!("err={wire}")]);
+        let resp = r.probe(Duration::from_secs(5)).expect("transport ok");
+        assert_eq!(
+            resp,
+            RunnerResponse::Error(expected),
+            "taxonomy {wire} must round-trip"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Timeout + kill
+// ---------------------------------------------------------------------------
+
+#[test]
+fn timeout_fires_and_child_is_reaped() {
+    let dir = cwd_dir();
+    // Sleep far past the deadline; no response is ever written.
+    let r = build_runner(dir.path(), &["ok", "sleep=5000"]);
+    let start = Instant::now();
+    let err = r
+        .probe(Duration::from_millis(150))
+        .expect_err("must time out");
+    let elapsed = start.elapsed();
+    match err {
+        RunnerError::Timeout {
+            deadline_ms,
+            windows_pid,
+            taskkill_attempted,
+        } => {
+            assert_eq!(deadline_ms, 150);
+            assert!(windows_pid.is_none(), "fake emitted no PID line");
+            assert!(!taskkill_attempted);
+        }
+        other => panic!("expected Timeout, got {other:?}"),
+    }
+    // Must not wait the full 5 s sleep; allow generous slack for CI.
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "timeout should fire promptly, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn timeout_parses_pid_line_and_attempts_taskkill() {
+    let dir = cwd_dir();
+    let r = build_runner(dir.path(), &["ok", "sleep=5000", "pidline=1", "noisy=1"]);
+    let err = r
+        .probe(Duration::from_millis(120))
+        .expect_err("must time out");
+    match err {
+        RunnerError::Timeout {
+            windows_pid,
+            taskkill_attempted,
+            ..
+        } => {
+            assert!(windows_pid.is_some(), "PID line should be parsed");
+            // The escalation program is `/bin/true` in tests, so this succeeds quickly;
+            // the flag records that a PID was seen and cancellation was attempted.
+            assert!(taskkill_attempted);
+        }
+        other => panic!("expected Timeout, got {other:?}"),
+    }
+}
+
+#[test]
+fn noisy_stderr_does_not_break_pid_parsing() {
+    let dir = cwd_dir();
+    let r = build_runner(dir.path(), &["ok", "sleep=5000", "pidline=1", "noisy=1"]);
+    match r.probe(Duration::from_millis(100)).unwrap_err() {
+        RunnerError::Timeout { windows_pid, .. } => {
+            assert!(windows_pid.unwrap() > 0);
+        }
+        other => panic!("expected Timeout, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transport failures
+// ---------------------------------------------------------------------------
+
+#[test]
+fn missing_bridge_is_bridge_missing() {
+    let dir = cwd_dir();
+    let r = Runner::without_interop_check(dir.path().join("nope.exe"), dir.path());
+    assert!(matches!(
+        r.probe(Duration::from_secs(1)),
+        Err(RunnerError::BridgeMissing { .. })
+    ));
+}
+
+#[test]
+fn nonzero_exit_is_bridge_failed() {
+    let dir = cwd_dir();
+    let r = build_runner(dir.path(), &["exit=3"]);
+    match r.probe(Duration::from_secs(5)).unwrap_err() {
+        RunnerError::BridgeFailed { code } => assert_eq!(code, Some(3)),
+        other => panic!("expected BridgeFailed, got {other:?}"),
+    }
+}
+
+#[test]
+fn garbage_output_is_transport() {
+    let dir = cwd_dir();
+    let r = build_runner(dir.path(), &["garbage=1"]);
+    match r.probe(Duration::from_secs(5)).unwrap_err() {
+        RunnerError::Transport { message } => {
+            assert!(
+                message.contains("frame") || message.contains("JSON"),
+                "{message}"
+            );
+        }
+        other => panic!("expected Transport, got {other:?}"),
+    }
+}
+
+#[test]
+fn truncated_frame_is_transport() {
+    let dir = cwd_dir();
+    let r = build_runner(dir.path(), &["badframe=1"]);
+    assert!(matches!(
+        r.probe(Duration::from_secs(5)),
+        Err(RunnerError::Transport { .. })
+    ));
+}
+
+#[test]
+fn empty_output_is_transport() {
+    let dir = cwd_dir();
+    let r = build_runner(dir.path(), &["empty=1"]);
+    assert!(matches!(
+        r.probe(Duration::from_secs(5)),
+        Err(RunnerError::Transport { .. })
+    ));
+}
+
+#[test]
+fn oversized_response_is_transport() {
+    let dir = cwd_dir();
+    let r = build_runner(dir.path(), &["oversize=1"]);
+    match r.probe(Duration::from_secs(5)).unwrap_err() {
+        RunnerError::Transport { message } => assert!(message.contains("exceeds"), "{message}"),
+        other => panic!("expected Transport, got {other:?}"),
+    }
+}
+
+#[test]
+fn oversized_declared_is_transport() {
+    let dir = cwd_dir();
+    let r = build_runner(dir.path(), &["oversize_declared=1"]);
+    assert!(matches!(
+        r.probe(Duration::from_secs(5)),
+        Err(RunnerError::Transport { .. })
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Interop pre-flight
+// ---------------------------------------------------------------------------
+
+#[test]
+fn interop_missing_file_is_unavailable() {
+    let dir = cwd_dir();
+    let r = Runner::with_interop_path(FAKE, dir.path(), dir.path().join("does-not-exist"));
+    match r.probe(Duration::from_secs(1)).unwrap_err() {
+        RunnerError::InteropUnavailable { path, .. } => {
+            assert!(path.ends_with("does-not-exist"));
+        }
+        other => panic!("expected InteropUnavailable, got {other:?}"),
+    }
+}
+
+#[test]
+fn interop_not_enabled_is_unavailable() {
+    let dir = cwd_dir();
+    let path = dir.path().join("WSLInterop");
+    fs::write(&path, "interpreter /init\n").unwrap();
+    let r = Runner::with_interop_path(FAKE, dir.path(), &path);
+    match r.probe(Duration::from_secs(1)).unwrap_err() {
+        RunnerError::InteropUnavailable { detail, .. } => assert!(detail.contains("enabled")),
+        other => panic!("expected InteropUnavailable, got {other:?}"),
+    }
+}
+
+#[test]
+fn interop_enabled_file_allows_probe() {
+    let dir = cwd_dir();
+    let path = enabled_interop_file(dir.path());
+    let r = Runner::with_interop_path(FAKE, dir.path(), &path).args(vec!["ok"]);
+    assert!(r.probe(Duration::from_secs(5)).is_ok());
+}
+
+#[test]
+fn interop_check_disabled_skips_file() {
+    let dir = cwd_dir();
+    let r = Runner::without_interop_check(FAKE, dir.path()).args(vec!["ok"]);
+    assert!(r.probe(Duration::from_secs(5)).is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// Pure helpers
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parse_pid_helper() {
+    assert_eq!(
+        wsl_webauthn_runner::parse_pid(b"PID 1234\nextra\n"),
+        Some(1234)
+    );
+    assert_eq!(wsl_webauthn_runner::parse_pid(b"not a pid line\n"), None);
+    assert_eq!(wsl_webauthn_runner::parse_pid(b""), None);
+    assert_eq!(wsl_webauthn_runner::parse_pid(b"PID abc\n"), None);
+}
+
+#[test]
+fn decode_probe_helper() {
+    let ok = RunnerResponse::Probe {
+        uv_platform_available: true,
+        api_version: 7,
+    };
+    assert_eq!(decode_probe(&ok), Some((true, 7)));
+    let err = RunnerResponse::Error(BridgeError::Busy);
+    assert_eq!(decode_probe(&err), None);
+}
+
+#[test]
+fn response_cap_constant_matches_protocol() {
+    assert_eq!(MAX_RESPONSE_BYTES, 64 * 1024);
+}

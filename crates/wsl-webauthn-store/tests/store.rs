@@ -1,0 +1,654 @@
+//! Store integration tests (plan §6).
+//!
+//! These run as whatever uid the test process has: when run as root (CI) files are
+//! root-owned and the production `Store::system` expectations hold; when run as a normal
+//! user the store is constructed with `Store::with_owner(base, current_euid())`. This is
+//! the parameterization the plan requires so the same suite passes in both environments.
+
+use std::fs;
+use std::os::unix::fs::{PermissionsExt, symlink};
+use std::path::{Path, PathBuf};
+
+use tempfile::TempDir;
+
+use wsl_webauthn_store::{
+    AttestationRecord, CONFIG_MODE, CredentialRecord, DIR_MODE, FILE_MODE, MODE_STRICT, Store,
+    StoreError, WindowsIdentity, current_euid, validate_username,
+};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn store_for(base: &Path) -> Store {
+    Store::with_owner(base, current_euid())
+}
+
+fn fresh() -> (TempDir, Store) {
+    let dir = TempDir::new().expect("tempdir");
+    // tempfile creates base 0700; make it explicit and deterministic.
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let store = store_for(dir.path());
+    (dir, store)
+}
+
+fn sample_record(user: &str) -> CredentialRecord {
+    CredentialRecord {
+        schema_version: 1,
+        rp_id: "io.github.kirin-xiao.wsl-webauthn-pam".into(),
+        origin: "io.github.kirin-xiao.wsl-webauthn-pam".into(),
+        linux_user: user.into(),
+        linux_uid: 1000,
+        credential_id: "Zm9vYmFy".into(),
+        cose_public_key: "AAECAw".into(),
+        alg: -7,
+        aaguid: "08987058-cadc-4b81-b6e1-30de50dcbe96".into(),
+        attestation: AttestationRecord {
+            format: "packed".into(),
+            mode: MODE_STRICT.into(),
+            verified: true,
+            leaf_sha256: Some("ab".repeat(32)),
+        },
+        windows_identity: Some(WindowsIdentity {
+            account: "HOST\\alice".into(),
+            sid: "S-1-5-21-1-2-3".into(),
+        }),
+        enrolled_at: "2026-10-01T12:34:56Z".into(),
+        sign_count: 0,
+        bridge_path: "/mnt/c/Users/alice/WSLWebAuthnBridge.exe".into(),
+        bridge_sha256: "cd".repeat(32),
+    }
+}
+
+/// Write a private file (0600, current owner) with raw bytes.
+fn write_private(path: &Path, bytes: &[u8]) {
+    fs::write(path, bytes).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn write_record_json(path: &Path, record: &CredentialRecord) {
+    let bytes = serde_json::to_vec(record).unwrap();
+    write_private(path, &bytes);
+}
+
+fn no_temp_files(dir: &Path) -> bool {
+    fs::read_dir(dir).unwrap().all(|e| {
+        !e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".tmp-")
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Username validation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn validate_username_accepts_normal_names() {
+    for ok in ["alice", "bob_2", "_svc", "a", "A.B-c_d", &"a".repeat(32)] {
+        assert!(validate_username(ok).is_ok(), "expected {ok:?} to be valid");
+    }
+}
+
+#[test]
+fn validate_username_rejects_bad_names() {
+    for bad in [
+        "",
+        "../x",
+        "a/b",
+        "a\\b",
+        "9lead",
+        ".hidden",
+        "-dash",
+        "a b",
+        "a\0b",
+        "über",
+        &"a".repeat(33),
+        "a..b/../c",
+    ] {
+        assert!(
+            matches!(validate_username(bad), Err(StoreError::InvalidUsername)),
+            "expected {bad:?} to be rejected"
+        );
+    }
+}
+
+#[test]
+fn load_rejects_invalid_username_before_touching_fs() {
+    let (_d, store) = fresh();
+    for bad in ["../x", "a/b", "", &"a".repeat(33), "9lead"] {
+        assert!(matches!(store.load(bad), Err(StoreError::InvalidUsername)));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Round-trip
+// ---------------------------------------------------------------------------
+
+#[test]
+fn save_load_list_remove_round_trip() {
+    let (_d, store) = fresh();
+    let rec = sample_record("alice");
+
+    store.save_atomic(&rec, false).expect("save");
+    assert!(no_temp_files(&store.credentials_dir()));
+
+    let loaded = store.load("alice").expect("load");
+    assert_eq!(loaded, rec);
+
+    assert_eq!(store.list().unwrap(), vec!["alice".to_string()]);
+
+    // A second user, to exercise sorting.
+    let mut bob = sample_record("bob");
+    bob.linux_user = "bob".into();
+    store.save_atomic(&bob, false).unwrap();
+    assert_eq!(
+        store.list().unwrap(),
+        vec!["alice".to_string(), "bob".to_string()]
+    );
+
+    assert!(store.remove("alice").unwrap());
+    assert!(!store.remove("alice").unwrap());
+    assert!(store.load("alice").is_err());
+    assert_eq!(store.list().unwrap(), vec!["bob".to_string()]);
+}
+
+#[test]
+fn load_missing_record_is_not_found() {
+    let (_d, store) = fresh();
+    assert!(matches!(
+        store.load("ghost"),
+        Err(StoreError::NotFound { .. })
+    ));
+}
+
+#[test]
+fn save_twice_without_replace_is_already_exists() {
+    let (_d, store) = fresh();
+    let rec = sample_record("alice");
+    store.save_atomic(&rec, false).unwrap();
+    assert!(matches!(
+        store.save_atomic(&rec, false),
+        Err(StoreError::AlreadyExists { .. })
+    ));
+    assert!(no_temp_files(&store.credentials_dir()));
+}
+
+#[test]
+fn save_with_replace_overwrites() {
+    let (_d, store) = fresh();
+    let mut rec = sample_record("alice");
+    store.save_atomic(&rec, false).unwrap();
+    rec.sign_count = 42;
+    rec.alg = -257;
+    store.save_atomic(&rec, true).expect("replace");
+    let loaded = store.load("alice").unwrap();
+    assert_eq!(loaded.sign_count, 42);
+    assert_eq!(loaded.alg, -257);
+    assert!(no_temp_files(&store.credentials_dir()));
+}
+
+#[test]
+fn save_creates_credentials_dir_0700() {
+    let (_d, store) = fresh();
+    store.save_atomic(&sample_record("alice"), false).unwrap();
+    let meta = fs::metadata(store.credentials_dir()).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o7777, DIR_MODE);
+}
+
+#[test]
+fn save_writes_record_0600() {
+    let (_d, store) = fresh();
+    store.save_atomic(&sample_record("alice"), false).unwrap();
+    let meta = fs::metadata(store.credentials_dir().join("alice.json")).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o7777, FILE_MODE);
+}
+
+#[test]
+fn save_rejects_invalid_record_user() {
+    let (_d, store) = fresh();
+    let mut rec = sample_record("alice");
+    rec.linux_user = "../evil".into();
+    assert!(matches!(
+        store.save_atomic(&rec, false),
+        Err(StoreError::InvalidUsername)
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Symlink hardening
+// ---------------------------------------------------------------------------
+
+#[test]
+fn load_refuses_symlinked_record() {
+    let (d, store) = fresh();
+    store.save_atomic(&sample_record("alice"), false).unwrap();
+    let target = store.credentials_dir().join("alice.json");
+    let other = d.path().join("other.json");
+    write_private(&other, b"{}");
+    fs::remove_file(&target).unwrap();
+    symlink(&other, &target).unwrap();
+    assert!(matches!(
+        store.load("alice"),
+        Err(StoreError::SymlinkedPath { .. })
+    ));
+}
+
+#[test]
+fn load_refuses_symlinked_credentials_dir() {
+    let (d, store) = fresh();
+    let real = d.path().join("real-creds");
+    fs::create_dir(&real).unwrap();
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).unwrap();
+    symlink(&real, store.credentials_dir()).unwrap();
+    assert!(matches!(
+        store.load("alice"),
+        Err(StoreError::SymlinkedPath { .. })
+    ));
+}
+
+#[test]
+fn save_refuses_symlinked_base() {
+    let d = TempDir::new().unwrap();
+    let real_base = d.path().join("real");
+    fs::create_dir(&real_base).unwrap();
+    let link_base = d.path().join("link");
+    symlink(&real_base, &link_base).unwrap();
+    let store = store_for(&link_base);
+    assert!(matches!(
+        store.save_atomic(&sample_record("alice"), false),
+        Err(StoreError::SymlinkedPath { .. })
+    ));
+}
+
+#[test]
+fn remove_refuses_symlinked_record() {
+    let (d, store) = fresh();
+    let dir = store.credentials_dir();
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let other = d.path().join("other.json");
+    write_private(&other, b"{}");
+    symlink(&other, dir.join("alice.json")).unwrap();
+    assert!(matches!(
+        store.remove("alice"),
+        Err(StoreError::SymlinkedPath { .. })
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Ownership / mode hardening
+// ---------------------------------------------------------------------------
+
+#[test]
+fn load_rejects_wrong_owner() {
+    let (d, store) = fresh();
+    store.save_atomic(&sample_record("alice"), false).unwrap();
+    // Expect a uid that is definitely not ours (wrapping is fine).
+    let wrong = Store::with_owner(d.path(), current_euid().wrapping_add(1));
+    assert!(matches!(
+        wrong.load("alice"),
+        Err(StoreError::BadOwnership { .. })
+    ));
+}
+
+#[test]
+fn load_rejects_bad_credentials_dir_mode() {
+    let (_d, store) = fresh();
+    store.save_atomic(&sample_record("alice"), false).unwrap();
+    fs::set_permissions(store.credentials_dir(), fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(matches!(
+        store.load("alice"),
+        Err(StoreError::BadOwnership { .. })
+    ));
+}
+
+#[test]
+fn load_rejects_bad_record_mode() {
+    let (_d, store) = fresh();
+    store.save_atomic(&sample_record("alice"), false).unwrap();
+    let path = store.credentials_dir().join("alice.json");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(matches!(
+        store.load("alice"),
+        Err(StoreError::BadOwnership { .. })
+    ));
+}
+
+#[test]
+fn save_refuses_existing_dir_with_bad_mode() {
+    let (_d, store) = fresh();
+    let dir = store.credentials_dir();
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(matches!(
+        store.save_atomic(&sample_record("alice"), false),
+        Err(StoreError::BadOwnership { .. })
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Corrupt / oversized / mismatched content
+// ---------------------------------------------------------------------------
+
+#[test]
+fn load_corrupt_json_is_corrupt() {
+    let (_d, store) = fresh();
+    let dir = store.credentials_dir();
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    write_private(&dir.join("alice.json"), b"{not json");
+    assert!(matches!(
+        store.load("alice"),
+        Err(StoreError::Corrupt { .. })
+    ));
+}
+
+#[test]
+fn load_unsupported_schema_is_corrupt() {
+    let (_d, store) = fresh();
+    let dir = store.credentials_dir();
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut rec = sample_record("alice");
+    rec.schema_version = 2;
+    write_record_json(&dir.join("alice.json"), &rec);
+    assert!(matches!(
+        store.load("alice"),
+        Err(StoreError::Corrupt { .. })
+    ));
+}
+
+#[test]
+fn load_record_user_mismatch_is_rejected() {
+    let (_d, store) = fresh();
+    let dir = store.credentials_dir();
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    // File alice.json but linux_user says "bob".
+    write_record_json(&dir.join("alice.json"), &sample_record("bob"));
+    assert!(matches!(
+        store.load("alice"),
+        Err(StoreError::RecordUserMismatch { .. })
+    ));
+}
+
+#[test]
+fn load_oversized_record_is_too_large() {
+    let (_d, store) = fresh();
+    let dir = store.credentials_dir();
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    write_private(&dir.join("alice.json"), &vec![b'x'; 256 * 1024 + 1]);
+    assert!(matches!(
+        store.load("alice"),
+        Err(StoreError::TooLarge { .. })
+    ));
+}
+
+#[test]
+fn load_directory_named_record_is_not_regular_file() {
+    let (_d, store) = fresh();
+    let dir = store.credentials_dir();
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir(dir.join("alice.json")).unwrap();
+    assert!(matches!(
+        store.load("alice"),
+        Err(StoreError::NotRegularFile { .. })
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Atomicity / temp-file hygiene
+// ---------------------------------------------------------------------------
+
+#[test]
+fn no_temp_files_after_successful_saves() {
+    let (_d, store) = fresh();
+    store.save_atomic(&sample_record("alice"), false).unwrap();
+    assert!(no_temp_files(&store.credentials_dir()));
+    store.save_atomic(&sample_record("alice"), true).unwrap();
+    assert!(no_temp_files(&store.credentials_dir()));
+}
+
+#[test]
+fn no_temp_files_after_failed_install() {
+    let (_d, store) = fresh();
+    let dir = store.credentials_dir();
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    // A directory sits where the record should go; `rename` over it fails *after* the
+    // temp file has been created and fsynced.
+    fs::create_dir(dir.join("alice.json")).unwrap();
+    let err = store.save_atomic(&sample_record("alice"), true);
+    assert!(err.is_err(), "rename over a directory must fail");
+    assert!(
+        no_temp_files(&dir),
+        "temp file must be cleaned up on failure"
+    );
+}
+
+#[test]
+fn no_temp_files_after_already_exists_link_race() {
+    // With replace=false the target appears after the pre-check by using link(2)'s
+    // atomic EEXIST; simulate by pre-creating the target as a directory so `link`
+    // fails, and confirm no temp survives.
+    let (_d, store) = fresh();
+    let dir = store.credentials_dir();
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir(dir.join("alice.json")).unwrap();
+    let err = store.save_atomic(&sample_record("alice"), false);
+    assert!(err.is_err());
+    assert!(no_temp_files(&dir));
+}
+
+#[test]
+fn list_missing_dir_is_empty() {
+    let (_d, store) = fresh();
+    assert_eq!(store.list().unwrap(), Vec::<String>::new());
+}
+
+#[test]
+fn list_skips_junk_entries() {
+    let (_d, store) = fresh();
+    store.save_atomic(&sample_record("alice"), false).unwrap();
+    let dir = store.credentials_dir();
+    write_private(&dir.join("notjson.txt"), b"x");
+    fs::create_dir(dir.join("subdir")).unwrap();
+    // A .json whose stem is not a valid username is skipped.
+    write_private(&dir.join("9bad.json"), b"{}");
+    symlink(dir.join("alice.json"), dir.join("link.json")).unwrap();
+    assert_eq!(store.list().unwrap(), vec!["alice".to_string()]);
+}
+
+#[test]
+fn remove_on_missing_dir_is_false() {
+    let (_d, store) = fresh();
+    assert!(!store.remove("alice").unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// TOCTOU (best effort)
+//
+// A deterministic injection point between `lstat` and `open` is unavailable from a
+// single-threaded test; instead we race a replacer against the reader and assert that
+// every outcome is well-defined (a valid record or a typed error, never a panic and
+// never a partially-read record).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn concurrent_replace_never_yields_torn_record() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (_d, store) = fresh();
+    store.save_atomic(&sample_record("alice"), false).unwrap();
+    let dir = store.credentials_dir();
+    let target = dir.join("alice.json");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let replacer = {
+        let stop = Arc::clone(&stop);
+        let dir = dir.clone();
+        std::thread::spawn(move || {
+            let mut n = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let mut rec = sample_record("alice");
+                rec.sign_count = n as u32;
+                let tmp = dir.join(format!(".tmp-race-{n}"));
+                fs::write(&tmp, serde_json::to_vec(&rec).unwrap()).unwrap();
+                fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600)).unwrap();
+                let _ = fs::rename(&tmp, &target);
+                n += 1;
+            }
+        })
+    };
+
+    let reader_store = store_for(store.base());
+    for _ in 0..2_000 {
+        match reader_store.load("alice") {
+            Ok(rec) => {
+                assert_eq!(rec.linux_user, "alice");
+                assert_eq!(rec.schema_version, 1);
+            }
+            // Any of these are legitimate race outcomes.
+            Err(
+                StoreError::NotFound { .. }
+                | StoreError::PathChanged { .. }
+                | StoreError::BadOwnership { .. }
+                | StoreError::SymlinkedPath { .. }
+                | StoreError::Corrupt { .. }
+                | StoreError::Io { .. },
+            ) => {}
+            Err(other) => panic!("unexpected error under race: {other:?}"),
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    replacer.join().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+const VALID_CONFIG: &str = r#"
+bridge_path = "/mnt/c/Users/alice/WSLWebAuthnBridge.exe"
+win_mnt = "/mnt/c"
+timeout_secs = 60
+"#;
+
+#[test]
+fn config_round_trip() {
+    let (_d, store) = fresh();
+    write_private(&store.config_path(), VALID_CONFIG.as_bytes());
+    let cfg = store.load_config().unwrap();
+    assert_eq!(
+        cfg.bridge_path,
+        PathBuf::from("/mnt/c/Users/alice/WSLWebAuthnBridge.exe")
+    );
+    assert_eq!(cfg.win_mnt, PathBuf::from("/mnt/c"));
+    assert_eq!(cfg.timeout_secs, Some(60));
+}
+
+#[test]
+fn config_defaults_win_mnt_and_timeout() {
+    let (_d, store) = fresh();
+    write_private(
+        &store.config_path(),
+        b"bridge_path = \"/x/WSLWebAuthnBridge.exe\"\n",
+    );
+    let cfg = store.load_config().unwrap();
+    assert_eq!(cfg.win_mnt, PathBuf::from("/mnt/c"));
+    assert_eq!(cfg.timeout_secs, None);
+}
+
+#[test]
+fn config_missing_is_error() {
+    let (_d, store) = fresh();
+    assert!(matches!(
+        store.load_config(),
+        Err(StoreError::ConfigMissing { .. })
+    ));
+}
+
+#[test]
+fn config_malformed_is_config_error() {
+    let (_d, store) = fresh();
+    write_private(&store.config_path(), b"bridge_path = [");
+    assert!(matches!(
+        store.load_config(),
+        Err(StoreError::Config { .. })
+    ));
+}
+
+#[test]
+fn config_missing_required_field_is_error() {
+    let (_d, store) = fresh();
+    write_private(&store.config_path(), b"win_mnt = \"/mnt/c\"\n");
+    assert!(matches!(
+        store.load_config(),
+        Err(StoreError::Config { .. })
+    ));
+}
+
+#[test]
+fn config_wrong_mode_is_bad_ownership() {
+    let (_d, store) = fresh();
+    write_private(&store.config_path(), VALID_CONFIG.as_bytes());
+    fs::set_permissions(store.config_path(), fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(matches!(
+        store.load_config(),
+        Err(StoreError::BadOwnership { .. })
+    ));
+}
+
+#[test]
+fn config_oversized_is_too_large() {
+    let (_d, store) = fresh();
+    write_private(&store.config_path(), &vec![b'#'; 64 * 1024 + 1]);
+    assert!(matches!(
+        store.load_config(),
+        Err(StoreError::TooLarge { .. })
+    ));
+}
+
+#[test]
+fn config_is_symlink_refused() {
+    let (d, store) = fresh();
+    let other = d.path().join("real-config");
+    write_private(&other, VALID_CONFIG.as_bytes());
+    symlink(&other, store.config_path()).unwrap();
+    assert!(matches!(
+        store.load_config(),
+        Err(StoreError::SymlinkedPath { .. })
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Paths / owner accessors
+// ---------------------------------------------------------------------------
+
+#[test]
+fn system_store_uses_production_paths() {
+    let store = Store::system();
+    assert_eq!(store.base(), Path::new("/etc/wsl_webauthn"));
+    assert_eq!(
+        store.credentials_dir(),
+        PathBuf::from("/etc/wsl_webauthn/credentials")
+    );
+    assert_eq!(
+        store.config_path(),
+        PathBuf::from("/etc/wsl_webauthn/config")
+    );
+    assert_eq!(store.owner_uid(), 0);
+}
+
+#[test]
+fn config_file_mode_constant_matches_plan() {
+    assert_eq!(CONFIG_MODE, 0o600);
+    assert_eq!(DIR_MODE, 0o700);
+    assert_eq!(FILE_MODE, 0o600);
+}
