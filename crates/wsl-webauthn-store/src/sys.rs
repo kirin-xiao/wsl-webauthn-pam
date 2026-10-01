@@ -13,9 +13,9 @@
 //! * `fchmod(2)` / `fsync(2)` / `rename(2)` — atomic, root-owned writes.
 //! * `unlink(2)` — temp cleanup.
 //! * `mkdir(2)` — create the credentials directory.
-//! * `lstat(2)` — symlink detection on every path component.
-//! * `chown(2)` — only used by tests running as root (restore ownership after `chown`
-//!   experiments); compiled unconditionally but harmless for non-root callers.
+//! * `lstat(2)` / `fstatat(2)` — symlink detection on every path component, including
+//!   relative to a held directory descriptor.
+//! * `unlinkat(2)` — remove a record relative to a held directory descriptor.
 
 #![allow(unsafe_code)]
 
@@ -238,32 +238,25 @@ pub(crate) fn fchmod(fd: RawFd, mode: u32) -> io::Result<()> {
     Ok(())
 }
 
-/// `fsync(2)`, mapping `EINVAL`/`ENOTSUP` (unsupported filesystems) to success so the
-/// store still works on exotic mounts while keeping durability best-effort.
+/// `fsync(2)`, retrying `EINTR` and mapping `EINVAL`/`ENOTSUP` (unsupported filesystems)
+/// to success so the store still works on exotic mounts while keeping durability
+/// best-effort.
 pub(crate) fn fsync(fd: RawFd) -> io::Result<()> {
-    // SAFETY: `fd` is an owned descriptor.
-    let rc = unsafe { libc::fsync(fd) };
-    if rc != 0 {
+    loop {
+        // SAFETY: `fd` is an owned descriptor.
+        let rc = unsafe { libc::fsync(fd) };
+        if rc == 0 {
+            return Ok(());
+        }
         let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
         if matches!(err.raw_os_error(), Some(libc::EINVAL) | Some(libc::ENOTSUP)) {
             return Ok(());
         }
         return Err(err);
     }
-    Ok(())
-}
-
-/// `chown(2)` — used by tests when running as root; a no-op failure is returned to the
-/// caller for inspection.
-#[allow(dead_code)]
-pub(crate) fn chown(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
-    let c = cpath(path)?;
-    // SAFETY: `c` is a valid NUL-terminated path.
-    let rc = unsafe { libc::chown(c.as_ptr(), uid, gid) };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 /// Create a uniquely named temp file in `dir` with a `0600` mode.
