@@ -143,6 +143,10 @@ GLOBAL:
     -h, --help       Print this help
     -V, --version    Print the version
 
+NOTE:
+    A value that begins with `-` must use the `--flag=value` form; in the
+    `--flag value` form a `-`-prefixed token is read as the next flag.
+
 EXIT CODES:
     0   success
     1   operational failure; in `status` list mode this includes one or more
