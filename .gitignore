@@ -1,5 +1,10 @@
 /target
 /build
+# cargo-fuzz artifacts (the fuzz crate is a separate workspace root)
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/Cargo.lock
 /spike/*.exe
 __pycache__/
 *.pyc

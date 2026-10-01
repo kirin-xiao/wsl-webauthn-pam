@@ -14,14 +14,27 @@ serde_json = { workspace = true }
 base64 = { workspace = true }
 thiserror = { workspace = true }
 ciborium = { workspace = true }
-sha2 = { workspace = true }
-p256 = { workspace = true }
+# `oid` exposes `AssociatedOid for Sha256`, required by `rsa`'s prefixed
+# PKCS#1 v1.5 verifying key.
+sha2 = { workspace = true, features = ["oid"] }
+# SHA-1 is only used by the `tpm` attestation path: the Windows Hello AIK signs
+# `certInfo` with RS1 (COSE alg -65535), whose prefix `rsa` needs `Sha1: AssociatedOid`.
+sha1 = { version = "0.10.6", features = ["oid"] }
+p256 = { workspace = true, features = ["pkcs8"] }
 ecdsa = { workspace = true }
-rsa = { workspace = true }
-ed25519-dalek = { workspace = true }
+rsa = { workspace = true, features = ["sha2"] }
+ed25519-dalek = { workspace = true, features = ["pkcs8"] }
 x509-cert = { workspace = true }
 der = { workspace = true }
 const-oid = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# Randomness for the synthesized test suite (key generation, nonces).
+rand = { workspace = true }
+# Certificate builder used only by the test harness.
+x509-cert = { workspace = true, features = ["builder"] }
+rsa = { workspace = true, features = ["sha2"] }
+ed25519-dalek = { workspace = true, features = ["pkcs8", "rand_core"] }
+# SHA-1 for the synthesized `tpm`/RS1 attestation vectors.
+sha1 = { version = "0.10.6", features = ["oid"] }

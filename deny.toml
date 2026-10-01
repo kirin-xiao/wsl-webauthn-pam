@@ -53,10 +53,10 @@ exceptions = []
 
 [bans]
 multiple-versions = "warn"
-# The crates in this workspace depend on each other through `path = "../…"`
-# deps, which cargo-deny reports as "wildcard" requirements. They are internal
-# and pinned by the workspace itself, so allow them; true wildcard *registry*
-# requirements are still denied.
+# Workspace crates depend on each other through `path = "../…"` deps, which
+# cargo-deny reports as "wildcard" requirements. They are internal and pinned
+# by the workspace itself, so allow them; true wildcard *registry* requirements
+# are still denied (only path deps are exempted by this flag).
 wildcards = "allow"
 allow-wildcard-paths = true
 deny = []
