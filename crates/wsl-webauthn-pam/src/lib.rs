@@ -99,6 +99,9 @@ fn guarded<F>(what: &str, body: F) -> c_int
 where
     F: FnOnce() -> c_int,
 {
+    // Root-cause fix for L8-1: replace the default stderr-printing panic hook with
+    // one that logs to syslog before `catch_unwind` can observe the panic.
+    logger::install_panic_hook();
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
         Ok(code) => code,
         Err(_) => {
@@ -235,4 +238,67 @@ pub extern "C" fn pam_sm_chauthtok(
     _argv: *const *const c_char,
 ) -> c_int {
     guarded("pam_sm_chauthtok", || PAM_IGNORE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Redirect the process's stderr to a temp file for the duration of `f`, restoring
+    /// it even if `f` panics, and return what `f` wrote. Serialized process-wide so two
+    /// tests cannot interleave redirections.
+    fn capture_stderr<F: FnOnce()>(f: F) -> String {
+        use std::io::Write as _;
+        use std::os::unix::io::AsRawFd as _;
+
+        /// Restores stderr when dropped, including on the unwind path.
+        struct Restore(i32);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::io::stderr().flush();
+                // SAFETY: `self.0` is the descriptor returned by `dup` and is closed
+                // exactly once; `dup2` restores the original stderr.
+                unsafe {
+                    libc::dup2(self.0, libc::STDERR_FILENO);
+                    libc::close(self.0);
+                }
+            }
+        }
+
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let file = tempfile::NamedTempFile::new().expect("tempfile");
+        let _ = std::io::stderr().flush();
+        // SAFETY: `dup`/`dup2` act on this process's own descriptors; the original is
+        // restored by `Restore` before the mutex is released.
+        let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
+        assert!(saved >= 0, "dup(stderr) failed");
+        let redirected = unsafe { libc::dup2(file.as_file().as_raw_fd(), libc::STDERR_FILENO) };
+        assert!(redirected >= 0, "dup2(stderr) failed");
+
+        {
+            let _restore = Restore(saved);
+            f();
+            std::fs::read_to_string(file.path()).unwrap_or_default()
+        }
+    }
+
+    /// L8-1: a panic contained by [`guarded`] must map to `PAM_ABORT` *and* leave the
+    /// invoking terminal untouched — the payload goes to syslog, never stderr.
+    #[test]
+    fn panic_in_guarded_logs_to_syslog_and_not_to_stderr() {
+        // Ensure the production syslog hook (not the default stderr hook) is installed.
+        logger::install_panic_hook();
+
+        let stderr = capture_stderr(|| {
+            let code = guarded("panic-hook-test", || panic!("L8-1 stderr sentinel"));
+            assert_eq!(code, PAM_ABORT, "a panic must still map to PAM_ABORT");
+        });
+
+        assert!(
+            !stderr.contains("L8-1 stderr sentinel") && !stderr.contains("panicked"),
+            "the panic payload must not reach stderr, got: {stderr:?}"
+        );
+    }
 }

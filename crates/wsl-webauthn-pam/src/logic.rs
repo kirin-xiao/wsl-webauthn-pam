@@ -463,6 +463,9 @@ pub fn authenticate<S: PamSeam, D: Deps>(
 ///
 /// On failure this requests `pam_fail_delay` (2 s) *before* returning.
 pub fn run<S: PamSeam, D: Deps>(seam: &mut S, deps: &D, flags: i32, raw_args: &[String]) -> i32 {
+    // Install the syslog-only panic hook before enclosing `authenticate` in
+    // `catch_unwind` (L8-1); this also covers direct callers that skip `guarded`.
+    logger::install_panic_hook();
     let args = crate::args::parse(raw_args);
     logger::set_debug(args.debug);
     logger::debug(&format!(

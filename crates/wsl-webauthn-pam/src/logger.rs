@@ -19,10 +19,11 @@ use std::ffi::CString;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::bindings::{self, LOG_AUTHPRIV, LOG_DEBUG, LOG_PID};
+use crate::bindings::{self, LOG_AUTHPRIV, LOG_CRIT, LOG_DEBUG, LOG_PID};
 
 static OPENLOG: OnceLock<()> = OnceLock::new();
 static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
+static PANIC_HOOK: OnceLock<()> = OnceLock::new();
 
 /// Configure whether [`debug`] emits messages for the lifetime of the process.
 ///
@@ -34,6 +35,46 @@ pub fn set_debug(enabled: bool) {
 /// Whether debug logging is currently enabled.
 pub fn debug_enabled() -> bool {
     DEBUG_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Render a panic payload and location for the syslog record.
+///
+/// The location (an absolute source path) is deliberately included: `LOG_AUTHPRIV`
+/// records are root-only, so this is the one place the path is safe to record. The
+/// point of the hook is that it *never* reaches the invoking user's terminal.
+fn describe_panic(info: &std::panic::PanicHookInfo<'_>) -> String {
+    let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = info.payload().downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    };
+    match info.location() {
+        Some(location) => format!("{payload} at {}:{}", location.file(), location.line()),
+        None => payload,
+    }
+}
+
+/// Install the syslog-only panic hook exactly once, before the first `catch_unwind`.
+///
+/// Without this the *default* hook prints the panic payload and an absolute source
+/// path to stderr — for a PAM module that is the invoking user's terminal — before
+/// `catch_unwind` maps the panic to `PAM_ABORT`. Replacing the process-wide hook is a
+/// one-time, idempotent operation ([`OnceLock`]); it changes only *where* diagnostics
+/// go, never the PAM return code that `catch_unwind` produces.
+pub fn install_panic_hook() {
+    PANIC_HOOK.get_or_init(|| {
+        std::panic::set_hook(Box::new(|info| {
+            auth(
+                LOG_CRIT,
+                &format!(
+                    "panic in pam_wsl_webauthn: {}; returning PAM_ABORT (fail closed)",
+                    describe_panic(info)
+                ),
+            );
+        }));
+    });
 }
 
 fn ensure_openlog() {
