@@ -164,6 +164,14 @@ it is exercised by synthesized positive/negative tests (one negative per
 invariant), `proptest` round-trips, and `cargo-fuzz` targets
 (`crates/wsl-webauthn-verifier/`, `fuzz/`).
 
+**Build requirement — unwinding panics.** The PAM module wraps every exported
+entry point in `catch_unwind` and returns `PAM_ABORT` instead of unwinding across
+the C ABI, and the Windows bridge must fail in-band rather than crash. Both
+crates therefore require `panic = "unwind"` (the Cargo default). Each crate root
+carries a `#[cfg(not(panic = "unwind"))] compile_error!` guard, so a
+`panic = "abort"` profile fails the build rather than silently disabling the
+fail-closed mapping.
+
 ---
 
 ## Enrollment security properties

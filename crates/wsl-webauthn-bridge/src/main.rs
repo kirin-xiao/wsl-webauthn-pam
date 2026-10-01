@@ -25,6 +25,19 @@
 //! On non-Windows hosts the binary is a stub (the crate still builds and its
 //! platform-independent layers are unit-tested there).
 
+// This crate contains the audited Win32 FFI; `unsafe` is confined to `ffi`.
+#![deny(unsafe_code)]
+
+// An aborting panic would kill the bridge process instead of letting it write a
+// framed error response (and would unwind through Win32 callback boundaries).
+// The Linux runner relies on graceful, in-band failures; require unwinding
+// panics in every profile.
+#[cfg(not(panic = "unwind"))]
+compile_error!(
+    "wsl-webauthn-bridge must be built with panic=unwind; an aborting panic \
+     crashes the process instead of reporting a transport/ceremony failure"
+);
+
 // The platform-independent layers are compiled for the real Windows build and
 // for the Linux test build (so `cargo test -p wsl-webauthn-bridge` exercises
 // the ceremony logic without `webauthn.dll`).
@@ -32,7 +45,9 @@
 mod api;
 #[cfg(any(windows, test))]
 mod ceremony;
+// Single, audited unsafe surface: hand-written `webauthn.dll` / Win32 FFI.
 #[cfg(windows)]
+#[allow(unsafe_code)]
 mod ffi;
 #[cfg(any(windows, test))]
 mod wire;

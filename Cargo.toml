@@ -6,10 +6,19 @@ members = ["crates/*"]
 # nightly-only libFuzzer targets.
 exclude = ["fuzz"]
 
+# Build requirement: `wsl-webauthn-pam` maps a panic to `PAM_ABORT` via
+# `catch_unwind`, and `wsl-webauthn-bridge` must report failures gracefully.
+# Both require unwinding panics; do NOT set `panic = "abort"` in any profile.
+# Each of those crate roots carries a `#[cfg(not(panic = "unwind"))]
+# compile_error!` guard so an aborting profile fails the build instead.
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# 1.88 is the true floor: `wsl-webauthn-cli` uses let-chains (`if let … && …`),
+# stabilized in 1.88. Verified by the `msrv` CI job, which checks the workspace
+# with `cargo +1.88.0 … --locked`.
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/kirin-xiao/wsl-webauthn-pam"
 

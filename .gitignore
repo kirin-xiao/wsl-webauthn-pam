@@ -1,10 +1,11 @@
 /target
 /build
-# cargo-fuzz artifacts (the fuzz crate is a separate workspace root)
+# cargo-fuzz build output (the fuzz crate is a separate workspace root). The
+# lockfile and the curated seed corpus ARE committed for reproducibility; only
+# local fuzzing output/corpora additions are ignored.
 /fuzz/target
-/fuzz/corpus
 /fuzz/artifacts
-/fuzz/Cargo.lock
+/fuzz/coverage
 /spike/*.exe
 __pycache__/
 *.pyc
