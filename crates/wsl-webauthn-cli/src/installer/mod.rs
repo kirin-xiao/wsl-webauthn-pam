@@ -1,0 +1,1492 @@
+//! The `install` / `uninstall` implementation (plan §10, decisions D6/D7).
+//!
+//! This module is the **only** place that writes system paths. It is written as pure
+//! Rust (no shell) and every mutation goes through [`crate::fsutil`], which refuses
+//! symlinks and installs files atomically (temp file in the same directory +
+//! `rename(2)`).
+//!
+//! # Testability seam: [`InstallPaths`]
+//!
+//! Every system path the installer touches (`/etc/wsl_webauthn`, `/etc/pam.d`,
+//! `/usr/share/pam-configs`, the module search roots, even the expected owner uid) is
+//! carried in [`InstallPaths`]. Production uses [`InstallPaths::system`]; tests build
+//! a fully tempdir-backed value so **no test ever touches `/etc`**.
+//!
+//! # Injection seams
+//!
+//! Four small traits keep the logic unit-testable:
+//! * [`InteropRunner`] — runs Windows helper programs (`cmd.exe`, `whoami.exe`) through
+//!   `wsl-webauthn-runner`'s [`wsl_webauthn_runner::InteropCommand`].
+//! * [`CommandRunner`] — runs Linux helpers (`pam-auth-update`) with an argument array.
+//! * [`Prompter`] — asks the operator yes/no questions.
+//! * [`Enroller`] — runs the in-process enrollment offer.
+//!
+//! # Install order (D7 + lockout safety)
+//!
+//! 1. Provision the Windows bridge exe (needed before enrollment can pin it).
+//! 2. Write `/etc/wsl_webauthn/config` (`0600`) and `credentials/` (`0700`).
+//! 3. Install the new `pam_wsl_webauthn.so` and the `pam-configs` profile, then
+//!    **verify** them. The rollback is **committed** here.
+//! 4. Only then offer legacy cleanup: rewrite `/etc/pam.d` references *before*
+//!    removing the old `.so`, `pam-auth-update --remove wsl-hello`, remove the old
+//!    module/config dirs. The legacy PEM is **never** imported.
+//! 5. Offer `pam-auth-update --enable wsl-webauthn`, print lockout guidance, then offer
+//!    enrollment **last**.
+//!
+//! Any step *up to and including verification* that fails rolls back exactly what *this
+//! run* wrote (new files and directories are removed) and returns a non-zero exit.
+//! Nothing after verification is rolled back: committing before migration means a
+//! failure can never remove the module/profile or un-rewrite a `/etc/pam.d` file back
+//! into a stale `pam_wsl_hello` reference.
+
+use std::fmt::Write as _;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context as _, anyhow, bail};
+
+use wsl_webauthn_store::{CONFIG_MODE, Store};
+
+use crate::confparse;
+use crate::fsutil;
+
+/// The `pam-auth-update` profile text, embedded from the repository's single source of
+/// truth (`pam-config` at the workspace root). This path is relative to this file
+/// (`crates/wsl-webauthn-cli/src/installer/mod.rs`) and is asserted byte-for-byte
+/// against the file on disk by a test, so the two can never drift.
+pub(crate) const PROFILE_TEXT: &str = include_str!("../../../../pam-config");
+
+/// Name of the `pam-configs` profile (plan D1: `wsl-webauthn`).
+pub(crate) const PROFILE_NAME: &str = "wsl-webauthn";
+/// Name of the legacy `pam-configs` profile (WSL-Hello-sudo).
+pub(crate) const LEGACY_PROFILE_NAME: &str = "wsl-hello";
+/// Our PAM module file name.
+pub(crate) const MODULE_NAME: &str = "pam_wsl_webauthn.so";
+/// The legacy module file name we detect and offer to remove.
+pub(crate) const LEGACY_MODULE_NAME: &str = "pam_wsl_hello.so";
+/// The legacy module *stem*, used for `/etc/pam.d` text replacement.
+pub(crate) const LEGACY_MODULE_STEM: &[u8] = b"pam_wsl_hello";
+/// The new module *stem*.
+pub(crate) const MODULE_STEM: &[u8] = b"pam_wsl_webauthn";
+/// Windows bridge executable name (plan D1/D11).
+pub(crate) const BRIDGE_EXE: &str = "WSLWebAuthnBridge.exe";
+/// Sub-path under `%LOCALAPPDATA%` where the bridge is installed (plan D11).
+pub(crate) const WIN_BRIDGE_SUBPATH: &[&str] = &["Programs", "wsl-webauthn-pam"];
+
+/// Mode of the installed module and profile (`root:root`).
+pub(crate) const MODULE_MODE: u32 = 0o644;
+/// Mode of the installed profile.
+pub(crate) const PROFILE_MODE: u32 = 0o644;
+/// Mode of the Windows bridge exe on DrvFs (informational; DrvFs ignores it).
+pub(crate) const BRIDGE_MODE: u32 = 0o755;
+/// Directory mode for `credentials/`.
+pub(crate) const DIR_MODE: u32 = 0o700;
+
+/// Default Windows mount root (mirrors `wsl-webauthn-store`).
+pub(crate) const DEFAULT_WIN_MNT: &str = "/mnt/c";
+
+/// Deadline for the `cmd.exe` invocation that resolves `%LOCALAPPDATA%` (plan §10.3).
+const LOCALAPPDATA_DEADLINE: Duration = Duration::from_secs(5);
+/// Deadline for the install-time `whoami.exe` interop sanity check (plan §10.2).
+const WHOAMI_DEADLINE: Duration = Duration::from_secs(5);
+
+const EXIT_OK: i32 = 0;
+const EXIT_FAIL: i32 = 1;
+
+// ---------------------------------------------------------------------------
+// System paths
+// ---------------------------------------------------------------------------
+
+/// Every system path the installer mutates, plus the expected owner uid.
+///
+/// Tests build this with tempdir roots and the current euid, so no test ever writes to
+/// `/etc`.
+#[derive(Debug, Clone)]
+pub(crate) struct InstallPaths {
+    /// `/etc/wsl_webauthn`.
+    pub etc_wsl_webauthn: PathBuf,
+    /// `/etc/wsl.conf` (parsed for the `[automount] root=`).
+    pub etc_wsl_conf: PathBuf,
+    /// `/etc/pam.d`.
+    pub pam_d: PathBuf,
+    /// `/usr/share/pam-configs`.
+    pub pam_configs: PathBuf,
+    /// `/etc/pam_wsl_hello` (legacy config dir; never removed by uninstall).
+    pub legacy_config_dir: PathBuf,
+    /// Roots scanned for `<root>/<triplet>/security/pam_unix.so` (`/usr/lib`, `/lib`).
+    pub module_search_roots: Vec<PathBuf>,
+    /// Expected owner uid of installed files (0 in production).
+    pub owner_uid: u32,
+}
+
+impl InstallPaths {
+    /// The production paths.
+    pub(crate) fn system() -> InstallPaths {
+        InstallPaths {
+            etc_wsl_webauthn: PathBuf::from(wsl_webauthn_store::SYSTEM_BASE),
+            etc_wsl_conf: PathBuf::from("/etc/wsl.conf"),
+            pam_d: PathBuf::from("/etc/pam.d"),
+            pam_configs: PathBuf::from("/usr/share/pam-configs"),
+            legacy_config_dir: PathBuf::from("/etc/pam_wsl_hello"),
+            module_search_roots: vec![PathBuf::from("/usr/lib"), PathBuf::from("/lib")],
+            owner_uid: 0,
+        }
+    }
+
+    /// `<etc_wsl_webauthn>/config`.
+    pub(crate) fn config_path(&self) -> PathBuf {
+        self.etc_wsl_webauthn.join("config")
+    }
+
+    /// `<etc_wsl_webauthn>/credentials`.
+    pub(crate) fn credentials_dir(&self) -> PathBuf {
+        self.etc_wsl_webauthn.join("credentials")
+    }
+
+    /// `<pam_configs>/wsl-webauthn`.
+    pub(crate) fn profile_path(&self) -> PathBuf {
+        self.pam_configs.join(PROFILE_NAME)
+    }
+
+    /// `<pam_configs>/wsl-hello`.
+    pub(crate) fn legacy_profile_path(&self) -> PathBuf {
+        self.pam_configs.join(LEGACY_PROFILE_NAME)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Injection seams
+// ---------------------------------------------------------------------------
+
+/// Runs a Windows program via WSL interop and returns its captured output.
+pub(crate) trait InteropRunner {
+    /// Run `program` with `args` in `win_mnt`, capturing stdout/stderr within `deadline`.
+    fn run(
+        &self,
+        program: &str,
+        args: &[&str],
+        win_mnt: &Path,
+        deadline: Duration,
+    ) -> Result<std::process::Output, String>;
+}
+
+/// Production interop runner, backed by [`wsl_webauthn_runner::InteropCommand`].
+pub(crate) struct RealInterop;
+
+impl InteropRunner for RealInterop {
+    fn run(
+        &self,
+        program: &str,
+        args: &[&str],
+        win_mnt: &Path,
+        deadline: Duration,
+    ) -> Result<std::process::Output, String> {
+        wsl_webauthn_runner::InteropCommand::run(program, args, win_mnt, deadline)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Exit status of an external helper command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommandStatus {
+    /// Whether the process exited 0.
+    pub success: bool,
+    /// The exit code, if the process exited normally.
+    pub code: Option<i32>,
+}
+
+/// Runs a Linux helper program with an argument array (no shell).
+pub(crate) trait CommandRunner {
+    /// Run `program` with `args`.
+    fn run(&self, program: &str, args: &[&str]) -> Result<CommandStatus, String>;
+}
+
+/// Production command runner.
+pub(crate) struct RealCommands;
+
+impl CommandRunner for RealCommands {
+    fn run(&self, program: &str, args: &[&str]) -> Result<CommandStatus, String> {
+        let status = std::process::Command::new(program)
+            .args(args)
+            .status()
+            .map_err(|e| format!("could not run {program}: {e}"))?;
+        Ok(CommandStatus {
+            success: status.success(),
+            code: status.code(),
+        })
+    }
+}
+
+/// Runs the post-install enrollment (in-process).
+///
+/// Abstracted so install tests never invoke the real enrollment logic (which would read
+/// the real `/etc/wsl_webauthn`). Production uses [`RealEnroller`].
+pub(crate) trait Enroller {
+    /// Enroll the invoking user; `allow_unattested` selects the attestation policy.
+    fn enroll(&self, allow_unattested: bool) -> anyhow::Result<i32>;
+}
+
+/// Production enroller: reuses the CLI's `enroll` implementation.
+pub(crate) struct RealEnroller;
+
+impl Enroller for RealEnroller {
+    fn enroll(&self, allow_unattested: bool) -> anyhow::Result<i32> {
+        crate::cmd_enroll(false, allow_unattested, None, None, None)
+    }
+}
+
+/// Asks the operator yes/no questions.
+pub(crate) trait Prompter {
+    /// Ask `question` and return the answer; `default` is used for an empty line and in
+    /// non-interactive mode.
+    fn confirm(&self, question: &str, default: bool) -> anyhow::Result<bool>;
+}
+
+/// The production prompter: reads from stdin unless `--yes`/`--non-interactive`.
+pub(crate) struct StdPrompter {
+    /// `--yes`: answer yes to every question.
+    pub assume_yes: bool,
+    /// `--non-interactive`: never read stdin; use the question's default.
+    pub non_interactive: bool,
+}
+
+impl Prompter for StdPrompter {
+    fn confirm(&self, question: &str, default: bool) -> anyhow::Result<bool> {
+        if self.assume_yes {
+            println!("{question} [yes]");
+            return Ok(true);
+        }
+        if self.non_interactive {
+            println!("{question} [{}]", if default { "yes" } else { "no" });
+            return Ok(default);
+        }
+        loop {
+            print!("{question} [{}] ", if default { "Y/n" } else { "y/N" });
+            std::io::stdout().flush().ok();
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line)? == 0 {
+                return Ok(default);
+            }
+            match line.trim().to_ascii_lowercase().as_str() {
+                "y" | "yes" => return Ok(true),
+                "n" | "no" => return Ok(false),
+                "" => return Ok(default),
+                _ => continue,
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Options
+// ---------------------------------------------------------------------------
+
+/// Options for [`install_with`].
+#[derive(Debug, Clone, Default)]
+pub(crate) struct InstallOptions {
+    /// Admit self/`none` attestation at enrollment (`--allow-unattested`).
+    pub allow_unattested: bool,
+    /// Skip the post-install enrollment offer (`--skip-enroll`).
+    pub skip_enroll: bool,
+    /// Override the module directory (skip detection).
+    pub module_dir: Option<PathBuf>,
+    /// Override the Windows mount root (skip `/etc/wsl.conf`).
+    pub win_mnt: Option<PathBuf>,
+    /// Explicit artifact directory (`--artifact-dir`), else `$WSL_WEBAUTHN_ARTIFACTS`,
+    /// else a search around the executable.
+    pub artifact_dir: Option<PathBuf>,
+}
+
+/// Options for [`uninstall_all`].
+#[derive(Debug, Clone, Default)]
+pub(crate) struct UninstallOptions {
+    /// Override the Windows mount root.
+    pub win_mnt: Option<PathBuf>,
+    /// Override the module directory (skip detection).
+    pub module_dir: Option<PathBuf>,
+}
+
+// ---------------------------------------------------------------------------
+// Rollback
+// ---------------------------------------------------------------------------
+
+/// One reversible action recorded during install.
+///
+/// Only **new** artifacts are rolled back (the plan's "remove what this run wrote"); an
+/// existing file is never rewritten by provisioning, so no restore action is needed.
+enum Action {
+    /// A file this run created; removing it undoes the action.
+    NewFile(PathBuf),
+    /// A directory tree this run created; the exe inside is removed recursively.
+    NewDir(PathBuf),
+}
+
+/// Records what this run wrote so a failure can undo exactly that.
+struct Rollback {
+    actions: Vec<Action>,
+    committed: bool,
+}
+
+impl Rollback {
+    fn new() -> Rollback {
+        Rollback {
+            actions: Vec::new(),
+            committed: false,
+        }
+    }
+
+    fn created_file(&mut self, path: PathBuf) {
+        self.actions.push(Action::NewFile(path));
+    }
+
+    fn created_dir(&mut self, path: PathBuf) {
+        self.actions.push(Action::NewDir(path));
+    }
+
+    /// Disarm the rollback: the install is complete and verified.
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+
+    /// Undo recorded actions, most-recent first.
+    fn rollback(&mut self) {
+        for action in self.actions.drain(..).rev() {
+            match action {
+                Action::NewFile(path) => {
+                    if let Err(e) = fsutil::remove_file(&path) {
+                        eprintln!("warning: rollback could not remove {}: {e}", path.display());
+                    }
+                }
+                Action::NewDir(path) => {
+                    if let Err(e) = fsutil::remove_tree(&path) {
+                        eprintln!("warning: rollback could not remove {}: {e}", path.display());
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Rollback {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.rollback();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Artifact resolution
+// ---------------------------------------------------------------------------
+
+/// The two build artifacts the installer ships.
+#[derive(Debug, Clone)]
+struct Artifacts {
+    /// The PAM module (`.so`).
+    module: PathBuf,
+    /// The Windows bridge exe.
+    bridge: PathBuf,
+}
+
+/// Candidate directories to search for artifacts, nearest-first.
+fn candidate_artifact_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        dirs.push(dir.to_path_buf());
+        if let Some(target) = ancestor_named(dir, "target") {
+            dirs.push(target.join("release"));
+            if let Ok(entries) = std::fs::read_dir(&target) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        dirs.push(path.join("release"));
+                    }
+                }
+            }
+        }
+        let mut cur = dir;
+        for _ in 0..4 {
+            let Some(parent) = cur.parent() else { break };
+            dirs.push(parent.to_path_buf());
+            dirs.push(parent.join("build"));
+            dirs.push(parent.join("build/release"));
+            dirs.push(parent.join("release"));
+            cur = parent;
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        dirs.push(cwd.join("build/release"));
+        dirs.push(cwd.join("build"));
+        dirs.push(cwd.join("release"));
+        dirs.push(cwd);
+    }
+    let mut seen = Vec::new();
+    dirs.retain(|d| {
+        if seen.contains(d) {
+            false
+        } else {
+            seen.push(d.clone());
+            true
+        }
+    });
+    dirs
+}
+
+/// Find the first ancestor of `dir` (inclusive) whose file name is `name`.
+fn ancestor_named(dir: &Path, name: &str) -> Option<PathBuf> {
+    let mut cur = Some(dir);
+    while let Some(path) = cur {
+        if path.file_name().and_then(|n| n.to_str()) == Some(name) {
+            return Some(path.to_path_buf());
+        }
+        cur = path.parent();
+    }
+    None
+}
+
+fn find_in(dirs: &[PathBuf], names: &[&str]) -> Option<PathBuf> {
+    for dir in dirs {
+        for name in names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the module and bridge artifacts.
+///
+/// Order: an explicit `--artifact-dir` (or `$WSL_WEBAUTHN_ARTIFACTS`) is authoritative
+/// and must contain both files; otherwise the executable's own directory, the `target/`
+/// tree around it, and the current directory are searched (release-tarball and cargo
+/// layouts).
+fn resolve_artifacts(explicit: Option<&Path>) -> anyhow::Result<Artifacts> {
+    let env_dir = std::env::var_os("WSL_WEBAUTHN_ARTIFACTS").map(PathBuf::from);
+    let explicit = explicit.map(Path::to_path_buf).or(env_dir);
+    let dirs = match explicit {
+        Some(dir) => vec![dir],
+        None => candidate_artifact_dirs(),
+    };
+    let module = find_in(&dirs, &[MODULE_NAME, "libpam_wsl_webauthn.so"]).ok_or_else(|| {
+        anyhow!(
+            "could not find {MODULE_NAME} (or libpam_wsl_webauthn.so); build the workspace \
+             (`make all`) or pass --artifact-dir <DIR> / set WSL_WEBAUTHN_ARTIFACTS"
+        )
+    })?;
+    let bridge = find_in(&dirs, &[BRIDGE_EXE]).ok_or_else(|| {
+        anyhow!(
+            "could not find {BRIDGE_EXE}; build the bridge (`make bridge`) or pass \
+             --artifact-dir <DIR> / set WSL_WEBAUTHN_ARTIFACTS"
+        )
+    })?;
+    Ok(Artifacts { module, bridge })
+}
+
+// ---------------------------------------------------------------------------
+// Module directory detection
+// ---------------------------------------------------------------------------
+
+/// Detect the PAM security directory by finding the one that contains `pam_unix.so`.
+///
+/// `roots` are library roots such as `/usr/lib`; both `<root>/security` and
+/// `<root>/<triplet>/security` are probed. Deterministic (sorted) so tests are stable.
+pub(crate) fn detect_module_dir(roots: &[PathBuf]) -> Option<PathBuf> {
+    for root in roots {
+        let direct = root.join("security");
+        if direct.join("pam_unix.so").is_file() {
+            return Some(direct);
+        }
+        if let Ok(entries) = std::fs::read_dir(root) {
+            let mut subdirs: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect();
+            subdirs.sort();
+            for subdir in subdirs {
+                let security = subdir.join("security");
+                if security.join("pam_unix.so").is_file() {
+                    return Some(security);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the destination module directory: explicit flag, detection, fallback, error.
+fn resolve_module_dir(paths: &InstallPaths, explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
+    if let Some(dir) = explicit {
+        let md = fsutil::lstat_opt(dir)?
+            .ok_or_else(|| anyhow!("module directory does not exist: {}", dir.display()))?;
+        if md.file_type().is_symlink() {
+            bail!(
+                "refusing to use a symlinked module directory: {}",
+                dir.display()
+            );
+        }
+        if !md.is_dir() {
+            bail!("module directory is not a directory: {}", dir.display());
+        }
+        return Ok(dir.to_path_buf());
+    }
+    if let Some(detected) = detect_module_dir(&paths.module_search_roots) {
+        return Ok(detected);
+    }
+    for fallback in ["/usr/lib/security", "/lib/security"] {
+        let dir = Path::new(fallback);
+        if dir.is_dir() {
+            return Ok(dir.to_path_buf());
+        }
+    }
+    bail!(
+        "could not locate the PAM module directory (no pam_unix.so found under {:?}); \
+         pass --module-dir <DIR> (e.g. /usr/lib/x86_64-linux-gnu/security)",
+        paths.module_search_roots
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+/// Quote a string as a TOML basic string.
+fn toml_basic_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04X}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Serialize the `[base]/config` TOML (exactly the fields the store's `deny_unknown_fields`
+/// parser accepts: `bridge_path`, `win_mnt`, optional `timeout_secs`).
+fn config_toml(bridge_path: &Path, win_mnt: &Path) -> String {
+    format!(
+        "bridge_path = {}\nwin_mnt = {}\n",
+        toml_basic_string(&bridge_path.to_string_lossy()),
+        toml_basic_string(&win_mnt.to_string_lossy()),
+    )
+}
+
+/// A unique backup path for `path`. The marker is also skipped when scanning `/etc/pam.d`
+/// on uninstall.
+fn backup_path(path: &Path) -> PathBuf {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    path.with_file_name(format!("{name}{}.{secs}", fsutil::BACKUP_MARKER))
+}
+
+/// Replace every non-overlapping occurrence of `needle` in `haystack`.
+fn replace_all(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+    if needle.is_empty() {
+        return haystack.to_vec();
+    }
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut i = 0;
+    while i < haystack.len() {
+        if haystack[i..].starts_with(needle) {
+            out.extend_from_slice(replacement);
+            i += needle.len();
+        } else {
+            out.push(haystack[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn resolve_win_mnt(paths: &InstallPaths, explicit: Option<&Path>) -> PathBuf {
+    if let Some(dir) = explicit {
+        return dir.to_path_buf();
+    }
+    if let Ok(bytes) = fsutil::read_nofollow(&paths.etc_wsl_conf)
+        && let Ok(text) = std::str::from_utf8(&bytes)
+        && let Some(parsed) = confparse::parse_win_mnt(text)
+    {
+        return parsed;
+    }
+    PathBuf::from(DEFAULT_WIN_MNT)
+}
+
+/// Resolve `%LOCALAPPDATA%` through `cmd.exe` (cwd = `win_mnt`, CRLF-stripped, 5 s).
+fn resolve_local_appdata(interop: &dyn InteropRunner, win_mnt: &Path) -> anyhow::Result<String> {
+    let output = interop
+        .run(
+            "cmd.exe",
+            &["/c", "echo", "%LOCALAPPDATA%"],
+            win_mnt,
+            LOCALAPPDATA_DEADLINE,
+        )
+        .map_err(|e| anyhow!("could not resolve %LOCALAPPDATA% via cmd.exe: {e}"))?;
+    if !output.status.success() {
+        bail!(
+            "cmd.exe /c echo %LOCALAPPDATA% exited with {:?}",
+            output.status.code()
+        );
+    }
+    confparse::parse_local_appdata(&output.stdout).ok_or_else(|| {
+        anyhow!("%LOCALAPPDATA% resolved to an unusable value (undefined variable?)")
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Provisioning
+// ---------------------------------------------------------------------------
+
+/// Ensure a directory exists, refusing symlinks, and record the highest newly created
+/// directory for rollback.
+fn ensure_dir(dir: &Path, mode: u32, rollback: &mut Rollback, what: &str) -> anyhow::Result<()> {
+    if let Some(md) = fsutil::lstat_opt(dir)? {
+        if md.file_type().is_symlink() {
+            bail!("refusing to use a symlinked {what}: {}", dir.display());
+        }
+        if !md.is_dir() {
+            bail!("{what} is not a directory: {}", dir.display());
+        }
+        return Ok(());
+    }
+    // Find the first existing ancestor so a create that makes several components can be
+    // rolled back by removing only the top-most new directory.
+    let mut first_missing: Option<PathBuf> = None;
+    let mut cur = Some(dir);
+    while let Some(path) = cur {
+        match fsutil::lstat_opt(path)? {
+            Some(_) => break,
+            None => first_missing = Some(path.to_path_buf()),
+        }
+        cur = path.parent();
+    }
+    fsutil::create_dir_all(dir).with_context(|| format!("creating {what} {}", dir.display()))?;
+    fsutil::set_mode(dir, mode)
+        .with_context(|| format!("setting mode on {what} {}", dir.display()))?;
+    if let Some(root) = first_missing {
+        rollback.created_dir(root);
+    }
+    Ok(())
+}
+
+/// Copy the bridge into `%LOCALAPPDATA%\Programs\wsl-webauthn-pam\` and return its WSL path.
+fn provision_bridge(
+    interop: &dyn InteropRunner,
+    win_mnt: &Path,
+    source: &Path,
+    rollback: &mut Rollback,
+) -> anyhow::Result<PathBuf> {
+    let local = resolve_local_appdata(interop, win_mnt)?;
+    let dest_win = confparse::windows_join(&local, WIN_BRIDGE_SUBPATH);
+    let dest_win = confparse::windows_join(&dest_win, &[BRIDGE_EXE]);
+    let dest = confparse::windows_to_wsl(&dest_win, win_mnt);
+
+    fsutil::refuse_symlink(&dest, "bridge destination")?;
+    let parent = dest
+        .parent()
+        .ok_or_else(|| anyhow!("bridge destination has no parent: {}", dest.display()))?;
+    ensure_dir(parent, 0o755, rollback, "bridge directory")?;
+
+    fsutil::copy_file_atomic(source, &dest, BRIDGE_MODE)
+        .with_context(|| format!("installing the bridge to {}", dest.display()))?;
+    rollback.created_file(dest.clone());
+
+    let hash = sha256_file(&dest).unwrap_or_default();
+    println!(
+        "  bridge:      {} (sha256 {})",
+        dest.display(),
+        short_hash(&hash)
+    );
+    Ok(dest)
+}
+
+/// Write `/etc/wsl_webauthn/config` and create `credentials/` (`0700`).
+fn provision_config(
+    paths: &InstallPaths,
+    win_mnt: &Path,
+    bridge_path: &Path,
+    rollback: &mut Rollback,
+) -> anyhow::Result<()> {
+    ensure_dir(&paths.etc_wsl_webauthn, 0o755, rollback, "config directory")?;
+    let toml = config_toml(bridge_path, win_mnt);
+    let config = paths.config_path();
+    fsutil::atomic_write(&config, toml.as_bytes(), CONFIG_MODE)
+        .with_context(|| format!("writing {}", config.display()))?;
+    rollback.created_file(config.clone());
+    println!("  config:      {}", config.display());
+
+    let creds = paths.credentials_dir();
+    ensure_dir(&creds, DIR_MODE, rollback, "credentials directory")?;
+    println!("  credentials: {}", creds.display());
+    Ok(())
+}
+
+/// Install `pam_wsl_webauthn.so` with mode `0644`.
+fn provision_module(
+    module_dir: &Path,
+    source: &Path,
+    rollback: &mut Rollback,
+) -> anyhow::Result<PathBuf> {
+    let dest = module_dir.join(MODULE_NAME);
+    fsutil::copy_file_atomic(source, &dest, MODULE_MODE)
+        .with_context(|| format!("installing the module to {}", dest.display()))?;
+    rollback.created_file(dest.clone());
+    println!("  module:      {}", dest.display());
+    Ok(dest)
+}
+
+/// Install the `pam-configs` profile with the embedded bytes.
+fn provision_profile(paths: &InstallPaths, rollback: &mut Rollback) -> anyhow::Result<PathBuf> {
+    ensure_dir(&paths.pam_configs, 0o755, rollback, "pam-configs directory")?;
+    let dest = paths.profile_path();
+    fsutil::atomic_write(&dest, PROFILE_TEXT.as_bytes(), PROFILE_MODE)
+        .with_context(|| format!("installing the profile to {}", dest.display()))?;
+    rollback.created_file(dest.clone());
+    println!("  profile:     {}", dest.display());
+    Ok(dest)
+}
+
+/// Verify the freshly written artifacts: profile bytes, module type/mode, config parse.
+fn verify_installed(
+    paths: &InstallPaths,
+    module_dir: &Path,
+    profile: &Path,
+    bridge: &Path,
+) -> anyhow::Result<()> {
+    let installed = fsutil::read_nofollow(profile)
+        .with_context(|| format!("re-reading {}", profile.display()))?;
+    if installed != PROFILE_TEXT.as_bytes() {
+        bail!(
+            "verification failed: {} does not match the embedded pam-config",
+            profile.display()
+        );
+    }
+    let module = module_dir.join(MODULE_NAME);
+    let md = fsutil::lstat_opt(&module)?.ok_or_else(|| {
+        anyhow!(
+            "verification failed: module missing at {}",
+            module.display()
+        )
+    })?;
+    if !md.is_file() {
+        bail!(
+            "verification failed: {} is not a regular file",
+            module.display()
+        );
+    }
+    if fsutil::mode_of(&md) != MODULE_MODE {
+        bail!(
+            "verification failed: {} has mode {:o}, expected {:o}",
+            module.display(),
+            fsutil::mode_of(&md),
+            MODULE_MODE
+        );
+    }
+    if fsutil::lstat_opt(bridge)?.is_none() {
+        bail!(
+            "verification failed: bridge missing at {}",
+            bridge.display()
+        );
+    }
+    let store = Store::with_owner(&paths.etc_wsl_webauthn, paths.owner_uid);
+    store.load_config().map_err(|e| {
+        anyhow!(
+            "verification failed: {} is not a valid store config: {e}",
+            paths.config_path().display()
+        )
+    })?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Legacy migration (D7)
+// ---------------------------------------------------------------------------
+
+/// A detected legacy WSL-Hello-sudo installation.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Legacy {
+    /// Legacy module files found.
+    pub modules: Vec<PathBuf>,
+    /// The legacy config directory, if present.
+    pub config_dir: Option<PathBuf>,
+    /// The legacy `pam-configs` profile, if present.
+    pub profile: Option<PathBuf>,
+}
+
+impl Legacy {
+    fn is_present(&self) -> bool {
+        !self.modules.is_empty() || self.config_dir.is_some() || self.profile.is_some()
+    }
+}
+
+/// Detect the legacy module in every candidate security directory.
+pub(crate) fn detect_legacy(paths: &InstallPaths) -> Legacy {
+    let mut modules = Vec::new();
+    let mut push = |dir: &Path| {
+        let candidate = dir.join(LEGACY_MODULE_NAME);
+        if fsutil::lstat_opt(&candidate).ok().flatten().is_some() {
+            modules.push(candidate);
+        }
+    };
+    for root in &paths.module_search_roots {
+        push(&root.join("security"));
+        if let Ok(entries) = std::fs::read_dir(root) {
+            let mut subdirs: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect();
+            subdirs.sort();
+            for subdir in subdirs {
+                push(&subdir.join("security"));
+            }
+        }
+    }
+    modules.sort();
+    modules.dedup();
+
+    Legacy {
+        modules,
+        config_dir: fsutil::lstat_opt(&paths.legacy_config_dir)
+            .ok()
+            .flatten()
+            .map(|_| paths.legacy_config_dir.clone()),
+        profile: fsutil::lstat_opt(&paths.legacy_profile_path())
+            .ok()
+            .flatten()
+            .map(|_| paths.legacy_profile_path()),
+    }
+}
+
+/// Rewrite `/etc/pam.d/*` references from `pam_wsl_hello` to `pam_wsl_webauthn.so`.
+///
+/// Runs **before** any old-module removal (a stale reference means a load failure and a
+/// lockout). Each file is confirmed individually, a timestamped copy is made first
+/// (mode-preserved), and the rewrite is atomic. Symlinked files are skipped with a
+/// warning (never edited through a link). Idempotent: a second run finds no legacy
+/// references and does nothing.
+///
+/// This runs *after* [`Rollback::commit`], so a later failure can never roll the rewrite
+/// back into the stale `pam_wsl_hello` state.
+fn migrate_rewrite_pam_d(paths: &InstallPaths, prompter: &dyn Prompter) -> anyhow::Result<usize> {
+    if !paths.pam_d.is_dir() {
+        return Ok(0);
+    }
+    let entries = std::fs::read_dir(&paths.pam_d)
+        .with_context(|| format!("reading {}", paths.pam_d.display()))?;
+    let mut files: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    files.sort();
+
+    let mut rewritten = 0usize;
+    for path in files {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if name.contains(fsutil::TEMP_MARKER) || name.contains(fsutil::BACKUP_MARKER) {
+            continue;
+        }
+        let Some(md) = fsutil::lstat_opt(&path)? else {
+            continue;
+        };
+        if md.file_type().is_symlink() {
+            println!("  skipping symlinked pam.d file {}", path.display());
+            continue;
+        }
+        if !md.is_file() {
+            continue;
+        }
+        let original = match fsutil::read_nofollow(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("warning: could not read {}: {e}", path.display());
+                continue;
+            }
+        };
+        if !original
+            .windows(LEGACY_MODULE_STEM.len())
+            .any(|w| w == LEGACY_MODULE_STEM)
+        {
+            continue;
+        }
+        let updated = replace_all(&original, LEGACY_MODULE_STEM, MODULE_STEM);
+        if updated == original {
+            continue;
+        }
+        let question = format!(
+            "Rewrite pam_wsl_hello references in {} to pam_wsl_webauthn.so?",
+            path.display()
+        );
+        if !prompter.confirm(&question, true)? {
+            println!("  left {} unchanged", path.display());
+            continue;
+        }
+        let mode = fsutil::mode_of(&md);
+        let backup = backup_path(&path);
+        fsutil::atomic_write(&backup, &original, mode)
+            .with_context(|| format!("writing backup {}", backup.display()))?;
+        fsutil::atomic_write(&path, &updated, mode)
+            .with_context(|| format!("rewriting {}", path.display()))?;
+        println!("  rewrote {} (backup {})", path.display(), backup.display());
+        rewritten += 1;
+    }
+    Ok(rewritten)
+}
+
+/// Remove the legacy profile (`pam-auth-update --remove wsl-hello`), module files, and
+/// config directory, each behind a confirmation. The legacy PEM is never imported.
+fn migrate_remove_legacy(
+    legacy: &Legacy,
+    commands: &dyn CommandRunner,
+    prompter: &dyn Prompter,
+) -> anyhow::Result<()> {
+    if legacy.profile.is_some()
+        && prompter.confirm(
+            "Run `pam-auth-update --remove wsl-hello` to deregister the legacy profile?",
+            true,
+        )?
+    {
+        match commands.run("pam-auth-update", &["--remove", LEGACY_PROFILE_NAME]) {
+            Ok(status) if status.success => {
+                println!("  pam-auth-update --remove wsl-hello: done");
+            }
+            Ok(status) => eprintln!(
+                "warning: pam-auth-update --remove wsl-hello exited {:?}",
+                status.code
+            ),
+            Err(e) => eprintln!("warning: {e}"),
+        }
+    }
+    if let Some(profile) = &legacy.profile
+        && fsutil::lstat_opt(profile)?.is_some()
+        && prompter.confirm(
+            &format!("Remove the legacy profile file {}?", profile.display()),
+            true,
+        )?
+    {
+        match fsutil::remove_file(profile) {
+            Ok(()) => println!("  removed {}", profile.display()),
+            Err(e) => eprintln!("warning: could not remove {}: {e}", profile.display()),
+        }
+    }
+    for module in &legacy.modules {
+        if prompter.confirm(
+            &format!("Remove the legacy module {}?", module.display()),
+            true,
+        )? {
+            match fsutil::remove_file(module) {
+                Ok(()) => println!("  removed {}", module.display()),
+                Err(e) => eprintln!("warning: could not remove {}: {e}", module.display()),
+            }
+        }
+    }
+    if let Some(dir) = &legacy.config_dir
+        && prompter.confirm(
+            &format!("Remove the legacy config directory {}?", dir.display()),
+            true,
+        )?
+    {
+        match fsutil::remove_tree(dir) {
+            Ok(()) => println!("  removed {}", dir.display()),
+            Err(e) => eprintln!("warning: could not remove {}: {e}", dir.display()),
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Post-install guidance
+// ---------------------------------------------------------------------------
+
+/// Offer to enable the profile (default **no** — the profile is `Default: no`).
+fn offer_enable(commands: &dyn CommandRunner, prompter: &dyn Prompter) -> anyhow::Result<()> {
+    let enable = prompter.confirm(
+        "Enable the wsl-webauthn PAM profile now (`pam-auth-update --enable wsl-webauthn`)?",
+        false,
+    )?;
+    if enable {
+        match commands.run("pam-auth-update", &["--enable", PROFILE_NAME]) {
+            Ok(status) if status.success => {
+                println!("pam-auth-update --enable wsl-webauthn: done");
+            }
+            Ok(status) => eprintln!(
+                "warning: pam-auth-update --enable wsl-webauthn exited {:?}",
+                status.code
+            ),
+            Err(e) => eprintln!("warning: {e}"),
+        }
+    } else {
+        println!("Left the profile disabled (it is `Default: no`).");
+    }
+    Ok(())
+}
+
+/// Print the lockout guidance required by plan §10.8 / R5.
+fn print_lockout_guidance() {
+    println!();
+    println!("Lockout safety:");
+    println!("  * Keep at least one of `sudo`/`su` working with a password while you test.");
+    println!("  * The profile is not enabled automatically; run `sudo pam-auth-update` and");
+    println!("    select \"WSL WebAuthn authentication\" when you are ready.");
+    println!("  * Manual alternative (add to /etc/pam.d/common-auth above the password line):");
+    println!("        auth sufficient pam_wsl_webauthn.so");
+    println!("  * If sudo breaks, sign in on another TTY/console and remove that line.");
+}
+
+/// Print what the operator must do next.
+fn print_next_steps(enrolled: bool) {
+    println!();
+    if enrolled {
+        println!("Installation complete. Test with: sudo -k; sudo true");
+    } else {
+        println!("Installation complete, but no credential is enrolled yet.");
+        println!("Enroll one before relying on the module:  sudo wsl-webauthn-pam enroll");
+        println!("  (add --allow-unattested only on machines without a TPM-backed Hello)");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// install
+// ---------------------------------------------------------------------------
+
+/// Execute the install flow against `paths` with the injected seams.
+pub(crate) fn install_with(
+    paths: &InstallPaths,
+    interop: &dyn InteropRunner,
+    commands: &dyn CommandRunner,
+    prompter: &dyn Prompter,
+    enroller: &dyn Enroller,
+    opts: &InstallOptions,
+) -> anyhow::Result<i32> {
+    let win_mnt = resolve_win_mnt(paths, opts.win_mnt.as_deref());
+    let artifacts = resolve_artifacts(opts.artifact_dir.as_deref())?;
+    let module_dir = resolve_module_dir(paths, opts.module_dir.as_deref())?;
+
+    println!("wsl-webauthn-pam installer");
+    println!("  win_mnt:     {}", win_mnt.display());
+    println!("  module dir:  {}", module_dir.display());
+    println!("  module src:  {}", artifacts.module.display());
+    println!("  bridge src:  {}", artifacts.bridge.display());
+    println!();
+
+    let mut rollback = Rollback::new();
+
+    // 1. Windows bridge (must exist before enrollment, which pins it).
+    // A `whoami.exe` sanity check (plan §10.2): warn, do not abort — some hosts have
+    // interop enabled but a restricted whoami.
+    if let Err(e) = interop.run("whoami.exe", &[], &win_mnt, WHOAMI_DEADLINE) {
+        eprintln!("warning: interop sanity check (`whoami.exe`) failed: {e}");
+        eprintln!("         (continuing; the same interop is used for the bridge at enroll time)");
+    }
+    let bridge_dest = provision_bridge(interop, &win_mnt, &artifacts.bridge, &mut rollback)?;
+    // 2. Linux config + credentials dir.
+    provision_config(paths, &win_mnt, &bridge_dest, &mut rollback)?;
+    // 3. New module and profile FIRST (a stale reference would mean lockout).
+    let module_dest = provision_module(&module_dir, &artifacts.module, &mut rollback)?;
+    let profile_dest = provision_profile(paths, &mut rollback)?;
+    // 4. Verify before touching anything legacy.
+    verify_installed(paths, &module_dir, &profile_dest, &bridge_dest)?;
+    println!();
+    println!("Installed and verified {}.", module_dest.display());
+
+    // The provisioning is complete and verified. Commit the rollback here: every step
+    // after this point (legacy cleanup, prompts, enrollment) must never be undone by
+    // removing the module/profile we just installed.
+    rollback.commit();
+
+    // 5. Legacy migration, only after our module/profile are verified.
+    let legacy = detect_legacy(paths);
+    if legacy.is_present() {
+        println!();
+        println!("Legacy WSL-Hello-sudo installation detected:");
+        for module in &legacy.modules {
+            println!("  legacy module: {}", module.display());
+        }
+        if let Some(dir) = &legacy.config_dir {
+            println!("  legacy config: {}", dir.display());
+        }
+        if let Some(profile) = &legacy.profile {
+            println!("  legacy profile: {}", profile.display());
+        }
+        println!("The legacy PEM trust anchor is NEVER imported; a fresh enrollment is required.");
+        // (a) rewrite /etc/pam.d references BEFORE any old-module removal.
+        let rewritten = migrate_rewrite_pam_d(paths, prompter)?;
+        if rewritten > 0 {
+            println!("Rewrote {rewritten} pam.d file(s).");
+        }
+        // (b)/(c) deregister the profile and remove the old module/config.
+        migrate_remove_legacy(&legacy, commands, prompter)?;
+        println!();
+        println!("Legacy cleanup complete. A FRESH enrollment is required (old credentials");
+        println!("are not migrated): run `sudo wsl-webauthn-pam enroll`.");
+    }
+
+    // 6. Offer to enable the profile, print lockout guidance, then offer enrollment LAST.
+    println!();
+    offer_enable(commands, prompter)?;
+    print_lockout_guidance();
+
+    if opts.skip_enroll {
+        print_next_steps(false);
+        return Ok(EXIT_OK);
+    }
+
+    println!();
+    let enroll_now = prompter.confirm(
+        "Enroll a Windows Hello credential NOW for the invoking user?",
+        true,
+    )?;
+    if !enroll_now {
+        print_next_steps(false);
+        return Ok(EXIT_OK);
+    }
+
+    // Invoke the enrollment logic in-process. The config and bridge installed above are
+    // what `cmd_enroll` resolves.
+    println!();
+    match enroller.enroll(opts.allow_unattested) {
+        Ok(code) => {
+            if code == EXIT_OK {
+                print_next_steps(true);
+            }
+            Ok(code)
+        }
+        Err(error) => {
+            eprintln!("warning: enrollment failed: {error:#}");
+            print_next_steps(false);
+            Ok(EXIT_FAIL)
+        }
+    }
+}
+
+/// Production entry point for `install`.
+pub(crate) fn cmd_install(
+    opts: InstallOptions,
+    assume_yes: bool,
+    non_interactive: bool,
+) -> anyhow::Result<i32> {
+    crate::require_root("install")?;
+    let paths = InstallPaths::system();
+    let prompter = StdPrompter {
+        assume_yes,
+        non_interactive,
+    };
+    install_with(
+        &paths,
+        &RealInterop,
+        &RealCommands,
+        &prompter,
+        &RealEnroller,
+        &opts,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// uninstall
+// ---------------------------------------------------------------------------
+
+/// Remove one user's credential record (shared by `unregister` and `uninstall`).
+///
+/// Never touches another user's record (SR-20). Returns [`EXIT_OK`] if a record was
+/// removed, [`EXIT_FAIL`] if there was nothing to do.
+pub(crate) fn uninstall_user(
+    store: &Store,
+    name: &str,
+    yes: bool,
+    prompter: &dyn Prompter,
+) -> anyhow::Result<i32> {
+    let existing = match store.load(name) {
+        Ok(record) => Some(record),
+        Err(wsl_webauthn_store::StoreError::NotFound { .. }) => None,
+        Err(error) => {
+            eprintln!("warning: could not read the existing record: {error}");
+            None
+        }
+    };
+    if existing.is_none() && !yes {
+        bail!("no credential record for \"{name}\"");
+    }
+
+    println!("About to remove the credential for \"{name}\".");
+    if let Some(record) = &existing {
+        if let Some(identity) = &record.windows_identity
+            && !identity.account.is_empty()
+        {
+            println!("  windows account: {}", identity.account);
+        }
+        println!("  enrolled at:     {}", record.enrolled_at);
+    } else {
+        println!("  (no readable record; removal will be a no-op if absent)");
+    }
+
+    if !prompter.confirm("Remove this credential?", false)? {
+        println!("Aborted.");
+        return Ok(EXIT_FAIL);
+    }
+    match store.remove(name) {
+        Ok(true) => {
+            println!("Removed the credential for \"{name}\".");
+            Ok(EXIT_OK)
+        }
+        Ok(false) => {
+            println!("No credential record for \"{name}\" (nothing to do).");
+            Ok(EXIT_FAIL)
+        }
+        Err(error) => bail!("failed to remove credential: {error}"),
+    }
+}
+
+/// Find installed copies of our module under the module search roots.
+fn find_installed_modules(paths: &InstallPaths, explicit: Option<&Path>) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut probe = |dir: &Path| {
+        let candidate = dir.join(MODULE_NAME);
+        if fsutil::lstat_opt(&candidate).ok().flatten().is_some() {
+            found.push(candidate);
+        }
+    };
+    if let Some(dir) = explicit {
+        probe(dir);
+    }
+    for root in &paths.module_search_roots {
+        probe(&root.join("security"));
+        if let Ok(entries) = std::fs::read_dir(root) {
+            let mut subdirs: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect();
+            subdirs.sort();
+            for subdir in subdirs {
+                probe(&subdir.join("security"));
+            }
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// Resolve the Windows bridge directory (`%LOCALAPPDATA%\Programs\wsl-webauthn-pam`).
+fn win_bridge_dir(interop: &dyn InteropRunner, win_mnt: &Path) -> anyhow::Result<PathBuf> {
+    let local = resolve_local_appdata(interop, win_mnt)?;
+    let dest_win = confparse::windows_join(&local, WIN_BRIDGE_SUBPATH);
+    Ok(confparse::windows_to_wsl(&dest_win, win_mnt))
+}
+
+/// Warn (never edit) if `/etc/pam.d` still references our module.
+fn warn_pam_d_references(paths: &InstallPaths) {
+    if !paths.pam_d.is_dir() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&paths.pam_d) else {
+        return;
+    };
+    let mut hits: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(md) = fsutil::lstat_opt(&path).ok().flatten() else {
+            continue;
+        };
+        if !md.is_file() || md.file_type().is_symlink() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if name.contains(fsutil::BACKUP_MARKER) || name.contains(fsutil::TEMP_MARKER) {
+            continue;
+        }
+        if let Ok(bytes) = fsutil::read_nofollow(&path)
+            && bytes.windows(MODULE_STEM.len()).any(|w| w == MODULE_STEM)
+        {
+            hits.push(path);
+        }
+    }
+    if !hits.is_empty() {
+        eprintln!();
+        eprintln!("WARNING: /etc/pam.d still references pam_wsl_webauthn.so:");
+        for path in hits {
+            eprintln!("  {}", path.display());
+        }
+        eprintln!("Fix these by hand (or run `pam-auth-update`) before relying on sudo/su.");
+    }
+}
+
+/// Execute a full uninstall against `paths`.
+pub(crate) fn uninstall_all(
+    paths: &InstallPaths,
+    interop: &dyn InteropRunner,
+    commands: &dyn CommandRunner,
+    prompter: &dyn Prompter,
+    opts: &UninstallOptions,
+) -> anyhow::Result<i32> {
+    let win_mnt = resolve_win_mnt(paths, opts.win_mnt.as_deref());
+    println!("wsl-webauthn-pam uninstaller");
+    println!("This removes the PAM profile, module, Linux config, and the Windows bridge.");
+
+    if !prompter.confirm(
+        "Remove ALL wsl-webauthn-pam components? This cannot be undone.",
+        false,
+    )? {
+        println!("Aborted.");
+        return Ok(EXIT_FAIL);
+    }
+
+    // 1. Profile: pam-auth-update --remove, then the file.
+    let profile = paths.profile_path();
+    if fsutil::lstat_opt(&profile)?.is_some() {
+        if prompter.confirm("Run `pam-auth-update --remove wsl-webauthn`?", true)? {
+            match commands.run("pam-auth-update", &["--remove", PROFILE_NAME]) {
+                Ok(status) if status.success => {
+                    println!("  pam-auth-update --remove wsl-webauthn: done");
+                }
+                Ok(status) => eprintln!(
+                    "warning: pam-auth-update --remove wsl-webauthn exited {:?}",
+                    status.code
+                ),
+                Err(e) => eprintln!("warning: {e}"),
+            }
+        }
+        if fsutil::lstat_opt(&profile)?.is_some() {
+            fsutil::remove_file(&profile)?;
+            println!("  removed {}", profile.display());
+        }
+    } else {
+        println!("  profile not installed");
+    }
+
+    // 2. Module(s).
+    for module in find_installed_modules(paths, opts.module_dir.as_deref()) {
+        if prompter.confirm(&format!("Remove {}?", module.display()), true)? {
+            fsutil::remove_file(&module)?;
+            println!("  removed {}", module.display());
+        }
+    }
+
+    // 3. Linux config dir.
+    if fsutil::lstat_opt(&paths.etc_wsl_webauthn)?.is_some()
+        && prompter.confirm(
+            &format!(
+                "Remove the Linux config directory {} (including credentials)?",
+                paths.etc_wsl_webauthn.display()
+            ),
+            true,
+        )?
+    {
+        fsutil::remove_tree(&paths.etc_wsl_webauthn)?;
+        println!("  removed {}", paths.etc_wsl_webauthn.display());
+    }
+
+    // 4. Windows bridge directory (best effort; report failures).
+    match win_bridge_dir(interop, &win_mnt) {
+        Ok(dir) => {
+            if fsutil::lstat_opt(&dir)?.is_some() {
+                if prompter.confirm(
+                    &format!("Remove the Windows bridge directory {}?", dir.display()),
+                    true,
+                )? {
+                    match fsutil::remove_tree(&dir) {
+                        Ok(()) => println!("  removed {}", dir.display()),
+                        Err(e) => eprintln!(
+                            "warning: could not remove the Windows bridge directory {}: {e}",
+                            dir.display()
+                        ),
+                    }
+                }
+            } else {
+                println!("  Windows bridge directory not present");
+            }
+        }
+        Err(e) => eprintln!("warning: could not resolve the Windows bridge directory: {e}"),
+    }
+
+    // 5. Never auto-edit on uninstall: warn about leftover /etc/pam.d references.
+    warn_pam_d_references(paths);
+
+    // 6. The legacy /etc/pam_wsl_hello is NEVER removed (it is not ours).
+    println!();
+    println!("Done. The legacy /etc/pam_wsl_hello (if any) was left untouched.");
+    Ok(EXIT_OK)
+}
+
+/// Production entry point for `uninstall`.
+pub(crate) fn cmd_uninstall(
+    user: Option<String>,
+    all: bool,
+    yes: bool,
+    win_mnt: Option<PathBuf>,
+    module_dir: Option<PathBuf>,
+    non_interactive: bool,
+) -> anyhow::Result<i32> {
+    crate::require_root("uninstall")?;
+    let prompter = StdPrompter {
+        assume_yes: yes,
+        non_interactive,
+    };
+    if all {
+        let paths = InstallPaths::system();
+        let opts = UninstallOptions {
+            win_mnt,
+            module_dir,
+        };
+        uninstall_all(&paths, &RealInterop, &RealCommands, &prompter, &opts)
+    } else {
+        let target = crate::resolve_target_user(user)?;
+        uninstall_user(&Store::system(), &target.name, yes, &prompter)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// helpers shared with tests
+// ---------------------------------------------------------------------------
+
+/// Lowercase hex SHA-256 of a file.
+fn sha256_file(path: &Path) -> anyhow::Result<String> {
+    use sha2::{Digest as _, Sha256};
+    let bytes = std::fs::read(path)?;
+    Ok(hex(&Sha256::digest(&bytes)))
+}
+
+/// Lowercase hex.
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// A short preview of a hex digest.
+fn short_hash(hex: &str) -> String {
+    let preview: String = hex.chars().take(12).collect();
+    if hex.len() > 12 {
+        format!("{preview}…")
+    } else {
+        preview
+    }
+}
+
+#[cfg(test)]
+mod tests;
