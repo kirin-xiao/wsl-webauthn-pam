@@ -6,6 +6,12 @@ members = ["crates/*"]
 # nightly-only libFuzzer targets.
 exclude = ["fuzz"]
 
+# Build requirement: `wsl-webauthn-pam` maps a panic to `PAM_ABORT` via
+# `catch_unwind`, and `wsl-webauthn-bridge` must report failures gracefully.
+# Both require unwinding panics; do NOT set `panic = "abort"` in any profile.
+# Each of those crate roots carries a `#[cfg(not(panic = "unwind"))]
+# compile_error!` guard so an aborting profile fails the build instead.
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"

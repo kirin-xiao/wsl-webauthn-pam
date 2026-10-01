@@ -78,6 +78,20 @@
 
 #![warn(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
+// The module's `unsafe` surface is the PAM C ABI: the six exported `pam_sm_*`
+// entry points plus the raw bindings. Those items carry a documented
+// `#[allow(unsafe_code)]`; everything else must stay safe.
+#![deny(unsafe_code)]
+
+// The module maps a panic in Rust code to `PAM_ABORT` via `catch_unwind`
+// (fail-closed). With `panic = "abort"` that mapping is silently lost and a
+// panic would unwind across the FFI boundary / abort the host process. Require
+// unwinding panics in every profile.
+#[cfg(not(panic = "unwind"))]
+compile_error!(
+    "wsl-webauthn-pam must be built with panic=unwind; panic=abort would disable \
+     the catch_unwind -> PAM_ABORT fail-closed mapping across the PAM FFI boundary"
+);
 
 pub mod args;
 pub mod bindings;
@@ -119,6 +133,7 @@ where
 /// # Safety
 ///
 /// `argv` must be null or point at `argc` valid `const char *` entries.
+#[allow(unsafe_code)] // raw C string array marshalling (PAM ABI)
 unsafe fn collect_args(argc: c_int, argv: *const *const c_char) -> Vec<String> {
     if argv.is_null() || argc <= 0 {
         return Vec::new();
@@ -145,6 +160,7 @@ unsafe fn collect_args(argc: c_int, argv: *const *const c_char) -> Vec<String> {
 /// The function is deliberately *not* marked `unsafe`: it has the C ABI libpam
 /// requires, and Rust's `unsafe fn` marker would not be visible to the PAM stack.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[allow(unsafe_code)] // PAM C ABI entry point
 #[unsafe(no_mangle)]
 pub extern "C" fn pam_sm_authenticate(
     pamh: *mut pam_handle_t,
@@ -167,6 +183,7 @@ pub extern "C" fn pam_sm_authenticate(
 /// # Safety
 ///
 /// `pamh` must be a valid `pam_handle_t *` supplied by libpam.
+#[allow(unsafe_code)] // PAM C ABI entry point
 #[unsafe(no_mangle)]
 pub extern "C" fn pam_sm_setcred(
     _pamh: *mut pam_handle_t,
@@ -182,6 +199,7 @@ pub extern "C" fn pam_sm_setcred(
 /// # Safety
 ///
 /// `pamh` must be a valid `pam_handle_t *` supplied by libpam.
+#[allow(unsafe_code)] // PAM C ABI entry point
 #[unsafe(no_mangle)]
 pub extern "C" fn pam_sm_acct_mgmt(
     _pamh: *mut pam_handle_t,
@@ -197,6 +215,7 @@ pub extern "C" fn pam_sm_acct_mgmt(
 /// # Safety
 ///
 /// `pamh` must be a valid `pam_handle_t *` supplied by libpam.
+#[allow(unsafe_code)] // PAM C ABI entry point
 #[unsafe(no_mangle)]
 pub extern "C" fn pam_sm_open_session(
     _pamh: *mut pam_handle_t,
@@ -212,6 +231,7 @@ pub extern "C" fn pam_sm_open_session(
 /// # Safety
 ///
 /// `pamh` must be a valid `pam_handle_t *` supplied by libpam.
+#[allow(unsafe_code)] // PAM C ABI entry point
 #[unsafe(no_mangle)]
 pub extern "C" fn pam_sm_close_session(
     _pamh: *mut pam_handle_t,
@@ -227,6 +247,7 @@ pub extern "C" fn pam_sm_close_session(
 /// # Safety
 ///
 /// `pamh` must be a valid `pam_handle_t *` supplied by libpam.
+#[allow(unsafe_code)] // PAM C ABI entry point
 #[unsafe(no_mangle)]
 pub extern "C" fn pam_sm_chauthtok(
     _pamh: *mut pam_handle_t,
