@@ -313,12 +313,12 @@ fn negative_tpm_format_without_tpm_fields() {
 // packed self-attestation
 // ---------------------------------------------------------------------------
 
-fn self_attestation(key: &TestKey) -> Fixture {
+fn self_attestation(key: &TestKey, aaguid: [u8; 16]) -> Fixture {
     let challenge = vec![0x78u8; 32];
     let credential_id = b"self-cred".to_vec();
     let client_data_json = client_data(ClientDataKind::Create, &challenge);
     let attested = AttestedData {
-        aaguid: AAGUID_ALLOWED,
+        aaguid,
         credential_id: credential_id.clone(),
         cose_public_key: key.cose.clone(),
     };
@@ -334,14 +334,14 @@ fn self_attestation(key: &TestKey) -> Fixture {
         client_data_json,
         attestation_object,
         root_fingerprint: [0u8; 32],
-        aaguid: AAGUID_ALLOWED,
+        aaguid,
         auth_data,
     }
 }
 
 #[test]
 fn negative_self_attestation_under_strict() {
-    let f = self_attestation(&es256());
+    let f = self_attestation(&es256(), AAGUID_ALLOWED);
     assert_eq!(
         verify(&f, AttestationPolicy::Strict),
         Err(VerifyError::AttestationNotAllowed)
@@ -349,9 +349,20 @@ fn negative_self_attestation_under_strict() {
 }
 
 #[test]
+fn negative_self_attestation_aaguid_not_in_allowlist() {
+    // Under `AllowUnattested` the self-attested `packed` arm must still enforce the
+    // AAGUID allow-list; a disallowed AAGUID cannot slip through by avoiding `x5c`.
+    let f = self_attestation(&es256(), AAGUID_DISALLOWED);
+    assert_eq!(
+        verify(&f, AttestationPolicy::AllowUnattested),
+        Err(VerifyError::AaguidNotAllowed)
+    );
+}
+
+#[test]
 fn positive_self_attestation_under_allow_unattested() {
     let key = es256();
-    let f = self_attestation(&key);
+    let f = self_attestation(&key, AAGUID_ALLOWED);
     let outcome = verify(&f, AttestationPolicy::AllowUnattested).expect("self allowed");
     assert_eq!(outcome.attestation.mode, AttestationMode::SelfAttested);
     assert_eq!(outcome.attestation.format, "packed");
@@ -394,7 +405,7 @@ fn negative_self_attestation_alg_mismatch() {
 #[test]
 fn negative_self_attestation_bad_signature() {
     let key = es256();
-    let f = self_attestation(&key);
+    let f = self_attestation(&key, AAGUID_ALLOWED);
     // Corrupt the signature inside attStmt by rebuilding the object.
     let obj = rewrite_att_stmt_sig(&f.attestation_object);
     let policy = AttestationPolicy::AllowUnattested;
@@ -413,13 +424,16 @@ fn negative_self_attestation_bad_signature() {
 // none attestation
 // ---------------------------------------------------------------------------
 
-fn none_attestation(stmt: Vec<(ciborium::value::Value, ciborium::value::Value)>) -> Fixture {
+fn none_attestation(
+    stmt: Vec<(ciborium::value::Value, ciborium::value::Value)>,
+    aaguid: [u8; 16],
+) -> Fixture {
     let key = es256();
     let challenge = vec![0x7au8; 32];
     let credential_id = b"none-cred".to_vec();
     let client_data_json = client_data(ClientDataKind::Create, &challenge);
     let attested = AttestedData {
-        aaguid: AAGUID_ALLOWED,
+        aaguid,
         credential_id: credential_id.clone(),
         cose_public_key: key.cose.clone(),
     };
@@ -431,14 +445,14 @@ fn none_attestation(stmt: Vec<(ciborium::value::Value, ciborium::value::Value)>)
         client_data_json,
         attestation_object,
         root_fingerprint: [0u8; 32],
-        aaguid: AAGUID_ALLOWED,
+        aaguid,
         auth_data,
     }
 }
 
 #[test]
 fn negative_none_under_strict() {
-    let f = none_attestation(vec![]);
+    let f = none_attestation(vec![], AAGUID_ALLOWED);
     assert_eq!(
         verify(&f, AttestationPolicy::Strict),
         Err(VerifyError::AttestationNotAllowed)
@@ -446,18 +460,32 @@ fn negative_none_under_strict() {
 }
 
 #[test]
+fn negative_none_aaguid_not_in_allowlist() {
+    // `none` is admitted under `AllowUnattested`, but the AAGUID allow-list still runs:
+    // an attacker-chosen AAGUID must not be accepted or persisted.
+    let f = none_attestation(vec![], AAGUID_DISALLOWED);
+    assert_eq!(
+        verify(&f, AttestationPolicy::AllowUnattested),
+        Err(VerifyError::AaguidNotAllowed)
+    );
+}
+
+#[test]
 fn positive_none_under_allow_unattested() {
-    let f = none_attestation(vec![]);
+    let f = none_attestation(vec![], AAGUID_ALLOWED);
     let outcome = verify(&f, AttestationPolicy::AllowUnattested).expect("none allowed");
     assert_eq!(outcome.attestation.mode, AttestationMode::None);
 }
 
 #[test]
 fn negative_none_with_nonempty_attstmt() {
-    let f = none_attestation(vec![(
-        ciborium::value::Value::from("alg"),
-        ciborium::value::Value::from(-7i64),
-    )]);
+    let f = none_attestation(
+        vec![(
+            ciborium::value::Value::from("alg"),
+            ciborium::value::Value::from(-7i64),
+        )],
+        AAGUID_ALLOWED,
+    );
     assert_eq!(
         verify(&f, AttestationPolicy::AllowUnattested),
         Err(VerifyError::InvalidAttestationStatement)
@@ -740,10 +768,18 @@ struct TpmFixture {
 }
 
 fn tpm_fixture(sig_scheme: TpmSig, name_alg: u16) -> TpmFixture {
+    tpm_fixture_with_opts(sig_scheme, name_alg, ChainOptions::default())
+}
+
+fn tpm_fixture_with_opts(
+    sig_scheme: TpmSig,
+    name_alg: u16,
+    chain_opts: ChainOptions,
+) -> TpmFixture {
     let credential = es256();
     let aik = rsa_aik();
     let aik_test_key = rsa_test_key(&aik);
-    let chain = build_tpm_chain(&aik_test_key, &ChainOptions::default());
+    let chain = build_tpm_chain(&aik_test_key, &chain_opts);
     let e = tpm_enrollment(&credential, &aik, &chain, sig_scheme, name_alg);
     TpmFixture {
         challenge: e.challenge,
@@ -1065,6 +1101,57 @@ fn negative_tpm_aik_subject_not_empty() {
         verify_attestation_with_anchor(&check, &policy, &e.root_fingerprint),
         Err(VerifyError::TpmAikSubjectNotEmpty)
     );
+}
+
+#[test]
+fn negative_tpm_aik_eku_missing() {
+    // An AIK leaf without the TCG AIK Extended Key Usage (2.23.133.8.3) is not a
+    // WebAuthn §8.3.1 certificate and must be rejected.
+    let f = tpm_fixture_with_opts(
+        TpmSig::Rs1,
+        tpm_alg::SHA1,
+        ChainOptions {
+            include_aik_eku: false,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        verify_tpm(&f, AttestationPolicy::Strict),
+        Err(VerifyError::TpmAikEkuMissing)
+    );
+}
+
+#[test]
+fn negative_tpm_aik_key_usage_forbids_signature() {
+    // The AIK signs `certInfo`; a leaf whose KeyUsage extension is present but omits
+    // `digitalSignature` must be rejected even though it carries the AIK EKU.
+    let f = tpm_fixture_with_opts(
+        TpmSig::Rs1,
+        tpm_alg::SHA1,
+        ChainOptions {
+            aik_key_usage_forbids_signature: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        verify_tpm(&f, AttestationPolicy::Strict),
+        Err(VerifyError::TpmAikKeyUsageForbidsSignature)
+    );
+}
+
+#[test]
+fn positive_tpm_aik_no_key_usage_extension() {
+    // RFC 5280: an absent KeyUsage imposes no restriction. The AIK leaf still has
+    // the required AIK EKU, so it must verify.
+    let f = tpm_fixture_with_opts(
+        TpmSig::Rs1,
+        tpm_alg::SHA1,
+        ChainOptions {
+            omit_aik_key_usage: true,
+            ..Default::default()
+        },
+    );
+    verify_tpm(&f, AttestationPolicy::Strict).expect("absent KeyUsage is unconstrained");
 }
 
 #[test]

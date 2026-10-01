@@ -149,10 +149,19 @@ suite substitute a synthetic root; it cannot weaken the production path.
 
 - `tpm` (§8.3): `ver == "2.0"`, `certInfo` magic/type, `extraData ==
   H(authData ‖ clientDataHash)`, `name` recomputed from `pubArea`, AIK `sig`
-  over `certInfo`, chain to the pinned root.
+  over `certInfo`, chain to the pinned root; AIK leaf v3, empty Subject,
+  `CA=false`, TCG AIK Extended Key Usage (`2.23.133.8.3`) and a KeyUsage, when
+  present, permitting `digitalSignature`. The TCG SubjectAltName content is not
+  validated (documented gap; Windows Hello's AIK SAN uses a non-standard
+  critical `directoryName` encoding).
 - `packed`/AttCA: chain to the pinned root, leaf v3, `CA=false`,
   `OU="Authenticator Attestation"`, `id-fido-gen-ce-aaguid` matching the
   authData AAGUID, `attStmt.alg` == leaf key alg.
+- AAGUID allow-list: the authData AAGUID must be one of `STRICT_AAGUIDS` on
+  **every** attestation path. It is checked once, before the format/policy
+  dispatch, so self and `none` (admitted under `AllowUnattested`) cannot bypass
+  it. Assertions do not enforce an AAGUID allow-list; the assertion path does not
+  trust or compare an AAGUID.
 - Self/`none` attestation: admitted **only** under explicit
   `AttestationPolicy::AllowUnattested` — never a silent fallback. The policy is
   permissive, not prescriptive: a fully verified `tpm`/`packed` attestation is

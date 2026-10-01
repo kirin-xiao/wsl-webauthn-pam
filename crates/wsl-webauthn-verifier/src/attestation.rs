@@ -14,8 +14,11 @@
 //! * `none`: an empty attestation statement; accepted **only** under
 //!   [`AttestationPolicy::AllowUnattested`].
 //!
-//! Any other format is rejected outright. In every case the authData AAGUID must be on
-//! [`crate::STRICT_AAGUIDS`].
+//! Any other format is rejected outright. The authData AAGUID must be on
+//! [`crate::STRICT_AAGUIDS`] on **every** attestation path — it is checked once, before
+//! the format/policy dispatch below, so no arm (including self-attested `packed` and
+//! `none` under [`AttestationPolicy::AllowUnattested`]) can return an outcome for a
+//! disallowed AAGUID.
 
 use std::time::SystemTime;
 
@@ -29,7 +32,7 @@ use crate::clientdata;
 use crate::cose;
 use crate::error::VerifyError;
 use crate::tpm;
-use crate::{AttestationMetadata, AttestationMode, AttestationPolicy};
+use crate::{AttestationMetadata, AttestationMode, AttestationPolicy, STRICT_AAGUIDS};
 use wsl_webauthn_protocol::ClientDataKind;
 
 /// Verify a registration ceremony and return the enrollment outcome.
@@ -71,6 +74,17 @@ pub(crate) fn verify(
     // 3. authenticatorData: fixed prefix (rpIdHash + UP + UV) then attested data.
     let prefix = parse_and_validate_prefix(auth_data)?;
     let attested = parse_attested_credential_data(auth_data)?;
+
+    // 3a. The authData AAGUID must be on the strict allow-list. The AAGUID is a
+    //     property of the authenticator, not of the attestation format, so it is
+    //     enforced here — before any policy arm or format dispatch can return an
+    //     outcome. Self-attested `packed` and `none` (admitted only under
+    //     `AllowUnattested`) are therefore held to the same allow-list as
+    //     `packed`/`tpm` with `x5c`; the allow-list cannot be bypassed by choosing a
+    //     weaker format.
+    if !STRICT_AAGUIDS.contains(&attested.aaguid) {
+        return Err(VerifyError::AaguidNotAllowed);
+    }
 
     // 4. Cross-check the bridge-reported credential id against the attested one.
     if reported_credential_id != attested.credential_id {

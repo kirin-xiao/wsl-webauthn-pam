@@ -1349,6 +1349,33 @@ fn cmd_verify() -> anyhow::Result<i32> {
         return Ok(EXIT_FAIL);
     }
 
+    // ---- negative control: a disallowed AAGUID must be rejected even under
+    // `--allow-unattested`. This self-attestation follows the exact same path as the
+    // positive one, so it proves the allow-list is enforced before any policy/format
+    // arm can return an outcome.
+    let disallowed_aaguid = [0xAAu8; 16];
+    let bad_auth_data = attested_auth_data(&cose_key, &credential_id, &disallowed_aaguid);
+    let bad_att_to_be_signed = {
+        let mut buf = bad_auth_data.clone();
+        buf.extend_from_slice(&Sha256::digest(&enroll_client_data));
+        buf
+    };
+    let bad_sig: p256::ecdsa::DerSignature = signing_key.sign(&bad_att_to_be_signed);
+    let bad_object = packed_self_attestation(&bad_auth_data, bad_sig.as_bytes())?;
+    let bad_check = EnrollCheck::new(
+        &enroll_challenge,
+        &bad_object,
+        &enroll_client_data,
+        &credential_id,
+    );
+    match verify_attestation(&bad_check, &AttestationPolicy::AllowUnattested) {
+        Err(VerifyError::AaguidNotAllowed) => {}
+        other => {
+            println!("verify: FAIL (disallowed AAGUID was not rejected: {other:?})");
+            return Ok(EXIT_FAIL);
+        }
+    }
+
     // ---- assertion: sign authData || SHA-256(clientData) ----
     let assert_challenge = random_bytes(CHALLENGE_BYTES);
     let assert_client_data = build_client_data(ClientDataKind::Get, &assert_challenge)?;
@@ -1396,6 +1423,7 @@ fn cmd_verify() -> anyhow::Result<i32> {
     );
     println!("  assertion:   verified (ES256)");
     println!("  negative control: tampered signature rejected");
+    println!("  negative control: disallowed AAGUID rejected");
     Ok(EXIT_OK)
 }
 
