@@ -331,6 +331,31 @@ fn read_only_base_dir_is_allowed() {
 }
 
 #[test]
+fn insecure_base_is_refused_by_list_and_remove() {
+    // `list`/`remove` do not re-check the `credentials` dir owner/mode, so the base
+    // check is their only guard against a swapped-in attacker-controlled directory.
+    let (d, store) = fresh();
+    store.save_atomic(&sample_record("alice"), false).unwrap();
+    fs::set_permissions(d.path(), fs::Permissions::from_mode(0o770)).unwrap();
+    assert!(matches!(store.list(), Err(StoreError::InsecureBase { .. })));
+    assert!(matches!(
+        store.remove("alice"),
+        Err(StoreError::InsecureBase { .. })
+    ));
+}
+
+#[test]
+fn missing_base_lists_empty_and_removes_nothing() {
+    // A base that is absent is not an *insecure* base: preserve the prior behaviour of
+    // treating it as "nothing enrolled" rather than erroring.
+    let d = TempDir::new().unwrap();
+    let missing = d.path().join("does-not-exist");
+    let store = Store::with_owner(&missing, current_euid());
+    assert!(store.list().unwrap().is_empty());
+    assert!(!store.remove("alice").unwrap());
+}
+
+#[test]
 fn load_rejects_bad_credentials_dir_mode() {
     let (_d, store) = fresh();
     store.save_atomic(&sample_record("alice"), false).unwrap();

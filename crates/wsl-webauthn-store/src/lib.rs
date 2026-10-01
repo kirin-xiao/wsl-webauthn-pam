@@ -374,8 +374,9 @@ impl Store {
     /// The base directory deliberately has **no** exact-mode requirement (an admin may
     /// use `0755`), but if it were writable by group or other an attacker could swap in
     /// their own `credentials/` directory or `config` file, so that is refused as
-    /// [`StoreError::InsecureBase`]. The same two checks fail closed at `load` and
-    /// `save_atomic` before any record is read or written.
+    /// [`StoreError::InsecureBase`]. The same checks run first on every operation that
+    /// resolves a path under the base (`load`, `save_atomic`, `list`, `remove`), so a
+    /// widened base can never be substituted for a trusted one.
     fn check_base(&self) -> Result<sys::Stat, StoreError> {
         let st = match sys::lstat(&self.base) {
             Ok(st) => st,
@@ -615,10 +616,18 @@ impl Store {
     /// Remove the record for `username`, returning `false` if there was none.
     ///
     /// Refuses to act through a symlinked `credentials` directory or on a symlinked
-    /// record. Unlike [`Store::load`], ownership/mode are not re-checked so an
-    /// administrator can clean up a mis-owned record.
+    /// record, and refuses an insecure base directory
+    /// ([`StoreError::InsecureBase`]). Unlike [`Store::load`], the *record's*
+    /// ownership/mode are not re-checked, so an administrator can clean up a mis-owned
+    /// record.
     pub fn remove(&self, username: &str) -> Result<bool, StoreError> {
         validate_username(username)?;
+        match self.check_base() {
+            Ok(_) => {}
+            // A missing base means no `credentials` dir either: nothing to remove.
+            Err(StoreError::NotFound { .. }) => return Ok(false),
+            Err(e) => return Err(e),
+        }
         let dir = self.credentials_dir();
         match sys::lstat(&dir) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -657,9 +666,17 @@ impl Store {
 
     /// List enrolled usernames (sorted, deduplicated) from `<base>/credentials/*.json`.
     ///
-    /// A missing `credentials` directory yields an empty list. Non-regular files,
-    /// symlinks, and names that fail [`validate_username`] are skipped.
+    /// A missing `credentials` directory yields an empty list, and a missing base is
+    /// likewise empty rather than an error. An insecure base directory is refused as
+    /// [`StoreError::InsecureBase`]. Non-regular files, symlinks, and names that fail
+    /// [`validate_username`] are skipped.
     pub fn list(&self) -> Result<Vec<String>, StoreError> {
+        match self.check_base() {
+            Ok(_) => {}
+            // A missing base means no `credentials` dir either: an empty list.
+            Err(StoreError::NotFound { .. }) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        }
         let dir = self.credentials_dir();
         match sys::lstat(&dir) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
