@@ -140,13 +140,13 @@ impl Deps for SystemDeps {
         // bridge writes to stderr is the only fine-grained diagnostic. Log it (bounded and
         // already escaped by the runner) under debug; the taxonomy itself is logged
         // unconditionally by the state machine below.
-        if let RunnerResponse::Error(error) = &exchange.response {
-            if let Some(diag) = &exchange.bridge_stderr {
-                logger::debug(&format!(
-                    "bridge ceremony error {}: {diag}",
-                    bridge_error_name(*error)
-                ));
-            }
+        if let RunnerResponse::Error(error) = &exchange.response
+            && let Some(diag) = &exchange.bridge_stderr
+        {
+            logger::debug(&format!(
+                "bridge ceremony error {}: {diag}",
+                bridge_error_name(*error)
+            ));
         }
         Ok(exchange.response)
     }
