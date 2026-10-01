@@ -345,48 +345,89 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
     }
 
     // Flag/command validation: keep every accepted flag tied to a subcommand so a
-    // typo or a misplaced flag is a usage error rather than silently ignored.
-    let only = |allowed: &[bool]| allowed.iter().all(|b| !b);
+    // typo or a misplaced flag is a usage error (exit `2`) rather than silently
+    // ignored. Each arm rejects *every* flag it does not list; the `EXIT CODES` help
+    // text documents this contract.
     let cmd = match name {
-        "enroll" => Command::Enroll {
-            replace,
-            allow_unattested,
-            user,
-            bridge,
-            win_mnt,
-        },
-        "unregister" => {
-            if !only(&[replace, allow_unattested, all]) {
-                return Err("`unregister` accepts only --user/--yes".to_string());
+        "enroll" => {
+            if yes
+                || all
+                || skip_enroll
+                || non_interactive
+                || module_dir.is_some()
+                || artifact_dir.is_some()
+            {
+                return Err(
+                    "`enroll` accepts only --replace/--allow-unattested/--user/--bridge/--win-mnt"
+                        .to_string(),
+                );
             }
-            if bridge.is_some() || win_mnt.is_some() {
-                return Err("`unregister` does not accept --bridge/--win-mnt".to_string());
+            Command::Enroll {
+                replace,
+                allow_unattested,
+                user,
+                bridge,
+                win_mnt,
+            }
+        }
+        "unregister" => {
+            if replace
+                || allow_unattested
+                || all
+                || skip_enroll
+                || non_interactive
+                || bridge.is_some()
+                || win_mnt.is_some()
+                || module_dir.is_some()
+                || artifact_dir.is_some()
+            {
+                return Err("`unregister` accepts only --user/--yes".to_string());
             }
             Command::Unregister { user, yes }
         }
         "probe" => {
-            if !only(&[replace, allow_unattested, yes, all]) {
+            if replace
+                || allow_unattested
+                || yes
+                || all
+                || skip_enroll
+                || non_interactive
+                || user.is_some()
+                || module_dir.is_some()
+                || artifact_dir.is_some()
+            {
                 return Err("`probe` accepts only --bridge/--win-mnt".to_string());
-            }
-            if user.is_some() {
-                return Err("`probe` does not accept --user".to_string());
             }
             Command::Probe { bridge, win_mnt }
         }
         "status" => {
-            if !only(&[replace, allow_unattested, yes, all]) {
+            if replace
+                || allow_unattested
+                || yes
+                || all
+                || skip_enroll
+                || non_interactive
+                || bridge.is_some()
+                || win_mnt.is_some()
+                || module_dir.is_some()
+                || artifact_dir.is_some()
+            {
                 return Err("`status` accepts only --user".to_string());
-            }
-            if bridge.is_some() || win_mnt.is_some() {
-                return Err("`status` does not accept --bridge/--win-mnt".to_string());
             }
             Command::Status { user }
         }
         "verify" => {
-            if !only(&[replace, allow_unattested, yes, all])
+            if replace
+                || allow_unattested
+                || yes
+                || all
+                || skip_enroll
+                || non_interactive
                 || user.is_some()
                 || bridge.is_some()
                 || win_mnt.is_some()
+                || module_dir.is_some()
+                || artifact_dir.is_some()
             {
                 return Err("`verify` takes no arguments".to_string());
             }
@@ -1839,6 +1880,36 @@ mod tests {
         assert!(parse(&args(&["uninstall", "--allow-unattested"])).is_err());
         // `--user` and `--all` are mutually exclusive.
         assert!(parse(&args(&["uninstall", "--user", "a", "--all"])).is_err());
+        // Every other subcommand rejects flags outside its own documented set (the
+        // `EXIT CODES` help text promises exit `2` for a misplaced flag).
+        for flag in ["--yes", "--all", "--skip-enroll", "--non-interactive"] {
+            assert!(
+                parse(&args(&["enroll", flag])).is_err(),
+                "enroll must reject {flag}"
+            );
+        }
+        assert!(parse(&args(&["enroll", "--module-dir", "/x"])).is_err());
+        assert!(parse(&args(&["enroll", "--artifact-dir", "/x"])).is_err());
+        for flag in ["--skip-enroll", "--non-interactive"] {
+            assert!(
+                parse(&args(&["unregister", flag])).is_err(),
+                "unregister must reject {flag}"
+            );
+        }
+        assert!(parse(&args(&["unregister", "--module-dir", "/x"])).is_err());
+        assert!(parse(&args(&["unregister", "--artifact-dir", "/x"])).is_err());
+        assert!(parse(&args(&["probe", "--skip-enroll"])).is_err());
+        assert!(parse(&args(&["probe", "--non-interactive"])).is_err());
+        assert!(parse(&args(&["status", "--module-dir", "/x"])).is_err());
+        assert!(parse(&args(&["status", "--artifact-dir", "/x"])).is_err());
+        assert!(parse(&args(&["status", "--non-interactive"])).is_err());
+        for flag in ["--skip-enroll", "--non-interactive"] {
+            assert!(
+                parse(&args(&["verify", flag])).is_err(),
+                "verify must reject {flag}"
+            );
+        }
+        assert!(parse(&args(&["verify", "--module-dir", "/x"])).is_err());
     }
 
     #[test]
