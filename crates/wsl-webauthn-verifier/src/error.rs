@@ -23,10 +23,6 @@ pub enum VerifyError {
         reason: &'static str,
     },
 
-    /// A required `clientDataJSON` member was absent or had the wrong type.
-    #[error("clientDataJSON member missing or wrongly typed")]
-    ClientDataFieldMissing,
-
     /// The `type` member did not match the expected ceremony.
     #[error("clientDataJSON type does not match the expected ceremony")]
     ClientDataTypeMismatch,
@@ -111,10 +107,6 @@ pub enum VerifyError {
         reason: &'static str,
     },
 
-    /// The COSE key used a compressed EC point (only uncompressed is accepted).
-    #[error("COSE key uses a compressed EC point")]
-    CoseKeyCompressedPoint,
-
     /// The COSE EC point was not on the curve.
     #[error("COSE key EC point is not on the curve")]
     CosePointNotOnCurve,
@@ -131,11 +123,21 @@ pub enum VerifyError {
     #[error("COSE RSA public exponent is not an accepted value (3 or 65537)")]
     CoseKeyExponentNotAllowed,
 
-    /// The COSE key type is not supported.
+    /// The COSE key type is not supported (a genuinely unknown `kty`).
     #[error("unsupported COSE key type: {kty}")]
     UnsupportedKeyType {
         /// The COSE `kty` label value.
         kty: i64,
+    },
+
+    /// The COSE key type and algorithm are individually known but are not a valid
+    /// pairing (for example `kty=EC2` with `alg=RS256`).
+    #[error("COSE key type {kty} is not valid for algorithm {alg}")]
+    KeyTypeAlgorithmMismatch {
+        /// The COSE `kty` label value.
+        kty: i64,
+        /// The COSE `alg` label value.
+        alg: i64,
     },
 
     /// The COSE algorithm is not on the allow-list.

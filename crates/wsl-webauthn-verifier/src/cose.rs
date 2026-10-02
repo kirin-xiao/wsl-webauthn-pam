@@ -208,13 +208,22 @@ pub(crate) fn parse(cose_key: &[u8]) -> Result<ParsedCoseKey, VerifyError> {
         (KTY_EC2, ALG_ES256) => parse_es256(map),
         (KTY_RSA, ALG_RS256) => parse_rs256(map),
         (KTY_OKP, ALG_EDDSA) => parse_ed25519(map),
+        // An algorithm outside the allow-list is reported as such regardless of kty.
         (_, alg) if !is_known_alg(alg) => Err(VerifyError::UnsupportedAlgorithm { alg }),
-        (_, _) => Err(VerifyError::UnsupportedKeyType { kty }),
+        // Both labels are individually recognised but do not form a supported
+        // pairing (e.g. kty=EC2 with alg=RS256): a mismatch, not an unknown type.
+        (kty, alg) if is_known_kty(kty) => Err(VerifyError::KeyTypeAlgorithmMismatch { kty, alg }),
+        // A genuinely unknown kty.
+        (kty, _) => Err(VerifyError::UnsupportedKeyType { kty }),
     }
 }
 
 fn is_known_alg(alg: i64) -> bool {
     matches!(alg, ALG_ES256 | ALG_RS256 | ALG_EDDSA)
+}
+
+fn is_known_kty(kty: i64) -> bool {
+    matches!(kty, KTY_EC2 | KTY_RSA | KTY_OKP)
 }
 
 fn parse_es256(map: &[(Value, Value)]) -> Result<ParsedCoseKey, VerifyError> {
@@ -434,6 +443,38 @@ mod tests {
         assert_eq!(
             parse(&out).unwrap_err(),
             VerifyError::UnsupportedAlgorithm { alg: -47 }
+        );
+    }
+
+    #[test]
+    fn rejects_known_kty_with_wrong_known_alg_as_mismatch() {
+        // kty=EC2 (2) is supported, but with alg=RS256 (-257) it is a mismatch,
+        // not an unsupported key type.
+        let map = vec![
+            (Value::from(1i64), Value::from(2i64)),
+            (Value::from(3i64), Value::from(-257i64)),
+        ];
+        let mut out = Vec::new();
+        ciborium::into_writer(&Value::Map(map), &mut out).unwrap();
+        assert_eq!(
+            parse(&out).unwrap_err(),
+            VerifyError::KeyTypeAlgorithmMismatch { kty: 2, alg: -257 }
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_kty_as_unsupported_key_type() {
+        // kty=99 is not a COSE key type we know, so UnsupportedKeyType applies even
+        // though the algorithm is allow-listed.
+        let map = vec![
+            (Value::from(1i64), Value::from(99i64)),
+            (Value::from(3i64), Value::from(-7i64)),
+        ];
+        let mut out = Vec::new();
+        ciborium::into_writer(&Value::Map(map), &mut out).unwrap();
+        assert_eq!(
+            parse(&out).unwrap_err(),
+            VerifyError::UnsupportedKeyType { kty: 99 }
         );
     }
 
