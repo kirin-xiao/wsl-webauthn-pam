@@ -26,7 +26,6 @@ pub(crate) const FLAG_UV: u8 = 0x04;
 /// Attested credential data included.
 pub(crate) const FLAG_AT: u8 = 0x40;
 /// Extension data included (not parsed).
-#[allow(dead_code)]
 pub(crate) const FLAG_ED: u8 = 0x80;
 
 /// Offset of the AAGUID inside attested credential data, measured from the start of
@@ -64,6 +63,11 @@ impl AuthDataPrefix {
     /// Whether attested credential data follows.
     pub(crate) fn has_attested_credential_data(&self) -> bool {
         self.flags & FLAG_AT != 0
+    }
+
+    /// Whether authenticator extensions follow the attested credential data.
+    pub(crate) fn has_extensions(&self) -> bool {
+        self.flags & FLAG_ED != 0
     }
 }
 
@@ -120,7 +124,9 @@ pub(crate) struct AttestedCredentialData<'a> {
 /// Parse `attestedCredentialData` starting at [`AAGUID_OFFSET`] of `auth_data`.
 ///
 /// The trailing COSE key is delimited by re-encoding the CBOR value, so the parser
-/// never has to guess where the key ends.
+/// never has to guess where the key ends. The decoded value must re-encode
+/// byte-for-byte to the input it came from (rejecting non-canonical encodings), and
+/// any bytes past the key are accepted only when the ED (extensions) flag is set.
 pub(crate) fn parse_attested_credential_data(
     auth_data: &[u8],
 ) -> Result<AttestedCredentialData<'_>, VerifyError> {
@@ -171,17 +177,27 @@ pub(crate) fn parse_attested_credential_data(
     ciborium::into_writer(&value, &mut encoded).map_err(|_| VerifyError::Internal {
         reason: "re-encoding parsed COSE value failed",
     })?;
-    // The re-encoded form delimits the key. Any bytes after it are either
-    // authenticator extensions (ED=1, which we do not consume) or ignored trailing
-    // data; neither affects a security decision here because the credential key we
-    // return is exactly this self-delimited slice. A re-encode *longer* than the
-    // remaining input means the key was truncated mid-value.
-    if encoded.is_empty() || encoded.len() > rest.len() {
+    // The re-encoded form delimits the key. The decoder accepts non-canonical CBOR
+    // (indefinite lengths, over-long integers, …); if such a key re-encoded to a
+    // *different* byte string, slicing `rest` at `encoded.len()` could truncate the
+    // key or pick the wrong boundary. Require the decoded value to re-encode back to
+    // the exact leading bytes it came from, so the returned slice is provably the
+    // whole, canonical key.
+    if encoded.is_empty() || encoded.len() > rest.len() || rest[..encoded.len()] != encoded[..] {
         return Err(VerifyError::MalformedCoseKey {
-            reason: "credential public key has inconsistent length",
+            reason: "credential public key is not canonically encoded",
         });
     }
     let cose_public_key = &rest[..encoded.len()];
+
+    // Everything after the key is either authenticator extensions (ED=1, which we do
+    // not consume) or a malformed input. Trailing bytes without the ED flag are
+    // rejected rather than silently swallowed.
+    if !rest[encoded.len()..].is_empty() && !prefix.has_extensions() {
+        return Err(VerifyError::MalformedAuthenticatorData {
+            reason: "trailing bytes after the credential public key without the ED flag",
+        });
+    }
 
     Ok(AttestedCredentialData {
         aaguid,
@@ -264,5 +280,80 @@ mod tests {
         assert!(constant_time_eq(&[1, 2, 3], &[1, 2, 3]));
         assert!(!constant_time_eq(&[1, 2, 3], &[1, 2, 4]));
         assert!(!constant_time_eq(&[1, 2], &[1, 2, 3]));
+    }
+
+    /// A canonical 5-entry ES256 COSE_Key map (contents irrelevant to this parser,
+    /// which only slices the key bytes).
+    fn cose_key_es256() -> Vec<u8> {
+        use ciborium::value::Value;
+        let map = vec![
+            (Value::from(1i64), Value::from(2i64)),
+            (Value::from(3i64), Value::from(-7i64)),
+            (Value::from(-1i64), Value::from(1i64)),
+            (Value::from(-2i64), Value::Bytes(vec![1u8; 32])),
+            (Value::from(-3i64), Value::Bytes(vec![2u8; 32])),
+        ];
+        let mut out = Vec::new();
+        ciborium::into_writer(&Value::Map(map), &mut out).unwrap();
+        out
+    }
+
+    /// Build authData with AT set, a fixed credential id, `cose` as the key, and any
+    /// extra flag bits (e.g. ED) and trailing bytes.
+    fn auth_data_with(cose: &[u8], extra_flags: u8, tail: &[u8]) -> Vec<u8> {
+        let mut ad = Vec::new();
+        ad.extend_from_slice(&Sha256::digest(RP_ID.as_bytes()));
+        ad.push(FLAG_UP | FLAG_UV | FLAG_AT | extra_flags);
+        ad.extend_from_slice(&0u32.to_be_bytes());
+        ad.extend_from_slice(&[0xAAu8; 16]);
+        let cred = b"cred";
+        ad.extend_from_slice(&(cred.len() as u16).to_be_bytes());
+        ad.extend_from_slice(cred);
+        ad.extend_from_slice(cose);
+        ad.extend_from_slice(tail);
+        ad
+    }
+
+    #[test]
+    fn parses_canonical_key_without_trailing() {
+        let cose = cose_key_es256();
+        let ad = auth_data_with(&cose, 0, &[]);
+        let parsed = parse_attested_credential_data(&ad).unwrap();
+        assert_eq!(parsed.cose_public_key, &cose[..]);
+        assert_eq!(parsed.credential_id, b"cred");
+    }
+
+    #[test]
+    fn rejects_trailing_bytes_without_ed() {
+        let cose = cose_key_es256();
+        let ad = auth_data_with(&cose, 0, &[0x00, 0x01]);
+        assert!(matches!(
+            parse_attested_credential_data(&ad),
+            Err(VerifyError::MalformedAuthenticatorData { .. })
+        ));
+    }
+
+    #[test]
+    fn accepts_trailing_extensions_with_ed() {
+        let cose = cose_key_es256();
+        let ad = auth_data_with(&cose, FLAG_ED, &[0x00, 0x01]);
+        let parsed = parse_attested_credential_data(&ad).unwrap();
+        assert_eq!(parsed.cose_public_key, &cose[..]);
+    }
+
+    #[test]
+    fn rejects_non_canonical_key() {
+        let cose = cose_key_es256();
+        // Rewrite the definite 5-entry map header (0xa5) as indefinite length: the
+        // decoder accepts it, but re-encoding is canonical and differs byte-for-byte.
+        assert_eq!(cose[0], 0xa5);
+        let mut non_canonical = vec![0xbf];
+        non_canonical.extend_from_slice(&cose[1..]);
+        non_canonical.push(0xff);
+        let ad = auth_data_with(&non_canonical, 0, &[]);
+        assert!(matches!(
+            parse_attested_credential_data(&ad),
+            Err(VerifyError::MalformedCoseKey { .. })
+        ));
     }
 }

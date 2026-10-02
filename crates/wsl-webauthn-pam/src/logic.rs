@@ -15,7 +15,7 @@
 //! table. No error is swallowed into success.
 
 use std::path::Path;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use wsl_webauthn_protocol::{
     BridgeError, ClientDataKind, ORIGIN, RP_ID, b64u_decode, b64u_encode, build_client_data,
@@ -95,11 +95,6 @@ pub trait Deps {
     ) -> Result<RunnerResponse, RunnerError>;
     /// Test-only panic injection point (production is a no-op).
     fn panic_probe(&self);
-
-    /// Test-only override for the assertion clock; production uses the wall clock.
-    fn now(&self) -> SystemTime {
-        SystemTime::now()
-    }
 }
 
 /// Build a [`Deps`] driven by the real store and runner.
@@ -584,7 +579,6 @@ pub fn authenticate<S: PamSeam, D: Deps>(
                 authenticator_data: &authenticator_data,
                 signature: &signature,
                 expected_sign_count: Some(record.sign_count),
-                now: deps.now(),
             };
             match verify_assertion(&check) {
                 Ok(outcome) => {
@@ -716,7 +710,6 @@ mod tests {
     fn all_verify_errors() -> Vec<VerifyError> {
         vec![
             VerifyError::MalformedClientData { reason: "r" },
-            VerifyError::ClientDataFieldMissing,
             VerifyError::ClientDataTypeMismatch,
             VerifyError::ChallengeMismatch,
             VerifyError::OriginMismatch,
@@ -736,11 +729,11 @@ mod tests {
             VerifyError::InvalidAttestationStatement,
             VerifyError::AttestationNotAllowed,
             VerifyError::MalformedCoseKey { reason: "r" },
-            VerifyError::CoseKeyCompressedPoint,
             VerifyError::CosePointNotOnCurve,
             VerifyError::CoseKeyModulusSize { bits: 1024 },
             VerifyError::CoseKeyExponentNotAllowed,
             VerifyError::UnsupportedKeyType { kty: 99 },
+            VerifyError::KeyTypeAlgorithmMismatch { kty: 2, alg: -257 },
             VerifyError::UnsupportedAlgorithm { alg: -9999 },
             VerifyError::AlgorithmMismatch,
             VerifyError::EmptyCredentialId,
@@ -748,6 +741,10 @@ mod tests {
             VerifyError::MalformedSignature { reason: "r" },
             VerifyError::SignatureInvalid,
             VerifyError::MalformedCertificate { reason: "r" },
+            VerifyError::CertificateTooLarge {
+                len: 9000,
+                max: 8192,
+            },
             VerifyError::CertificateChainEmpty,
             VerifyError::CertificateChainAnchorNotFound,
             VerifyError::CertificateChainSignatureInvalid,
@@ -756,6 +753,7 @@ mod tests {
             VerifyError::CertificateLeafIsCa,
             VerifyError::CertificateIntermediateNotCa,
             VerifyError::CertificateMissingBasicConstraints,
+            VerifyError::CertificatePathLenExceeded,
             VerifyError::CertificateSubjectOuMismatch,
             VerifyError::CertificateExpired,
             VerifyError::CertificateNotYetValid,
@@ -784,6 +782,11 @@ mod tests {
             VerifyError::TpmAikEkuMissing,
             VerifyError::TpmAikKeyUsageForbidsSignature,
             VerifyError::Internal { reason: "r" },
+            VerifyError::InputTooLarge {
+                field: "signature",
+                len: 2048,
+                max: 1024,
+            },
         ]
     }
 

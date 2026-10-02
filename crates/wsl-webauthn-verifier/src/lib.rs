@@ -116,6 +116,28 @@ pub use error::VerifyError;
 use std::time::SystemTime;
 
 // ---------------------------------------------------------------------------
+// Input size bounds
+// ---------------------------------------------------------------------------
+//
+// These are defence-in-depth caps at the verifier boundary. The normal caller is
+// already bounded (a response frame is ≤ `wsl_webauthn_protocol::MAX_RESPONSE_BYTES`,
+// 64 KiB, before base64-decoding), but the verifier is a public API and must not
+// assume it: a caller that relaxes its own cap would otherwise hand the CBOR/der
+// decoders unbounded input and let the materialised `Value`/certificate tree amplify
+// memory use. Every cap is far above any real WebAuthn structure.
+
+/// Maximum size of an `attestationObject`.
+pub(crate) const MAX_ATTESTATION_BYTES: usize = 64 * 1024;
+/// Maximum size of an `authenticatorData`.
+pub(crate) const MAX_AUTHENTICATOR_DATA_BYTES: usize = 64 * 1024;
+/// Maximum size of a `clientDataJSON`.
+pub(crate) const MAX_CLIENT_DATA_BYTES: usize = 16 * 1024;
+/// Maximum size of a signature (ES256 DER ≤ 72 B, RS256 4096-bit = 512 B, EdDSA 64 B).
+pub(crate) const MAX_SIGNATURE_BYTES: usize = 1024;
+/// Maximum size of an encoded COSE public key (a 4096-bit RSA modulus is 512 B).
+pub(crate) const MAX_COSE_KEY_BYTES: usize = 4 * 1024;
+
+// ---------------------------------------------------------------------------
 // Pinned trust material (plan D3)
 // ---------------------------------------------------------------------------
 
@@ -191,8 +213,9 @@ pub struct AttestationMetadata {
 
 /// Inputs to an assertion (login) verification.
 ///
-/// Construct with [`AssertionCheck::new`], which sets `now` to
-/// [`SystemTime::now`]. Tests may set `now` directly to pin the clock.
+/// Construct with [`AssertionCheck::new`]. The assertion path has no time semantics:
+/// unlike enrollment, no certificate validity window is consulted, so there is no
+/// clock input.
 #[derive(Debug)]
 pub struct AssertionCheck<'a> {
     /// The raw (≥16 byte) challenge we minted and put in `clientDataJSON`.
@@ -213,12 +236,11 @@ pub struct AssertionCheck<'a> {
     /// `None` (or a stored count of 0 on a zero-counter authenticator) skips the
     /// check. Pass the value loaded with the credential record.
     pub expected_sign_count: Option<u32>,
-    /// The instant used for any time-based checks. Defaults to `SystemTime::now()`.
-    pub now: SystemTime,
 }
 
 impl<'a> AssertionCheck<'a> {
-    /// Build an assertion check with `now = SystemTime::now()`.
+    /// Build an assertion check. The assertion path has no time semantics, so no
+    /// clock is captured.
     pub fn new(
         expected_challenge: &'a [u8],
         credential_id: &'a [u8],
@@ -237,7 +259,6 @@ impl<'a> AssertionCheck<'a> {
             // No stored count by default: the counter check is skipped. The PAM
             // module and CLI set this from the loaded credential record.
             expected_sign_count: None,
-            now: SystemTime::now(),
         }
     }
 
@@ -299,6 +320,10 @@ pub struct EnrollOutcome {
     pub credential_id: Vec<u8>,
     /// The credential's COSE public key bytes (as found in `authData`).
     pub cose_public_key: Vec<u8>,
+    /// The credential key's allow-listed COSE algorithm identifier (`-7` ES256,
+    /// `-257` RS256, `-8` EdDSA), taken from the already-parsed key so callers do not
+    /// have to re-parse the CBOR to recover label 3.
+    pub alg: i32,
     /// The authenticator's AAGUID.
     pub aaguid: [u8; 16],
     /// The signature counter at registration.

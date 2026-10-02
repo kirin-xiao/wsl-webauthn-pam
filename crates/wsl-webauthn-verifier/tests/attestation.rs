@@ -100,6 +100,7 @@ fn positive_packed_x5c_strict() {
     let outcome = verify(&f, AttestationPolicy::Strict).expect("strict packed");
     assert_eq!(outcome.credential_id, f.credential_id);
     assert_eq!(outcome.aaguid, f.aaguid);
+    assert_eq!(outcome.alg, -7, "ES256 credential algorithm is reported");
     assert_eq!(outcome.attestation.format, "packed");
     assert_eq!(outcome.attestation.mode, AttestationMode::StrictVerified);
     assert!(outcome.attestation.leaf_sha256.is_some());
@@ -107,9 +108,15 @@ fn positive_packed_x5c_strict() {
 
 #[test]
 fn positive_packed_x5c_with_each_credential_alg() {
-    for key in [es256(), rs256(), ed25519()] {
+    let expected = [(-7, es256()), (-257, rs256()), (-8, ed25519())];
+    for (alg, key) in expected {
         let f = fixture_with(key, ChainOptions::default(), -7, None);
-        verify(&f, AttestationPolicy::Strict).expect("packed valid for all credential algs");
+        let outcome =
+            verify(&f, AttestationPolicy::Strict).expect("packed valid for all credential algs");
+        assert_eq!(
+            outcome.alg, alg,
+            "the enrolled key's COSE alg is carried in the outcome"
+        );
     }
 }
 
@@ -1785,7 +1792,6 @@ fn local_vector_tpm_strict_round_trip() {
         authenticator_data: &auth_data,
         signature: &signature,
         expected_sign_count: None,
-        now: SystemTime::now(),
     };
     wsl_webauthn_verifier::verify_assertion(&assert_check).expect("real assertion verification");
 }

@@ -97,7 +97,6 @@ proptest! {
             authenticator_data: &auth_data,
             signature: &signature,
             expected_sign_count: None,
-            now: common::fixture_now(),
         };
         let _ = verify_assertion(&check);
     }

@@ -36,6 +36,15 @@ use rsa::signature::Verifier as _;
 /// Maximum number of certificates accepted in `x5c` (defensive bound).
 const MAX_CHAIN_LEN: usize = 8;
 
+/// Maximum DER size of a single certificate accepted in `x5c` (defence in depth).
+///
+/// Real attestation certificates — including a 4096-bit RSA AIK — are well under
+/// 2 KiB, so 8 KiB is generous. The bound exists so the verifier does not depend on
+/// the `rsa` crate's own `check_public_with_max_size(4096)` to reject an oversized
+/// declared key: a certificate larger than this is refused before `Certificate::from_der`
+/// or any SPKI extraction runs. An invariant test asserts this bound.
+pub(crate) const MAX_CERT_BYTES: usize = 8 * 1024;
+
 /// OID `id-fido-gen-ce-aaguid` (1.3.6.1.4.1.45724.1.1.4).
 pub(crate) const ID_FIDO_GEN_CE_AAGUID: der::asn1::ObjectIdentifier =
     der::asn1::ObjectIdentifier::new_unwrap("1.3.6.1.4.1.45724.1.1.4");
@@ -106,7 +115,7 @@ pub(crate) enum ChainProfile {
 /// never broaden trust beyond the compile-time pin. When the anchor *is* present in
 /// `x5c` it must be the topmost certificate and `bundle_root` is ignored.
 pub(crate) fn verify_chain(
-    certs_der: &[Vec<u8>],
+    certs_der: &[&[u8]],
     auth_aaguid: &[u8; 16],
     now: SystemTime,
     anchor_fingerprint: &[u8; 32],
@@ -123,8 +132,16 @@ pub(crate) fn verify_chain(
     }
 
     // Parse every certificate up front; keep DER alongside so we can fingerprint.
+    // Each entry is size-capped before the DER parser sees it, so a certificate that
+    // merely *declares* a huge key cannot force expensive parse/modexp work.
     let mut parsed: Vec<Certificate> = Vec::with_capacity(certs_der.len());
     for der_bytes in certs_der {
+        if der_bytes.len() > MAX_CERT_BYTES {
+            return Err(VerifyError::CertificateTooLarge {
+                len: der_bytes.len(),
+                max: MAX_CERT_BYTES,
+            });
+        }
         let cert =
             Certificate::from_der(der_bytes).map_err(|_| VerifyError::MalformedCertificate {
                 reason: "certificate is not valid DER",
@@ -200,16 +217,27 @@ pub(crate) fn verify_chain(
         return Err(VerifyError::CertificateVersionNotV3);
     }
 
-    // BasicConstraints: CA=false on the leaf, CA=true on everything above it.
+    // BasicConstraints: CA=false on the leaf, CA=true on everything above it. Each
+    // CA's `pathLenConstraint`, when present, bounds the number of non-self-issued
+    // intermediate CA certificates that may follow it (RFC 5280 §4.2.1.9): the root
+    // in particular MUST NOT have more than one intermediate below it. The leaf is
+    // not a CA, so it does not count against any constraint.
     let leaf_bc = basic_constraints(leaf)?;
     if leaf_bc.ca {
         return Err(VerifyError::CertificateLeafIsCa);
     }
-    for cert in &parsed[1..] {
+    for (index, cert) in parsed[1..].iter().enumerate() {
         let bc = basic_constraints(cert)?;
         if !bc.ca {
             return Err(VerifyError::CertificateIntermediateNotCa);
         }
+        // Certificates below this CA toward the leaf (`parsed[..index + 1]`) are the
+        // ones pathLenConstraint counts.
+        enforce_path_len(&bc, &parsed[..index + 1])?;
+    }
+    if let Some(root) = &external_root {
+        let bc = basic_constraints(root)?;
+        enforce_path_len(&bc, &parsed[1..])?;
     }
 
     // Leaf Subject OU must be exactly "Authenticator Attestation".
@@ -254,7 +282,7 @@ pub(crate) fn verify_chain(
     }
 
     Ok(ChainInfo {
-        leaf_sha256: sha256(&certs_der[0]),
+        leaf_sha256: sha256(certs_der[0]),
         leaf_spki: leaf.tbs_certificate.subject_public_key_info.clone(),
     })
 }
@@ -267,7 +295,15 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Check that `now` lies within `[not_before, not_after]`.
+/// Check that `now` lies within the certificate's validity period.
+///
+/// Both bounds are **inclusive**, matching RFC 5280 §4.1.2.5 (the validity period
+/// includes `notBefore` and `notAfter`). This is a deliberate choice: certificate
+/// validity times have one-second granularity, so an exclusive `notBefore` would
+/// reject a certificate during the remainder of the second in which it was issued
+/// (the synthesized fixtures and any short-lived certificate are affected), while
+/// adding no security. The window is never widened beyond the certificate's own
+/// bounds.
 fn check_validity(cert: &Certificate, now: SystemTime) -> Result<(), VerifyError> {
     let validity = &cert.tbs_certificate.validity;
     let not_before = validity.not_before.to_system_time();
@@ -279,6 +315,42 @@ fn check_validity(cert: &Certificate, now: SystemTime) -> Result<(), VerifyError
         return Err(VerifyError::CertificateExpired);
     }
     Ok(())
+}
+
+/// Enforce a CA certificate's `pathLenConstraint` against the CA certificates below
+/// it toward the leaf.
+///
+/// RFC 5280 §4.2.1.9 counts only **non-self-issued** intermediate CA certificates,
+/// so a self-issued certificate (one whose subject equals its issuer) is skipped.
+/// `below_toward_leaf` is the slice of certificates from the leaf up to and including
+/// this CA (`parsed[..index + 1]`), in leaf-first order; non-CA entries — the leaf,
+/// and any certificate that already failed the CA check — are likewise skipped.
+fn enforce_path_len(
+    bc: &BasicConstraints,
+    below_toward_leaf: &[Certificate],
+) -> Result<(), VerifyError> {
+    let Some(limit) = bc.path_len_constraint else {
+        return Ok(());
+    };
+    let mut count: usize = 0;
+    for below in below_toward_leaf {
+        if is_self_issued(below) {
+            continue;
+        }
+        if basic_constraints(below).is_ok_and(|below_bc| below_bc.ca) {
+            count += 1;
+        }
+    }
+    if count > usize::from(limit) {
+        return Err(VerifyError::CertificatePathLenExceeded);
+    }
+    Ok(())
+}
+
+/// Whether a certificate is self-issued (subject equals issuer), which RFC 5280
+/// excludes from `pathLenConstraint` accounting.
+fn is_self_issued(cert: &Certificate) -> bool {
+    cert.tbs_certificate.subject == cert.tbs_certificate.issuer
 }
 
 /// Extract and parse the BasicConstraints extension, which must be present.
@@ -550,5 +622,44 @@ pub(crate) fn cose_key_from_spki(
         Ok(ParsedCoseKey::Ed25519(Box::new(key)))
     } else {
         Err(VerifyError::UnsupportedCertificateAlgorithm)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bundled Microsoft root, which `attestation::verify` may append as a trust
+    /// anchor, must itself satisfy the per-certificate size bound. If it did not, a
+    /// real Windows Hello `tpm` attestation would be rejected by the verifier's own
+    /// cap — so this is an invariant of the trust material, not an optional check.
+    #[test]
+    fn bundled_root_within_cert_size_cap() {
+        assert!(
+            crate::ms_root::MS_TPM_ROOT_2014_DER.len() <= MAX_CERT_BYTES,
+            "bundled root is {} bytes, above the {MAX_CERT_BYTES}-byte cap",
+            crate::ms_root::MS_TPM_ROOT_2014_DER.len()
+        );
+    }
+
+    #[test]
+    fn oversized_certificate_is_rejected_before_parsing() {
+        let huge = vec![0u8; MAX_CERT_BYTES + 1];
+        let err = verify_chain(
+            &[&huge],
+            &crate::STRICT_AAGUIDS[0],
+            SystemTime::now(),
+            &crate::MS_TPM_ROOT_2014_SHA256,
+            ChainProfile::Packed,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            VerifyError::CertificateTooLarge {
+                len: MAX_CERT_BYTES + 1,
+                max: MAX_CERT_BYTES,
+            }
+        );
     }
 }

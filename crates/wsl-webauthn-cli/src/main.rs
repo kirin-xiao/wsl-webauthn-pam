@@ -23,9 +23,10 @@
 //! * **Diagnostics go to stderr; stdout is human-readable status output only.** The
 //!   Windows SID captured for audit is stored in the record but never printed.
 //! * Exit codes: `0` success, `1` operational failure, `2` usage error.
-//! * The `alg` field is derived from the enrolled COSE key with a tiny local CBOR
-//!   reader ([`read_cose_alg`]) rather than the verifier's `#[doc(hidden)] pub mod
-//!   testing` seam, so the CLI does not depend on a test-only API.
+//! * The `alg` field is taken from the verifier's
+//!   [`EnrollOutcome::alg`](wsl_webauthn_verifier::EnrollOutcome::alg), which the
+//!   verifier already parsed from the credential COSE key, so the CLI carries no
+//!   CBOR reader of its own.
 //!
 //! # D3 double-enroll
 //!
@@ -1307,8 +1308,7 @@ fn build_record(
     bridge_sha256: &str,
     enrolled_at: &str,
 ) -> anyhow::Result<CredentialRecord> {
-    let alg = read_cose_alg(&outcome.cose_public_key)
-        .context("deriving COSE algorithm from the enrolled credential key")?;
+    let alg = outcome.alg;
 
     // `verified` records whether the chain was cryptographically verified. Under
     // AllowUnattested a verified (strict-mode) attestation is still recorded as strict;
@@ -1345,34 +1345,6 @@ fn build_record(
         bridge_path: bridge_path.display().to_string(),
         bridge_sha256: bridge_sha256.to_string(),
     })
-}
-
-/// Read the COSE `alg` label (3) from an encoded COSE_Key map.
-///
-/// A small local reader avoids depending on the verifier's `#[doc(hidden)]` test seam.
-/// The verifier has already validated the key structure, so this only extracts a label.
-///
-/// **L6-5 follow-up (cross-crate, not done here).** This duplicates COSE schema knowledge
-/// that the verifier already parsed. Once `wsl_webauthn_verifier::EnrollOutcome` gains a
-/// `pub alg: i32` field (populated from `ParsedCoseKey::alg` — a verifier-side change; the
-/// field is absent as of this branch), `build_record` should read `outcome.alg` and this
-/// function (plus its two unit tests below) can be deleted. Records loaded from disk carry
-/// an explicit `alg` already, so no fallback reader is needed after that.
-fn read_cose_alg(cose_public_key: &[u8]) -> anyhow::Result<i32> {
-    let value: ciborium::value::Value = ciborium::from_reader(cose_public_key)
-        .map_err(|e| anyhow!("COSE key is not valid CBOR: {e}"))?;
-    let map = value
-        .as_map()
-        .ok_or_else(|| anyhow!("COSE key is not a CBOR map"))?;
-    for (key, value) in map {
-        if key.as_integer() == Some(ciborium::value::Integer::from(3))
-            && let Some(alg) = value.as_integer()
-        {
-            let alg = i64::try_from(alg).map_err(|_| anyhow!("COSE alg out of range"))?;
-            return i32::try_from(alg).map_err(|_| anyhow!("COSE alg out of i32 range"));
-        }
-    }
-    bail!("COSE key is missing the alg label")
 }
 
 /// Format a 16-byte AAGUID as a canonical lowercase hyphenated UUID.
@@ -2497,29 +2469,6 @@ mod tests {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
     }
 
-    // ---- alg derivation ----
-
-    #[test]
-    fn read_cose_alg_extracts_label_three() {
-        use ciborium::value::Value;
-        let map = Value::Map(vec![
-            (Value::from(1i64), Value::from(2i64)),
-            (Value::from(3i64), Value::from(-7i64)),
-        ]);
-        let mut bytes = Vec::new();
-        ciborium::into_writer(&map, &mut bytes).unwrap();
-        assert_eq!(read_cose_alg(&bytes).unwrap(), -7);
-    }
-
-    #[test]
-    fn read_cose_alg_rejects_missing_label() {
-        use ciborium::value::Value;
-        let map = Value::Map(vec![(Value::from(1i64), Value::from(2i64))]);
-        let mut bytes = Vec::new();
-        ciborium::into_writer(&map, &mut bytes).unwrap();
-        assert!(read_cose_alg(&bytes).is_err());
-    }
-
     // ---- double-enroll state machine (scripted ceremony) ----
 
     /// Scripted [`EnrollCeremony`] that returns a well-formed `none` attestation (or a
@@ -2638,6 +2587,7 @@ mod tests {
         Ok(EnrollOutcome {
             credential_id: outcome.credential_bytes.clone(),
             cose_public_key: es256_cose_bytes(),
+            alg: -7,
             aaguid: STRICT_AAGUIDS[1],
             sign_count: 0,
             attestation: wsl_webauthn_verifier::AttestationMetadata {
@@ -2828,6 +2778,7 @@ mod tests {
         let outcome = EnrollOutcome {
             credential_id: vec![1, 2, 3, 4],
             cose_public_key: es256_cose_bytes(),
+            alg: -7,
             aaguid: STRICT_AAGUIDS[0],
             sign_count: 0,
             attestation: wsl_webauthn_verifier::AttestationMetadata {
@@ -2870,6 +2821,7 @@ mod tests {
         let outcome = EnrollOutcome {
             credential_id: vec![9],
             cose_public_key: es256_cose_bytes(),
+            alg: -7,
             aaguid: STRICT_AAGUIDS[0],
             sign_count: 0,
             attestation: wsl_webauthn_verifier::AttestationMetadata {
@@ -2931,6 +2883,7 @@ mod tests {
         let outcome = EnrollOutcome {
             credential_id: vec![7, 7, 7, 7],
             cose_public_key: es256_cose_bytes(),
+            alg: -7,
             aaguid: STRICT_AAGUIDS[0],
             sign_count: 0,
             attestation: wsl_webauthn_verifier::AttestationMetadata {

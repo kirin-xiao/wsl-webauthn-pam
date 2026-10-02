@@ -46,6 +46,27 @@ pub(crate) fn verify(
     if credential_id.is_empty() {
         return Err(VerifyError::EmptyCredentialId);
     }
+    if client_data_json.len() > crate::MAX_CLIENT_DATA_BYTES {
+        return Err(VerifyError::InputTooLarge {
+            field: "clientDataJSON",
+            len: client_data_json.len(),
+            max: crate::MAX_CLIENT_DATA_BYTES,
+        });
+    }
+    if authenticator_data.len() > crate::MAX_AUTHENTICATOR_DATA_BYTES {
+        return Err(VerifyError::InputTooLarge {
+            field: "authenticatorData",
+            len: authenticator_data.len(),
+            max: crate::MAX_AUTHENTICATOR_DATA_BYTES,
+        });
+    }
+    if signature.len() > crate::MAX_SIGNATURE_BYTES {
+        return Err(VerifyError::InputTooLarge {
+            field: "signature",
+            len: signature.len(),
+            max: crate::MAX_SIGNATURE_BYTES,
+        });
+    }
 
     // 1. clientDataJSON for `webauthn.get`.
     clientdata::validate(client_data_json, ClientDataKind::Get, expected_challenge)?;
@@ -89,4 +110,42 @@ pub(crate) fn verify(
     Ok(AssertionOutcome {
         sign_count: prefix.sign_count,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_oversized_inputs() {
+        let big_cdj = vec![0u8; crate::MAX_CLIENT_DATA_BYTES + 1];
+        let err = verify(b"challenge", b"cred", &[], &big_cdj, &[], &[], None).unwrap_err();
+        assert!(matches!(
+            err,
+            VerifyError::InputTooLarge {
+                field: "clientDataJSON",
+                ..
+            }
+        ));
+
+        let big_ad = vec![0u8; crate::MAX_AUTHENTICATOR_DATA_BYTES + 1];
+        let err = verify(b"challenge", b"cred", &[], &[], &big_ad, &[], None).unwrap_err();
+        assert!(matches!(
+            err,
+            VerifyError::InputTooLarge {
+                field: "authenticatorData",
+                ..
+            }
+        ));
+
+        let big_sig = vec![0u8; crate::MAX_SIGNATURE_BYTES + 1];
+        let err = verify(b"challenge", b"cred", &[], &[], &[], &big_sig, None).unwrap_err();
+        assert!(matches!(
+            err,
+            VerifyError::InputTooLarge {
+                field: "signature",
+                ..
+            }
+        ));
+    }
 }

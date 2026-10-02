@@ -23,10 +23,6 @@ pub enum VerifyError {
         reason: &'static str,
     },
 
-    /// A required `clientDataJSON` member was absent or had the wrong type.
-    #[error("clientDataJSON member missing or wrongly typed")]
-    ClientDataFieldMissing,
-
     /// The `type` member did not match the expected ceremony.
     #[error("clientDataJSON type does not match the expected ceremony")]
     ClientDataTypeMismatch,
@@ -111,10 +107,6 @@ pub enum VerifyError {
         reason: &'static str,
     },
 
-    /// The COSE key used a compressed EC point (only uncompressed is accepted).
-    #[error("COSE key uses a compressed EC point")]
-    CoseKeyCompressedPoint,
-
     /// The COSE EC point was not on the curve.
     #[error("COSE key EC point is not on the curve")]
     CosePointNotOnCurve,
@@ -131,11 +123,21 @@ pub enum VerifyError {
     #[error("COSE RSA public exponent is not an accepted value (3 or 65537)")]
     CoseKeyExponentNotAllowed,
 
-    /// The COSE key type is not supported.
+    /// The COSE key type is not supported (a genuinely unknown `kty`).
     #[error("unsupported COSE key type: {kty}")]
     UnsupportedKeyType {
         /// The COSE `kty` label value.
         kty: i64,
+    },
+
+    /// The COSE key type and algorithm are individually known but are not a valid
+    /// pairing (for example `kty=EC2` with `alg=RS256`).
+    #[error("COSE key type {kty} is not valid for algorithm {alg}")]
+    KeyTypeAlgorithmMismatch {
+        /// The COSE `kty` label value.
+        kty: i64,
+        /// The COSE `alg` label value.
+        alg: i64,
     },
 
     /// The COSE algorithm is not on the allow-list.
@@ -181,6 +183,15 @@ pub enum VerifyError {
         reason: &'static str,
     },
 
+    /// A certificate exceeded the verifier's DER size cap.
+    #[error("certificate of {len} bytes exceeds the maximum accepted size of {max}")]
+    CertificateTooLarge {
+        /// The observed DER length in bytes.
+        len: usize,
+        /// The maximum accepted DER length in bytes.
+        max: usize,
+    },
+
     /// The `x5c` array was empty.
     #[error("x5c certificate chain is empty")]
     CertificateChainEmpty,
@@ -212,6 +223,11 @@ pub enum VerifyError {
     /// A certificate was missing the BasicConstraints extension.
     #[error("certificate is missing the BasicConstraints extension")]
     CertificateMissingBasicConstraints,
+
+    /// A CA certificate's `pathLenConstraint` was exceeded by the number of
+    /// non-self-issued intermediate CA certificates below it in the path.
+    #[error("certificate chain exceeds a CA certificate's pathLenConstraint")]
+    CertificatePathLenExceeded,
 
     /// The leaf Subject OU was not `Authenticator Attestation`.
     #[error("leaf certificate Subject OU is not \"Authenticator Attestation\"")]
@@ -332,5 +348,16 @@ pub enum VerifyError {
     Internal {
         /// Short, non-sensitive reason string.
         reason: &'static str,
+    },
+
+    /// An input exceeded the verifier's defence-in-depth size cap.
+    #[error("{field} of {len} bytes exceeds the maximum accepted size of {max}")]
+    InputTooLarge {
+        /// The name of the oversized input.
+        field: &'static str,
+        /// The observed length in bytes.
+        len: usize,
+        /// The maximum accepted length in bytes.
+        max: usize,
     },
 }

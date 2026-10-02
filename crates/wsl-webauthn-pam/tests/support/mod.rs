@@ -19,7 +19,7 @@
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use p256::ecdsa::SigningKey as P256SigningKey;
 use p256::ecdsa::signature::Signer as _;
@@ -169,8 +169,6 @@ pub struct TestDeps {
     pub panic: bool,
     /// Cap on the runner deadline (keeps timeout tests fast).
     pub deadline_cap: Option<Duration>,
-    /// Clock override for the verifier.
-    pub now: SystemTime,
 }
 
 /// A fixed config reply.
@@ -291,10 +289,6 @@ impl Deps for TestDeps {
 
     fn panic_probe(&self) {
         assert!(!self.panic, "injected panic for PAM_ABORT coverage");
-    }
-
-    fn now(&self) -> SystemTime {
-        self.now
     }
 }
 
@@ -614,7 +608,6 @@ impl Fixture {
             },
             panic: false,
             deadline_cap: Some(Duration::from_secs(5)),
-            now: SystemTime::now(),
         }
     }
 }

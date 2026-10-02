@@ -112,7 +112,6 @@ fn independent_assertion() {
         authenticator_data: &auth_data,
         signature: &signature,
         expected_sign_count: None,
-        now: pinned_now(),
     };
     let outcome = verify_assertion(&check).expect("independent assertion must verify");
     assert_eq!(outcome.sign_count, 5);

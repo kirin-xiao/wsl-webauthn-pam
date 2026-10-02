@@ -48,7 +48,6 @@ fn check<'a>(a: &'a Assertion) -> AssertionCheck<'a> {
         authenticator_data: &a.auth_data,
         signature: &a.signature,
         expected_sign_count: None,
-        now: fixture_now(),
     }
 }
 
@@ -404,8 +403,8 @@ fn negative_credential_key_rsa_modulus_too_small() {
 
 #[test]
 fn negative_credential_key_kty_alg_mismatch() {
-    // Each known kty paired with a known-but-wrong alg must be rejected as an
-    // unsupported *key type* (the allow-listed alg is not valid for that kty).
+    // Each known kty paired with a known-but-wrong alg is rejected as a
+    // key-type/algorithm *mismatch* (L1-7), distinct from an unknown kty.
     let a = build_assertion(&es256());
     let cases: [(i64, i64); 3] = [
         (2, -257), // kty=EC2 with RS256
@@ -418,8 +417,8 @@ fn negative_credential_key_kty_alg_mismatch() {
         c.cose_public_key = &cose;
         assert_eq!(
             verify_assertion(&c),
-            Err(VerifyError::UnsupportedKeyType { kty }),
-            "kty={kty}/alg={alg} must be a key-type mismatch"
+            Err(VerifyError::KeyTypeAlgorithmMismatch { kty, alg }),
+            "kty={kty}/alg={alg} must be a key-type/algorithm mismatch"
         );
     }
 }

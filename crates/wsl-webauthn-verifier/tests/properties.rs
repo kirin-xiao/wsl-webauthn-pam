@@ -89,7 +89,6 @@ proptest! {
             authenticator_data: &auth_data,
             signature: &signature,
             expected_sign_count: Some(stored),
-            now: common::fixture_now(),
         };
         let outcome = verify_assertion(&check);
         let should_reject = (stored != 0 || observed != 0) && observed <= stored;
@@ -125,7 +124,6 @@ proptest! {
             authenticator_data: &auth_data,
             signature: &signature,
             expected_sign_count: None,
-            now: common::fixture_now(),
         };
         prop_assert_eq!(verify_assertion(&check), verify_assertion(&check));
     }
