@@ -153,6 +153,16 @@ NOTE:
     A value that begins with `-` must use the `--flag=value` form; in the
     `--flag value` form a `-`-prefixed token is read as the next flag.
 
+STABLE ERROR TOKENS:
+    Operational failures print `error[<token>]: <message>` on stderr (usage errors
+    print a bare `error:`). Scripts can branch on the bracketed token without parsing
+    prose. Current tokens:
+      config-missing, config-invalid, not-found, already-exists, record-corrupt,
+      invalid-username, symlink, not-regular-file, insecure-store, too-large,
+      path-changed, record-user-mismatch, encode, io,
+      bridge-missing, interop-unavailable, spawn, bridge-failed, transport, timeout,
+      verify-rejected, error
+
 EXIT CODES:
     0   success
     1   operational failure; in `status` list mode this includes one or more
@@ -224,6 +234,66 @@ mod userdb {
 const EXIT_OK: i32 = 0;
 const EXIT_FAIL: i32 = 1;
 const EXIT_USAGE: i32 = 2;
+
+/// A stable machine-readable token for an operational failure (L8-10).
+///
+/// Every `error!`-style `anyhow` error carries at least one source; the innermost store,
+/// runner, or verifier error is mapped to a documented token. Errors that originate in the
+/// CLI itself have no source and map to the generic `error` token.
+fn error_code(error: &anyhow::Error) -> &'static str {
+    for cause in error.chain() {
+        if let Some(store) = cause.downcast_ref::<StoreError>() {
+            return store_error_code(store);
+        }
+        if let Some(runner) = cause.downcast_ref::<wsl_webauthn_runner::RunnerError>() {
+            return runner_error_code(runner);
+        }
+        if let Some(verify) = cause.downcast_ref::<VerifyError>() {
+            return verify_error_code(verify);
+        }
+    }
+    "error"
+}
+
+/// Stable token for a [`StoreError`].
+fn store_error_code(error: &StoreError) -> &'static str {
+    match error {
+        StoreError::InvalidUsername => "invalid-username",
+        StoreError::SymlinkedPath { .. } => "symlink",
+        StoreError::NotRegularFile { .. } => "not-regular-file",
+        StoreError::BadOwnership { .. } | StoreError::InsecureBase { .. } => "insecure-store",
+        StoreError::NotFound { .. } => "not-found",
+        StoreError::AlreadyExists { .. } => "already-exists",
+        StoreError::Corrupt { .. } => "record-corrupt",
+        StoreError::TooLarge { .. } => "too-large",
+        StoreError::PathChanged { .. } => "path-changed",
+        StoreError::RecordUserMismatch { .. } => "record-user-mismatch",
+        StoreError::ConfigMissing { .. } => "config-missing",
+        StoreError::Config { .. } => "config-invalid",
+        StoreError::Encode { .. } => "encode",
+        StoreError::Io { .. } => "io",
+    }
+}
+
+/// Stable token for a [`wsl_webauthn_runner::RunnerError`].
+fn runner_error_code(error: &wsl_webauthn_runner::RunnerError) -> &'static str {
+    use wsl_webauthn_runner::RunnerError;
+    match error {
+        RunnerError::BridgeMissing { .. } => "bridge-missing",
+        RunnerError::InteropUnavailable { .. } => "interop-unavailable",
+        RunnerError::RequestTooLarge { .. } => "too-large",
+        RunnerError::Spawn { .. } => "spawn",
+        RunnerError::BridgeFailed { .. } => "bridge-failed",
+        RunnerError::Transport { .. } => "transport",
+        RunnerError::Timeout { .. } => "timeout",
+        RunnerError::InteropHelperMissing { .. } => "interop-unavailable",
+    }
+}
+
+/// Stable token for a [`VerifyError`].
+fn verify_error_code(_error: &VerifyError) -> &'static str {
+    "verify-rejected"
+}
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -626,7 +696,7 @@ fn main() -> ExitCode {
         Ok(Parsed::Run(command)) => match run(command) {
             Ok(code) => code,
             Err(error) => {
-                eprintln!("error: {error:#}");
+                eprintln!("error[{}]: {error:#}", error_code(&error));
                 EXIT_FAIL
             }
         },
@@ -770,9 +840,30 @@ struct BridgeConfig {
     bridge: PathBuf,
     win_mnt: PathBuf,
     /// A non-fatal error reading the on-disk config (e.g. a read-permission failure as
-    /// a non-root user despite `--bridge`/`--win-mnt` being supplied). Surfaced by
-    /// `probe` as a warning; `enroll` folds it into its missing-bridge error.
+    /// a non-root user despite `--bridge`/`--win-mnt` being supplied). Surfaced as a
+    /// warning by every subcommand that consults the config (see [`Self::warn_config_error`]);
+    /// `enroll` also folds it into its missing-bridge error.
     config_error: Option<String>,
+}
+
+impl BridgeConfig {
+    /// The warning to print for a non-fatal config read error, if any.
+    fn config_warning(&self) -> Option<String> {
+        self.config_error
+            .as_ref()
+            .map(|error| format!("warning: {error}"))
+    }
+
+    /// Surface a config read error on stderr (L8-5).
+    ///
+    /// `--bridge`/`--win-mnt` intentionally allow an operator to bypass an unreadable
+    /// config, but silently discarding the read error hides a broken persisted config
+    /// until the next PAM auth fails with an unrelated message.
+    fn warn_config_error(&self) {
+        if let Some(warning) = self.config_warning() {
+            eprintln!("{warning}");
+        }
+    }
 }
 
 /// Resolve the bridge path and Windows mount root from flags, then the config file.
@@ -783,8 +874,15 @@ fn resolve_bridge(
     bridge_flag: Option<PathBuf>,
     win_mnt_flag: Option<PathBuf>,
 ) -> anyhow::Result<BridgeConfig> {
-    let store = Store::system();
+    resolve_bridge_with_store(&Store::system(), bridge_flag, win_mnt_flag)
+}
 
+/// Store-injectable implementation of [`resolve_bridge`] (tempdir-backed in tests).
+fn resolve_bridge_with_store(
+    store: &Store,
+    bridge_flag: Option<PathBuf>,
+    win_mnt_flag: Option<PathBuf>,
+) -> anyhow::Result<BridgeConfig> {
     // Only consult the config when a flag does not already supply the value; this keeps
     // `probe --bridge … --win-mnt …` usable as non-root (the config is root-readable).
     let mut config: Option<wsl_webauthn_store::Config> = None;
@@ -848,6 +946,7 @@ fn cmd_enroll(
     require_root("enroll")?;
     let target = resolve_target_user(user)?;
     let config = resolve_bridge(bridge, win_mnt)?;
+    config.warn_config_error();
 
     println!(
         "Enrolling \"{}\" (uid {}) with Windows Hello",
@@ -894,7 +993,7 @@ fn cmd_enroll(
             bail!("probe failed: {} ({err:?})", friendly_bridge_error(err));
         }
         Ok(other) => bail!("unexpected probe response: {other:?}"),
-        Err(err) => bail!("probe transport error: {err}"),
+        Err(err) => bail!("probe transport error: {}", render_runner_error(&err)),
     }
 
     // 2. Capture the Windows identity (non-fatal).
@@ -1119,7 +1218,12 @@ fn run_ceremony(runner: &dyn EnrollCeremony, target: &UserInfo) -> anyhow::Resul
 
     let response = runner
         .run_ceremony(params, ENROLL_DEADLINE)
-        .map_err(|error| anyhow!("enrollment transport error: {error}"))?;
+        .map_err(|error| {
+            anyhow!(
+                "enrollment transport error: {}",
+                render_runner_error(&error)
+            )
+        })?;
 
     match response {
         RunnerResponse::Enroll {
@@ -1247,6 +1351,13 @@ fn build_record(
 ///
 /// A small local reader avoids depending on the verifier's `#[doc(hidden)]` test seam.
 /// The verifier has already validated the key structure, so this only extracts a label.
+///
+/// **L6-5 follow-up (cross-crate, not done here).** This duplicates COSE schema knowledge
+/// that the verifier already parsed. Once `wsl_webauthn_verifier::EnrollOutcome` gains a
+/// `pub alg: i32` field (populated from `ParsedCoseKey::alg` — a verifier-side change; the
+/// field is absent as of this branch), `build_record` should read `outcome.alg` and this
+/// function (plus its two unit tests below) can be deleted. Records loaded from disk carry
+/// an explicit `alg` already, so no fallback reader is needed after that.
 fn read_cose_alg(cose_public_key: &[u8]) -> anyhow::Result<i32> {
     let value: ciborium::value::Value = ciborium::from_reader(cose_public_key)
         .map_err(|e| anyhow!("COSE key is not valid CBOR: {e}"))?;
@@ -1303,13 +1414,11 @@ fn cmd_probe(bridge: Option<PathBuf>, win_mnt: Option<PathBuf>) -> anyhow::Resul
 
     println!("Bridge:  {}", config.bridge.display());
     println!("win_mnt: {}", config.win_mnt.display());
-    if let Some(error) = &config.config_error {
-        eprintln!("warning: {error}");
-    }
+    config.warn_config_error();
 
     if !config.bridge.exists() {
         eprintln!(
-            "error: bridge executable not found: {}",
+            "error[bridge-missing]: bridge executable not found: {}",
             config.bridge.display()
         );
         return Ok(EXIT_FAIL);
@@ -1365,7 +1474,7 @@ fn cmd_probe(bridge: Option<PathBuf>, win_mnt: Option<PathBuf>) -> anyhow::Resul
             ok = false;
         }
         Err(error) => {
-            println!("interop: FAILED — {error}");
+            println!("interop: FAILED — {}", render_runner_error(&error));
             ok = false;
         }
     }
@@ -1447,8 +1556,8 @@ fn status_with_store(store: &Store, user: Option<String>) -> anyhow::Result<i32>
     }
     if unreadable > 0 {
         eprintln!(
-            "error: {unreadable} of {} credential record(s) under {} are unreadable; \
-             re-run as root to read them",
+            "error[record-corrupt]: {unreadable} of {} credential record(s) under {} are \
+             unreadable; re-run as root to read them",
             users.len(),
             store.credentials_dir().display()
         );
@@ -1768,6 +1877,10 @@ fn packed_self_attestation(auth_data: &[u8], signature: &[u8]) -> anyhow::Result
 // ---------------------------------------------------------------------------
 
 /// Capture `HOST\user` and the SID via `whoami.exe`. Non-fatal: `None` on failure.
+///
+/// L8-6: an empty SID is *not* a known identity. If the `/user` probe fails or its output
+/// carries no `S-1-` token, the whole identity is omitted (`None`) rather than persisting
+/// `sid: ""`, so audit data cannot present a half-absent binding as real.
 fn capture_windows_identity(win_mnt: &Path) -> Option<WindowsIdentity> {
     let account_output = InteropCommand::run("whoami.exe", &[], win_mnt, WHOAMI_DEADLINE).ok()?;
     let account = String::from_utf8_lossy(&account_output.stdout)
@@ -1779,15 +1892,21 @@ fn capture_windows_identity(win_mnt: &Path) -> Option<WindowsIdentity> {
 
     let sid = InteropCommand::run("whoami.exe", &["/user"], win_mnt, WHOAMI_DEADLINE)
         .ok()
-        .and_then(|output| {
-            let text = String::from_utf8_lossy(&output.stdout);
-            text.split_whitespace()
-                .find(|token| token.starts_with("S-1-"))
-                .map(str::to_string)
-        })
-        .unwrap_or_default();
+        .and_then(|output| parse_windows_sid(&output.stdout))?;
 
     Some(WindowsIdentity { account, sid })
+}
+
+/// Extract the first `S-1-…` SID token from `whoami.exe /user` output.
+///
+/// Returns `None` for output without a SID (and never an empty string), so a failed or
+/// unexpected probe cannot be mistaken for a captured identity (L8-6).
+fn parse_windows_sid(stdout: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stdout);
+    text.split_whitespace()
+        .find(|token| token.starts_with("S-1-"))
+        .map(str::to_string)
+        .filter(|sid| !sid.is_empty())
 }
 
 // ---------------------------------------------------------------------------
@@ -1828,6 +1947,35 @@ fn friendly_bridge_error(error: wsl_webauthn_protocol::BridgeError) -> &'static 
         BridgeError::Busy => "another Windows Hello operation is already in progress",
         BridgeError::InvalidParameter => "the bridge rejected the request parameters",
         BridgeError::Internal => "an internal bridge error occurred",
+    }
+}
+
+/// Render a runner transport error, disambiguating a signal-killed bridge (L8-11).
+///
+/// `RunnerError::BridgeFailed { code: None }` means the child was terminated by a signal,
+/// but its `Display` renders a bare "status None" with no signal number. The runner type
+/// is out of this crate's scope, so the CLI can only add the interpretation.
+///
+/// **Runner-side follow-up (needed for the real fix):** replace
+/// `RunnerError::BridgeFailed { code: Option<i32>, message: String }`
+/// (crates/wsl-webauthn-runner/src/lib.rs, `bridge_failed` at ~line 916) with a
+/// `reason: ExitReason` field, `enum ExitReason { Code(i32), Signal(i32) }`, populated
+/// from `std::os::unix::process::ExitStatusExt::signal()` instead of `status.code()`
+/// (sites ~lines 506 and 682). Its `Display`/`bridge_exit_meaning` should then render
+/// "terminated by signal 9 (SIGKILL)" and a `BridgeFailed` test should `abort()` a fake
+/// bridge and assert the message names the signal. Until then this wrapper at least stops
+/// the CLI from presenting the ambiguity as a plain missing exit code.
+fn render_runner_error(error: &wsl_webauthn_runner::RunnerError) -> String {
+    use wsl_webauthn_runner::RunnerError;
+    match error {
+        RunnerError::BridgeFailed {
+            code: None,
+            message,
+        } => format!(
+            "{message} (the bridge child was terminated by a signal before it could exit; \
+             run the bridge directly to identify which signal)"
+        ),
+        other => other.to_string(),
     }
 }
 
@@ -2260,6 +2408,40 @@ mod tests {
             PathBuf::from("/definitely/not/here/bridge.exe")
         );
         assert!(resolved.win_mnt.ends_with("tmp"));
+    }
+
+    /// L8-5: an unreadable config must be surfaced as a warning on every subcommand that
+    /// consults the config — even when `--bridge` lets the run continue.
+    #[test]
+    fn resolve_bridge_surfaces_an_unreadable_config_as_a_warning() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_dir, store) = tempdir_store();
+        // A config with the wrong mode is refused by `read_secure_file` (BadOwnership), a
+        // non-`ConfigMissing` error the CLI must not silently swallow.
+        let cfg = store.config_path();
+        std::fs::write(&cfg, b"bridge_path = \"/mnt/c/bridge.exe\"\n").unwrap();
+        std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let resolved = resolve_bridge_with_store(
+            &store,
+            Some(PathBuf::from("/definitely/not/here/bridge.exe")),
+            None,
+        )
+        .unwrap();
+
+        let warning = resolved
+            .config_warning()
+            .expect("a config read error must be surfaced, not discarded");
+        assert!(warning.starts_with("warning: could not read"), "{warning}");
+        assert!(
+            warning.contains(&store.config_path().display().to_string()),
+            "the warning must name the config path: {warning}"
+        );
+        // The explicit `--bridge` still wins, so the run proceeds despite the warning.
+        assert_eq!(
+            resolved.bridge,
+            PathBuf::from("/definitely/not/here/bridge.exe")
+        );
     }
 
     // ---- user resolution ----
@@ -2844,6 +3026,110 @@ mod tests {
         assert!(store.load("bob").is_ok(), "bob's record must survive");
         // Removing a missing user is a no-op, not an error.
         assert!(!store.remove("carol").unwrap());
+    }
+
+    // ---- stable error tokens / runner rendering (L8-10, L8-11) ----
+
+    #[test]
+    fn error_codes_are_stable_tokens() {
+        // Store family.
+        let store_err: anyhow::Error = anyhow::Error::new(StoreError::ConfigMissing {
+            path: PathBuf::from("/etc/wsl_webauthn/config"),
+        });
+        assert_eq!(error_code(&store_err), "config-missing");
+        // Runner family.
+        let runner_err: anyhow::Error =
+            anyhow::Error::new(wsl_webauthn_runner::RunnerError::BridgeMissing {
+                path: PathBuf::from("/mnt/c/bridge.exe"),
+            });
+        assert_eq!(error_code(&runner_err), "bridge-missing");
+        // Verifier family.
+        let verify_err: anyhow::Error = anyhow::Error::new(VerifyError::ChallengeMismatch);
+        assert_eq!(error_code(&verify_err), "verify-rejected");
+        // Wrapped with context: the innermost source still decides the token.
+        let wrapped = store_err.context("hashing bridge");
+        assert_eq!(error_code(&wrapped), "config-missing");
+        // A CLI-originated error (no source) falls back to the generic token.
+        assert_eq!(error_code(&anyhow!("no bridge configured")), "error");
+        // A few more representative mappings.
+        assert_eq!(
+            store_error_code(&StoreError::AlreadyExists {
+                path: PathBuf::from("/x")
+            }),
+            "already-exists"
+        );
+        assert_eq!(
+            store_error_code(&StoreError::BadOwnership {
+                path: PathBuf::from("/x"),
+                expected_uid: 0,
+                actual_uid: 1,
+                expected_mode: 0o600,
+                actual_mode: 0o644,
+            }),
+            "insecure-store"
+        );
+    }
+
+    #[test]
+    fn usage_documents_every_error_token() {
+        assert!(USAGE.contains("STABLE ERROR TOKENS"));
+        // Tokens scripts may rely on: a representative sample from each family.
+        for token in [
+            "config-missing",
+            "config-invalid",
+            "record-corrupt",
+            "already-exists",
+            "bridge-failed",
+            "timeout",
+            "verify-rejected",
+        ] {
+            assert!(USAGE.contains(token), "usage must document token {token}");
+        }
+    }
+
+    #[test]
+    fn runner_bridge_failed_signal_death_is_explained() {
+        let signal = wsl_webauthn_runner::RunnerError::BridgeFailed {
+            code: None,
+            message: "bridge exited with status None: bridge terminated by signal before \
+                      writing a response"
+                .to_string(),
+        };
+        let rendered = render_runner_error(&signal);
+        assert!(
+            rendered.contains("terminated by a signal"),
+            "a signal death must be disambiguated from a missing exit code: {rendered}"
+        );
+
+        // A real exit code is rendered verbatim (no signal note).
+        let coded = wsl_webauthn_runner::RunnerError::BridgeFailed {
+            code: Some(3),
+            message: "bridge exited with status Some(3): malformed response".to_string(),
+        };
+        assert_eq!(
+            render_runner_error(&coded),
+            "bridge exited with status Some(3): malformed response"
+        );
+    }
+
+    #[test]
+    fn parse_windows_sid_extracts_the_s1_token() {
+        let out = b"USER INFORMATION\r\n----------------\r\n\r\n\
+User Name   HOST\\alice\r\n\
+SID         S-1-5-21-1-2-3-1001\r\n";
+        assert_eq!(
+            parse_windows_sid(out).as_deref(),
+            Some("S-1-5-21-1-2-3-1001")
+        );
+        // An empty or SID-less probe is `None`, never an empty string.
+        assert!(parse_windows_sid(b"").is_none());
+        assert!(parse_windows_sid(b"User Name   HOST\\alice\n").is_none());
+    }
+
+    #[test]
+    fn default_win_mnt_has_a_single_definition() {
+        assert_eq!(DEFAULT_WIN_MNT, wsl_webauthn_store::Config::DEFAULT_WIN_MNT);
+        assert_eq!(DEFAULT_WIN_MNT, "/mnt/c");
     }
 
     // ---- verify self-test ----
