@@ -3,14 +3,34 @@
 //! Recognised arguments (all optional, order-independent):
 //!
 //! * `debug` — emit `LOG_DEBUG` detail (never secrets) to syslog.
-//! * `timeout=<secs>` — whole-child authentication deadline; overrides the config
-//!   value and the 60 s default. A non-numeric or zero value is ignored (debug-logged).
-//! * `noverifypin` — skip the bridge-executable SHA-256 pin check (plan D11). This
-//!   weakens a defence-in-depth control; it is logged loudly on every use.
+//! * `timeout=<secs>` — whole-child authentication deadline, in
+//!   `1..=`[`MAX_TIMEOUT_SECS`]; overrides the config value and the 60 s default.
 //!
-//! Unknown arguments are ignored and debug-logged; parsing never panics.
+//! There is deliberately **no `noverifypin` argument**: disabling the
+//! bridge-executable SHA-256 pin from `/etc/pam.d` let an operator (or a near-miss
+//! typo they believed enabled it) silently turn root authentication into "run
+//! whatever executable is at the configured path". The pin is now always verified.
+//! A future build/install-time escape hatch, if ever needed, must live behind
+//! `cfg(debug_assertions)` — never in the runtime argument surface (L2-4).
+//!
+//! Unknown arguments are **logged at `LOG_ERR`**, not silently debug-logged: a
+//! near-miss `timeout=`, a misspelled flag, or a stale `noverifypin` must be visible
+//! at the default log level. `timeout=` outside the accepted range is likewise
+//! `LOG_ERR` and ignored (the config/default applies), never honoured as an
+//! unbounded value. Parsing never panics.
 
 use wsl_webauthn_protocol::DEFAULT_AUTH_TIMEOUT_SECS;
+
+use crate::bindings::LOG_ERR;
+use crate::logger;
+
+/// Upper bound for an operator-supplied `timeout=<secs>`.
+///
+/// The whole authentication is a 1–3 s Windows Hello gesture; a value above this is
+/// far more likely to be a typo (`timeout=6000`) or a denial-of-service knob than a
+/// deliberate setting, so an out-of-range value is rejected rather than honoured
+/// unboundedly (L2-7).
+pub const MAX_TIMEOUT_SECS: u64 = 600;
 
 /// Parsed module arguments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -19,35 +39,49 @@ pub struct ModuleArgs {
     pub debug: bool,
     /// `timeout=<secs>`, when supplied and valid.
     pub timeout_secs: Option<u64>,
-    /// `noverifypin`.
-    pub noverifypin: bool,
 }
 
 /// Parse module arguments.
 ///
-/// `raw` are the strings as delivered to `pam_sm_authenticate`.
+/// `raw` are the strings as delivered to `pam_sm_authenticate`. Invalid or unknown
+/// tokens are reported at `LOG_ERR` and ignored; they never change the decision.
 pub fn parse(raw: &[String]) -> ModuleArgs {
     let mut args = ModuleArgs::default();
     for arg in raw {
         match arg.as_str() {
             "debug" => args.debug = true,
-            "noverifypin" => args.noverifypin = true,
             other => {
                 if let Some((key, value)) = other.split_once('=') {
                     if key == "timeout" {
                         match value.parse::<u64>() {
-                            Ok(secs) if secs > 0 => args.timeout_secs = Some(secs),
-                            _ => crate::logger::debug(&format!(
-                                "ignoring invalid timeout argument: {other:?}"
-                            )),
+                            Ok(secs) if (1..=MAX_TIMEOUT_SECS).contains(&secs) => {
+                                args.timeout_secs = Some(secs);
+                            }
+                            Ok(secs) => logger::auth(
+                                LOG_ERR,
+                                &format!(
+                                    "invalid timeout argument {other:?}: {secs} is outside \
+                                     1..={MAX_TIMEOUT_SECS}; ignoring it"
+                                ),
+                            ),
+                            Err(_) => logger::auth(
+                                LOG_ERR,
+                                &format!(
+                                    "invalid timeout argument {other:?}: not a number; ignoring it"
+                                ),
+                            ),
                         }
                     } else {
-                        crate::logger::debug(&format!(
-                            "ignoring unknown module argument: {other:?}"
-                        ));
+                        logger::auth(
+                            LOG_ERR,
+                            &format!("ignoring unknown module argument: {other:?}"),
+                        );
                     }
                 } else {
-                    crate::logger::debug(&format!("ignoring unknown module argument: {other:?}"));
+                    logger::auth(
+                        LOG_ERR,
+                        &format!("ignoring unknown module argument: {other:?}"),
+                    );
                 }
             }
         }
@@ -82,27 +116,52 @@ mod tests {
     }
 
     #[test]
-    fn flags_parse() {
-        let a = parse(&s(&["debug", "noverifypin"]));
+    fn debug_parses() {
+        let a = parse(&s(&["debug"]));
         assert!(a.debug);
-        assert!(a.noverifypin);
         assert_eq!(a.timeout_secs, None);
     }
 
     #[test]
-    fn timeout_parses() {
+    fn timeout_parses_within_range() {
         assert_eq!(parse(&s(&["timeout=30"])).timeout_secs, Some(30));
-        assert_eq!(parse(&s(&["timeout=0"])).timeout_secs, None);
-        assert_eq!(parse(&s(&["timeout=abc"])).timeout_secs, None);
-        assert_eq!(parse(&s(&["timeout="])).timeout_secs, None);
+        assert_eq!(parse(&s(&["timeout=1"])).timeout_secs, Some(1));
+        assert_eq!(
+            parse(&s(&[&format!("timeout={MAX_TIMEOUT_SECS}")])).timeout_secs,
+            Some(MAX_TIMEOUT_SECS)
+        );
     }
 
     #[test]
-    fn unknown_args_ignored() {
+    fn timeout_out_of_range_or_malformed_is_ignored() {
+        // Zero, non-numeric, empty, and the previously-unbounded u64::MAX all fall
+        // back to the config/default rather than being honoured.
+        assert_eq!(parse(&s(&["timeout=0"])).timeout_secs, None);
+        assert_eq!(parse(&s(&["timeout=abc"])).timeout_secs, None);
+        assert_eq!(parse(&s(&["timeout="])).timeout_secs, None);
+        assert_eq!(parse(&s(&["timeout=-1"])).timeout_secs, None);
+        assert_eq!(
+            parse(&s(&["timeout=99999999999999999999"])).timeout_secs,
+            None
+        );
+        assert_eq!(
+            parse(&s(&[&format!("timeout={}", MAX_TIMEOUT_SECS + 1)])).timeout_secs,
+            None
+        );
+        assert_eq!(
+            parse(&s(&[&format!("timeout={}", u64::MAX)])).timeout_secs,
+            None
+        );
+    }
+
+    #[test]
+    fn unknown_and_removed_args_are_ignored() {
         let a = parse(&s(&["bogus", "foo=bar", "=x", "timeout=5"]));
         assert!(!a.debug);
-        assert!(!a.noverifypin);
         assert_eq!(a.timeout_secs, Some(5));
+        // `noverifypin` is no longer an argument; it must not silently do anything.
+        assert_eq!(parse(&s(&["noverifypin"])), ModuleArgs::default());
+        assert_eq!(parse(&s(&["no_verify_pin"])), ModuleArgs::default());
     }
 
     #[test]

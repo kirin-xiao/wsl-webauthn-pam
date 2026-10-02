@@ -11,8 +11,11 @@
 //! 1. `pam_get_user` → validate the name with the store's `^[A-Za-z_][A-Za-z0-9._-]{0,31}$`
 //!    validator (rejecting null/empty first).
 //! 2. Load `/etc/wsl_webauthn/config` and the user's credential record.
-//! 3. Unless `noverifypin`, compare the SHA-256 of the configured bridge executable
-//!    with the digest pinned in the record (plan D11); a mismatch refuses to launch.
+//! 3. Refuse a bridge executable whose path is not trustworthy (symlinked, or written
+//!    by group/other outside a DrvFs mount), then compare the SHA-256 of the bridge
+//!    executable (hashed from an `O_NOFOLLOW` descriptor) with the digest pinned in
+//!    the record (plan D11); a mismatch refuses to launch. There is no way to skip
+//!    this check from the argument surface.
 //! 4. Mint a 32-byte challenge, build the exact `clientDataJSON`, optionally emit a
 //!    `pam_conv` consent pre-prompt (skipped under `PAM_SILENT`), and run the bridge.
 //! 5. Verify the response with `wsl-webauthn-verifier` (echo consistency, credential
@@ -57,16 +60,29 @@
 //! # Module arguments
 //!
 //! ```text
-//! auth [success=end default=ignore] pam_wsl_webauthn.so [debug] [timeout=<secs>] [noverifypin]
+//! auth [success=end default=ignore] pam_wsl_webauthn.so [debug] [timeout=<secs>]
 //! ```
 //!
-//! * `debug` — `LOG_DEBUG` detail (never secrets, challenges, or signatures).
-//! * `timeout=<secs>` — whole-child deadline; overrides the config value and the 60 s
-//!   default. The runner's own 5 s `taskkill` budget may add to the wall time.
-//! * `noverifypin` — **disables** the bridge SHA-256 pin check (defence in depth
-//!   removed). Its use is logged loudly at `LOG_ERR` on every authentication.
+//! * `debug` — `LOG_DEBUG` detail (never secrets, challenges, or signatures). The
+//!   setting is per-thread, so it cannot leak into a concurrent authentication.
+//! * `timeout=<secs>` — whole-child deadline in `1..=600`; overrides the config value
+//!   and the 60 s default. The runner's own 5 s `taskkill` budget may add to the wall
+//!   time.
 //!
-//! Unknown arguments are ignored and debug-logged. Parsing never panics.
+//! There is **no `noverifypin` argument** (removed; L2-4). Disabling the bridge pin
+//! from `/etc/pam.d` silently reduced root authentication to "run whatever executable
+//! is at the configured path"; the pin is now always enforced. Unknown arguments,
+//! including a stray `noverifypin`, and an out-of-range `timeout=` are logged at
+//! `LOG_ERR` and ignored — a near-miss flag must be visible at the default log level.
+//!
+//! # Pre-prompt bridge verification cost (L10-2)
+//!
+//! Hashing the bridge executable happens on **every** authentication, before the
+//! Windows Hello prompt. It streams the file (never `fs::read`s it whole) and, on a
+//! 9p/DrvFs mount, measured ~10–15 ms for the ~2 MB bridge — negligible against the
+//! 1–3 s gesture and the 50–110 ms interop spawn, and deliberate: caching the digest
+//! would reopen the TOCTOU window the pin exists to narrow. A size cap refuses to hash
+//! an absurdly large file.
 //!
 //! # Lockout guidance
 //!
@@ -97,6 +113,13 @@
 // (fail-closed). With `panic = "abort"` that mapping is silently lost and a
 // panic would unwind across the FFI boundary / abort the host process. Require
 // unwinding panics in every profile.
+//
+// Dependency (L3-5): this strategy only produces a *defined* unwind/return — rather
+// than aborting — because libpam is compiled with `-fexceptions` and the six
+// `pam_sm_*` entry points are `extern "C"` frames that `guarded`/`run` always wrap in
+// `catch_unwind`. A downstream packager must therefore keep `panic = "unwind"` *and*
+// libpam built with exceptions; the compile-time guard below rejects an aborting
+// profile, and `tests/` drives a deliberate panic through the real `guarded` closure.
 #[cfg(not(panic = "unwind"))]
 compile_error!(
     "wsl-webauthn-pam must be built with panic=unwind; panic=abort would disable \
@@ -108,6 +131,7 @@ pub mod bindings;
 pub mod logger;
 pub mod logic;
 pub mod seam;
+mod sys;
 
 pub use args::ModuleArgs;
 pub use logic::{AuthOutcome, Deps, FAIL_DELAY_USEC, SystemDeps, authenticate, run};
@@ -332,6 +356,26 @@ mod tests {
 
         assert!(
             !stderr.contains("L8-1 stderr sentinel") && !stderr.contains("panicked"),
+            "the panic payload must not reach stderr, got: {stderr:?}"
+        );
+    }
+
+    /// L3-5: the *outer* guarded closure that wraps the real `pam_sm_authenticate`
+    /// path (argument collection → `run`) must also contain a panic. A panic raised
+    /// while marshalling the PAM argument array must become `PAM_ABORT`, not unwind
+    /// across the C ABI.
+    #[test]
+    fn panic_in_the_outer_pam_sm_authenticate_closure_maps_to_pam_abort() {
+        logger::install_panic_hook();
+        let stderr = capture_stderr(|| {
+            let code = guarded("pam_sm_authenticate", || {
+                let _args: Vec<String> = Vec::new();
+                panic!("L3-5 outer-closure sentinel");
+            });
+            assert_eq!(code, PAM_ABORT, "the outer closure must fail closed");
+        });
+        assert!(
+            !stderr.contains("L3-5 outer-closure sentinel") && !stderr.contains("panicked"),
             "the panic payload must not reach stderr, got: {stderr:?}"
         );
     }

@@ -104,12 +104,23 @@ impl PamSeam for FakeSeam {
 
 /// How [`TestDeps::sha256_file`] behaves.
 pub enum Sha256Behavior {
-    /// Hash the real file (so a correctly pinned bridge passes).
+    /// Hash the real file through the production `O_NOFOLLOW` hasher.
     OfFile,
     /// Return this digest regardless of the file (a pin mismatch).
     Fixed([u8; 32]),
     /// Fail as if the file were unreadable.
     Err(String),
+}
+
+/// How [`TestDeps::bridge_path_is_trusted`] behaves.
+pub enum TrustBehavior {
+    /// Delegate to the production ownership/mode/symlink check.
+    Real,
+    /// Accept every path (the common in-test case: the fake bridge lives outside the
+    /// tempdir/win_mnt and is not root-owned, so the production rule would refuse it).
+    Trusted,
+    /// Refuse every path (drives the untrusted-path mapping).
+    Untrusted,
 }
 
 /// How the runner is driven.
@@ -145,6 +156,8 @@ pub struct TestDeps {
     pub record: RecordReply,
     /// Bridge-pin hashing behaviour.
     pub sha256: Sha256Behavior,
+    /// Bridge-path trust behaviour.
+    pub trust: TrustBehavior,
     /// Bytes returned by `fill_random` (copied, repeated if needed).
     pub random: [u8; 32],
     /// When set, `fill_random` reports an entropy failure instead of filling bytes
@@ -233,6 +246,14 @@ impl Deps for TestDeps {
         }
     }
 
+    fn bridge_path_is_trusted(&self, path: &Path, win_mnt: &Path) -> Result<(), String> {
+        match &self.trust {
+            TrustBehavior::Real => pam_wsl_webauthn::logic::bridge_path_is_trusted(path, win_mnt),
+            TrustBehavior::Trusted => Ok(()),
+            TrustBehavior::Untrusted => Err("test-forced untrusted bridge path".to_string()),
+        }
+    }
+
     fn fill_random(&self, dest: &mut [u8]) -> Result<(), String> {
         if let Some(e) = &self.random_error {
             return Err(e.clone());
@@ -277,13 +298,9 @@ impl Deps for TestDeps {
     }
 }
 
-/// SHA-256 a file, mirroring [`pam_wsl_webauthn::logic::SystemDeps`]'s behaviour.
+/// SHA-256 a file, mirroring the hardened O_NOFOLLOW hasher used in production.
 pub fn hash_file(path: &Path) -> Result<[u8; 32], String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("read {path:?}: {e}"))?;
-    let digest = Sha256::digest(&bytes);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest);
-    Ok(out)
+    pam_wsl_webauthn::logic::sha256_file_nofollow(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -415,6 +432,16 @@ pub fn script_success(bundle: &AssertionBundle, echo: bool) -> String {
 pub fn script_response(response: &Response) -> String {
     let frame = response.to_frame().expect("response serializes");
     format!("response={}", b64u_encode(&frame))
+}
+
+/// A scripted **probe** response, to exercise an unexpected variant on the assert path.
+pub fn script_probe() -> String {
+    script_response(&Response::probe(true, 10))
+}
+
+/// A scripted **enroll** response, to exercise an unexpected variant on the assert path.
+pub fn script_enroll() -> String {
+    script_response(&Response::enroll("packed", "", ""))
 }
 
 // ---------------------------------------------------------------------------
@@ -576,6 +603,7 @@ impl Fixture {
             config: ConfigReply::Missing,
             record: RecordReply::NotFound,
             sha256: Sha256Behavior::OfFile,
+            trust: TrustBehavior::Trusted,
             random: self.challenge,
             random_error: None,
             runner: RunnerBehavior {
