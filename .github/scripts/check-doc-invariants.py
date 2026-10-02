@@ -35,15 +35,21 @@ Add an entry to `INVARIANTS` with:
                 least a marker, a static anchor, or a test).
     claims      [(relative path, substring), ...] — the documented claim(s)
                 that must still be present, so a prose removal is caught.
-    tests       [{"name": ..., "expect": [...], "forbid": [...]}, ...] —
-                `expect` substrings must all appear in the named test's body,
-                `forbid` (optional) substrings must not.  `expect` encodes the
-                documented direction: a "must be rejected" invariant expects an
-                `Err(VerifyError::…)` / `PAM_AUTH_ERR` and forbids `PAM_SUCCESS`.
+    tests       [{"name": ..., "expect": [...], "forbid": [...],
+                  "file": "relative/path.rs"}, ...] —
+                `expect` substrings must all appear in the named test's *code*
+                (comments are stripped first, so a comment cannot satisfy a
+                direction check) and `forbid` (optional) substrings must not.
+                `expect` encodes the documented direction: a "must be rejected"
+                invariant expects an `Err(VerifyError::…)` / `PAM_AUTH_ERR` and
+                forbids `PAM_SUCCESS`.  A mapped test carrying `#[ignore]` is an
+                error (it must actually run), and a name defined in more than one
+                file is an error unless `"file"` pins the intended one.
     static      [(path, substring), ...] — non-test code/doc anchors (e.g. a
                 `compile_error!` guard) that must exist.
-    marker      True if the id must appear as `<!-- INVARIANT: ID -->` in a
-                file listed in `MARKER_FILES`.
+    marker      True if the id must appear as `<!-- INVARIANT: ID -->` in *every*
+                machine-checked file that the entry's `claims` reference (at
+                least `SECURITY.md`), not merely one of them.
 
 This is deliberately a hand-maintained table, not NLP: a reworded test name is
 a one-line mapping update, and a genuinely new invariant is an explicit
@@ -347,7 +353,7 @@ INVARIANTS = [
     {
         "id": "CBOR-EXACT-NO-TRAILING",
         "level": "high",
-        "claims": [(VERIFIER_LIB, "attested-credential-data length bounds")],
+        "claims": [],
         "tests": [
             {"name": "negative_attestation_object_trailing_bytes", "expect": ["MalformedAttestationObject"]},
             {"name": "cose_trailing_byte_rejected", "expect": ["!testing::parse_cose_key"]},
@@ -357,7 +363,7 @@ INVARIANTS = [
     {
         "id": "CBOR-NO-DUPLICATE-KEYS",
         "level": "high",
-        "claims": [(VERIFIER_LIB, "attestation_object")],
+        "claims": [],
         "tests": [
             {"name": "negative_duplicate_fmt_rejected", "expect": ["MalformedAttestationObject"]},
             {"name": "negative_duplicate_auth_data_rejected", "expect": ["MalformedAttestationObject"]},
@@ -367,7 +373,7 @@ INVARIANTS = [
     {
         "id": "AUTHDATA-CANONICAL-COSE-FIRST",
         "level": "high",
-        "claims": [(VERIFIER_LIB, "attested-credential-data length bounds")],
+        "claims": [],
         "tests": [
             {"name": "rejects_non_canonical_key", "expect": ["Err(VerifyError::MalformedCoseKey"]},
         ],
@@ -376,7 +382,7 @@ INVARIANTS = [
     {
         "id": "AUTHDATA-ED-GATES-TRAILING",
         "level": "high",
-        "claims": [(VERIFIER_LIB, "attested-credential-data length bounds")],
+        "claims": [],
         "tests": [
             {"name": "rejects_trailing_bytes_without_ed", "expect": ["MalformedAuthenticatorData"]},
             {"name": "accepts_trailing_extensions_with_ed", "expect": ["parse_attested_credential_data", "cose_public_key"]},
@@ -410,7 +416,10 @@ INVARIANTS = [
         "id": "ASSERTION-CLIENTDATA-CHALLENGE-DECODED",
         "level": "high",
         "claims": [(VERIFIER_LIB, "`challenge` compared on **decoded** bytes")],
-        "tests": [{"name": "negative_wrong_challenge", "expect": ["Err(VerifyError::ChallengeMismatch)"]}],
+        "tests": [
+            {"name": "negative_wrong_challenge", "file": AS, "expect": ["Err(VerifyError::ChallengeMismatch)"]},
+            {"name": "negative_wrong_challenge", "file": AT, "expect": ["Err(VerifyError::ChallengeMismatch)"]},
+        ],
         "marker": True,
     },
     {
@@ -424,7 +433,10 @@ INVARIANTS = [
         "id": "ASSERTION-RPIDHASH",
         "level": "high",
         "claims": [(VERIFIER_LIB, "`rpIdHash == SHA-256(RP_ID)`")],
-        "tests": [{"name": "negative_bad_rpid_hash", "expect": ["Err(VerifyError::RpIdHashMismatch)"]}],
+        "tests": [
+            {"name": "negative_bad_rpid_hash", "file": AS, "expect": ["Err(VerifyError::RpIdHashMismatch)"]},
+            {"name": "negative_bad_rpid_hash", "file": AT, "expect": ["Err(VerifyError::RpIdHashMismatch)"]},
+        ],
         "marker": True,
     },
     {
@@ -432,8 +444,10 @@ INVARIANTS = [
         "level": "high",
         "claims": [(VERIFIER_LIB, "`UP=1`; `UV=1`")],
         "tests": [
-            {"name": "negative_user_presence_zero", "expect": ["Err(VerifyError::UserPresenceRequired)"]},
-            {"name": "negative_user_verification_zero", "expect": ["Err(VerifyError::UserVerificationRequired)"]},
+            {"name": "negative_user_presence_zero", "file": AS, "expect": ["Err(VerifyError::UserPresenceRequired)"]},
+            {"name": "negative_user_presence_zero", "file": AT, "expect": ["Err(VerifyError::UserPresenceRequired)"]},
+            {"name": "negative_user_verification_zero", "file": AS, "expect": ["Err(VerifyError::UserVerificationRequired)"]},
+            {"name": "negative_user_verification_zero", "file": AT, "expect": ["Err(VerifyError::UserVerificationRequired)"]},
         ],
         "marker": True,
     },
@@ -733,60 +747,186 @@ def iter_rust_files(root: Path):
         yield from sorted(crates.rglob("*.rs"))
 
 
-def find_test_body(root: Path, name: str) -> tuple[Path | None, str]:
-    """Locate `fn <name>(...) { ... }`, returning (path, body) or (None, "").
+def repo_rel(root: Path, path: Path) -> str:
+    """Path relative to the repo root, POSIX-style (stable error messages)."""
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.as_posix()
 
-    The body is brace-matched with a tiny scanner that skips `//`/`/* */`
-    comments and string literals, so a `}` inside a message cannot truncate it.
+
+def _block_start(text: str, fn_start: int) -> int:
+    """Index where the attribute/doc block directly above `fn_start` begins.
+
+    `#[ignore]` (and `#[test]`) live *before* the `fn`, so a body slice that
+    starts at `fn` would never see them.  Walk back over the contiguous run of
+    attributes and doc-comments.  A multi-line attribute is recognised by its
+    bracket-only closing lines (which must contain a `]`, so a previous
+    function's bare `}` is never swallowed into the next test's body).  If no
+    `#[…]` attribute is actually found, fall back to `fn_start`.
     """
-    pattern = re.compile(r"\bfn\s+" + re.escape(name) + r"\s*\(")
-    for path in iter_rust_files(root):
-        text = read_text(path)
-        m = pattern.search(text)
-        if not m:
+    head = text[:fn_start]
+    lines = head.split("\n")
+    offsets = []
+    pos = 0
+    for ln in lines:
+        offsets.append(pos)
+        pos += len(ln) + 1
+
+    collected: list[int] = []
+    depth = 0
+    for idx in range(len(lines) - 1, -1, -1):
+        s = lines[idx].strip()
+        if depth > 0:  # inside a multi-line attribute
+            collected.append(idx)
+            depth += s.count("[") - s.count("]")
             continue
-        brace = text.find("{", m.end())
-        if brace < 0:
+        if s == "":
+            if collected:
+                break  # a blank line ends the block once it has started
             continue
-        depth = 0
-        i = brace
-        n = len(text)
-        while i < n:
-            c = text[i]
-            if c == "/" and i + 1 < n and text[i + 1] == "/":
-                nl = text.find("\n", i)
-                i = n if nl < 0 else nl
-            elif c == "/" and i + 1 < n and text[i + 1] == "*":
-                close = text.find("*/", i + 2)
-                i = n if close < 0 else close + 2
-            elif c == '"':
-                i += 1
-                while i < n and text[i] != '"':
-                    if text[i] == "\\":
-                        i += 1
+        if s.startswith("#["):
+            collected.append(idx)
+            depth += s.count("[") - s.count("]")
+            continue
+        if s.startswith("///") or s.startswith("//!"):
+            collected.append(idx)
+            continue
+        # A bracket-only continuation line (e.g. `)]`) of a multi-line attr.
+        if "]" in s and set(s) <= set(" \t[],)"):
+            collected.append(idx)
+            continue
+        break
+
+    if not any(lines[idx].strip().startswith("#[") for idx in collected):
+        return fn_start
+    return offsets[collected[-1]]
+
+
+def _match_body(text: str, brace: int) -> int | None:
+    """Return the index just past the matching `}` for the `{` at `brace`."""
+    depth = 0
+    i = brace
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            nl = text.find("\n", i)
+            i = n if nl < 0 else nl
+        elif c == "/" and i + 1 < n and text[i + 1] == "*":
+            close = text.find("*/", i + 2)
+            i = n if close < 0 else close + 2
+        elif c == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                if text[i] == "\\" and i + 1 < n:
                     i += 1
                 i += 1
-            elif c == "{":
-                depth += 1
+            i += 1
+        elif c == "{":
+            depth += 1
+            i += 1
+        elif c == "}":
+            depth -= 1
+            i += 1
+            if depth == 0:
+                return i
+        else:
+            i += 1
+    return None
+
+
+def find_test_bodies(root: Path, name: str) -> list[tuple[Path, str]]:
+    """Locate every `fn <name>(...) { ... }` in the tree.
+
+    Returns one (path, body) per match.  The body is brace-matched with a tiny
+    scanner that skips `//`/`/* */` comments and string literals, so a `}`
+    inside a message cannot truncate it; it starts at the function's attribute
+    block so `#[ignore]` is visible.  Returning *all* matches (not just the
+    first) lets the caller reject an ambiguous duplicate name instead of
+    silently trusting whichever file happens to sort first.
+    """
+    pattern = re.compile(r"\bfn\s+" + re.escape(name) + r"\s*\(")
+    found: list[tuple[Path, str]] = []
+    for path in iter_rust_files(root):
+        text = read_text(path)
+        for m in pattern.finditer(text):
+            brace = text.find("{", m.end())
+            if brace < 0:
+                continue
+            end = _match_body(text, brace)
+            if end is None:
+                continue
+            found.append((path, text[_block_start(text, m.start()):end]))
+    return found
+
+
+def find_test_body(root: Path, name: str) -> tuple[Path | None, str]:
+    """First match, for callers that do not care about ambiguity.
+
+    The invariant checker uses `find_test_bodies` so it can *reject* duplicates;
+    this single-result form is retained for the self-test and small helpers.
+    """
+    found = find_test_bodies(root, name)
+    return found[0] if found else (None, "")
+
+
+def strip_comments(text: str) -> str:
+    """Remove `//…` and `/* … */` comments, respecting string literals.
+
+    Comments must never satisfy a direction check: the adversarial review
+    showed that replacing `assert_eq!(x, Err(CertificatePathLenExceeded))` with
+    `assert!(x.is_ok())` plus a comment naming the old error still printed OK.
+    The scanner mirrors `_match_body`, so a `//` inside a URL literal or a `/*`
+    inside a message is not mistaken for a comment.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            nl = text.find("\n", i)
+            i = n if nl < 0 else nl
+        elif c == "/" and i + 1 < n and text[i + 1] == "*":
+            close = text.find("*/", i + 2)
+            i = n if close < 0 else close + 2
+        elif c == '"':
+            out.append(c)
+            i += 1
+            while i < n and text[i] != '"':
+                if text[i] == "\\" and i + 1 < n:
+                    out.append(text[i])
+                    i += 1
+                out.append(text[i])
                 i += 1
-            elif c == "}":
-                depth -= 1
+            if i < n:
+                out.append(text[i])
                 i += 1
-                if depth == 0:
-                    break
-            else:
-                i += 1
-        return path, text[m.start():i]
-    return None, ""
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def attribute_problems(body: str) -> list[str]:
+    """Reject attributes that stop a mapped test from actually running."""
+    if re.search(r"#\[\s*ignore\b", body):
+        return ["carries `#[ignore]`; a mapped invariant test must run"]
+    return []
 
 
 def body_problems(body: str, expect, forbid) -> list[str]:
+    # Strip comments first: an `expect` substring hidden in a comment must not
+    # satisfy the direction check, and a `forbid` substring in a comment must
+    # not create a spurious violation either.
+    code = strip_comments(body)
     problems = []
     for needle in expect or []:
-        if needle not in body:
+        if needle not in code:
             problems.append(f"missing required assertion text {needle!r}")
     for needle in forbid or []:
-        if needle in body:
+        if needle in code:
             problems.append(f"contains forbidden text {needle!r}")
     return problems
 
@@ -833,11 +973,28 @@ def check_invariants(root: Path, invariants, known_uncovered, marker_files) -> t
     for inv in invariants:
         ident = inv["id"]
         level = inv.get("level", "medium")
-        if inv.get("marker") and ident not in doc_markers and ident not in known_uncovered:
-            errors.append(
-                f"{ident}: expected a `<!-- INVARIANT: {ident} -->` marker in "
-                + " or ".join(marker_files)
+
+        # A `marker: true` id is a claim about the docs it is attached to: it
+        # must appear in *every* machine-checked file whose claim the mapping
+        # references, not just one.  Otherwise dropping the marker from one
+        # file (e.g. the verifier trust table) would go unnoticed.
+        if inv.get("marker"):
+            present = sorted({f for f, _ in doc_markers.get(ident, [])})
+            if not present and ident not in known_uncovered:
+                errors.append(
+                    f"{ident}: expected a `<!-- INVARIANT: {ident} -->` marker in "
+                    " or ".join(marker_files)
+                )
+            claimed_marker_files = sorted(
+                {p for p, _ in inv.get("claims", []) if p in marker_files}
             )
+            for relpath in claimed_marker_files:
+                if relpath not in present:
+                    errors.append(
+                        f"{ident}: marker missing from {relpath} (present in "
+                        f"{', '.join(present) or 'no checked file'}); a `marker: true` "
+                        f"id must be present in every checked file its claims reference"
+                    )
 
         for relpath, needle in inv.get("claims", []):
             path = rel(root, relpath)
@@ -862,12 +1019,28 @@ def check_invariants(root: Path, invariants, known_uncovered, marker_files) -> t
 
         for test in tests:
             name = test["name"]
-            path, body = find_test_body(root, name)
-            if path is None:
+            pinned = test.get("file")
+            matches = find_test_bodies(root, name)
+            if pinned is not None:
+                matches = [(p, b) for p, b in matches if repo_rel(root, p) == pinned]
+                if not matches:
+                    errors.append(f"{ident}: test {name!r} not found in pinned file {pinned}")
+                    continue
+            if not matches:
                 errors.append(f"{ident}: test {name!r} not found in the tree")
                 continue
+            if len(matches) > 1:
+                files = ", ".join(repo_rel(root, p) for p, _ in matches)
+                errors.append(
+                    f"{ident}: test name {name!r} is ambiguous (defined in {files}); "
+                    f"pin the intended file with \"file\": \"…\" in the mapping"
+                )
+                continue
+            path, body = matches[0]
+            for problem in attribute_problems(body):
+                errors.append(f"{ident}: test {name} ({repo_rel(root, path)}): {problem}")
             for problem in body_problems(body, test.get("expect"), test.get("forbid")):
-                errors.append(f"{ident}: test {name} ({path}): {problem}")
+                errors.append(f"{ident}: test {name} ({repo_rel(root, path)}): {problem}")
 
     uncovered_notes = []
     for ident, why in sorted(known_uncovered.items()):
@@ -902,19 +1075,25 @@ def self_test() -> int:
     markers = extract_markers(text)
     expect(set(markers) == {"A", "B-C", "D"}, f"marker extraction: {markers}")
 
-    # Test-body extraction with a string containing a brace and a `//` comment.
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
-        src = root / "crates" / "demo" / "src"
-        src.mkdir(parents=True)
-        (src / "lib.rs").write_text(
+        (root / "Cargo.toml").write_text("x = 1\n")
+
+        def write(relpath: str, contents: str) -> None:
+            p = root / relpath
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(contents)
+
+        # Test-body extraction with a string containing a brace and a `//` comment.
+        write(
+            "crates/demo/src/lib.rs",
             "fn helper() {}\n"
             "#[test]\n"
             "fn keeps_braces() {\n"
             '    let s = "} not the end";\n'
             "    // } also not the end\n"
             "    assert_eq!(1, 1);\n"
-            "}\n"
+            "}\n",
         )
         path, body = find_test_body(root, "keeps_braces")
         expect(path is not None, "find_test_body found the function")
@@ -924,7 +1103,8 @@ def self_test() -> int:
         # Direction enforcement: a negative invariant expecting a rejection in a
         # positive body must fail.
         expect(
-            body_problems("assert!(verify(&x).is_ok());", ["is_err()"], None) == ["missing required assertion text 'is_err()'"],
+            body_problems("assert!(verify(&x).is_ok());", ["is_err()"], None)
+            == ["missing required assertion text 'is_err()'"],
             "expect-mismatch detected",
         )
         expect(
@@ -932,9 +1112,144 @@ def self_test() -> int:
             "expect-match accepted",
         )
         expect(
-            body_problems("assert!(x.is_ok()); // is_err()", [], ["is_err()"]) != [],
+            body_problems("assert!(x.is_err());", [], ["is_err()"]) != [],
             "forbid-mismatch detected",
         )
+        expect(
+            body_problems("assert!(x.is_ok()); // is_err()", [], ["is_err()"]) == [],
+            "forbid in a comment is not a violation",
+        )
+
+        # (1) Comment-only satisfaction: the `expect` needle appears only inside
+        # a comment, so the direction check must still fail.  This is the exact
+        # false-confidence mode the adversarial review proved (a positive body
+        # plus a comment naming the old error used to print OK).
+        write(
+            "crates/demo/src/lib.rs",
+            "fn helper() {}\n"
+            "#[test]\n"
+            "fn keeps_braces() {\n"
+            '    let s = "} not the end";\n'
+            "    // } also not the end\n"
+            "    assert_eq!(1, 1);\n"
+            "}\n"
+            "#[test]\n"
+            "fn swapped_to_positive() {\n"
+            "    // assert_eq!(verify(&x), Err(CertificatePathLenExceeded));\n"
+            "    assert!(verify(&x).is_ok());\n"
+            "}\n",
+        )
+        p, b = find_test_body(root, "swapped_to_positive")
+        expect(p is not None, "swapped test found")
+        expect(
+            body_problems(b, ["Err(CertificatePathLenExceeded)"], None) != [],
+            "comment-only satisfaction rejected",
+        )
+        stripped = strip_comments("assert!(a); // c\n/* d */ assert!(b);")
+        expect(
+            stripped == "assert!(a); \n assert!(b);",
+            f"comment stripping kept code: {stripped!r}",
+        )
+        comment_mapping = [
+            {
+                "id": "CM", "level": "high", "claims": [], "marker": False,
+                "tests": [{"name": "swapped_to_positive",
+                           "expect": ["Err(CertificatePathLenExceeded)"]}],
+            }
+        ]
+        errs, _ = check_invariants(root, comment_mapping, {}, ("SECURITY.md",))
+        expect(
+            any("CertificatePathLenExceeded" in e for e in errs),
+            "comment-only direction rejected end-to-end",
+        )
+
+        # (2) `#[ignore]` on a mapped test must be rejected.  The body slice
+        # starts at the attribute block, so the attribute is visible.
+        write(
+            "crates/demo/src/ignore.rs",
+            "#[test]\n"
+            "#[ignore]\n"
+            "fn hidden_by_ignore() {\n"
+            "    assert!(verify(&x).is_err());\n"
+            "}\n",
+        )
+        p, b = find_test_body(root, "hidden_by_ignore")
+        expect(p is not None and "#[ignore]" in b, "ignore attribute captured in body")
+        expect(attribute_problems(b) != [], "ignore attribute rejected")
+        ignore_mapping = [
+            {
+                "id": "IG", "level": "high", "claims": [], "marker": False,
+                "tests": [{"name": "hidden_by_ignore", "expect": ["is_err()"]}],
+            }
+        ]
+        errs, _ = check_invariants(root, ignore_mapping, {}, ("SECURITY.md",))
+        expect(
+            any("ignore" in e for e in errs),
+            "ignore rejected end-to-end",
+        )
+
+        # (3) A name defined in two files is ambiguous and must be an error; the
+        # same name pinned with "file" resolves it.
+        write(
+            "crates/demo/tests/dup_a.rs",
+            "#[test]\nfn duplicate_name() { assert!(verify(&x).is_err()); }\n",
+        )
+        write(
+            "crates/demo/tests/dup_b.rs",
+            "#[test]\nfn duplicate_name() { assert!(verify(&x).is_ok()); }\n",
+        )
+        dup_mapping = [
+            {
+                "id": "DUP", "level": "high", "claims": [], "marker": False,
+                "tests": [{"name": "duplicate_name", "expect": ["is_err()"]}],
+            }
+        ]
+        errs, _ = check_invariants(root, dup_mapping, {}, ("SECURITY.md",))
+        expect(any("ambiguous" in e for e in errs), "duplicate name rejected")
+
+        dup_pinned = [
+            {
+                "id": "DUP", "level": "high", "claims": [], "marker": False,
+                "tests": [{"name": "duplicate_name", "file": "crates/demo/tests/dup_a.rs",
+                           "expect": ["is_err()"]}],
+            }
+        ]
+        errs, _ = check_invariants(root, dup_pinned, {}, ("SECURITY.md",))
+        expect(not any("ambiguous" in e for e in errs), "pinned duplicate resolved")
+        # Pinning the *positive* copy must expose the direction break.
+        dup_wrong = [
+            {
+                "id": "DUP", "level": "high", "claims": [], "marker": False,
+                "tests": [{"name": "duplicate_name", "file": "crates/demo/tests/dup_b.rs",
+                           "expect": ["is_err()"]}],
+            }
+        ]
+        errs, _ = check_invariants(root, dup_wrong, {}, ("SECURITY.md",))
+        expect(
+            any("missing required assertion text 'is_err()'" in e for e in errs),
+            "pinned positive copy fails direction",
+        )
+
+        # (4) A `marker: true` id must appear in every checked file its claims
+        # reference, not just one.
+        (root / "SECURITY.md").write_text("<!-- INVARIANT: MARKED -->\n")
+        (root / "VERIFIER.md").write_text("no marker here\n")
+        marker_mapping = [
+            {
+                "id": "MARKED", "level": "high",
+                "claims": [("SECURITY.md", "<!-- INVARIANT: MARKED -->"),
+                           ("VERIFIER.md", "no marker here")],
+                "tests": [], "static": [("Cargo.toml", "x")], "marker": True,
+            }
+        ]
+        errs, _ = check_invariants(root, marker_mapping, {}, ("SECURITY.md", "VERIFIER.md"))
+        expect(
+            any("marker missing from VERIFIER.md" in e for e in errs),
+            "marker missing from a claimed file rejected",
+        )
+        (root / "VERIFIER.md").write_text("<!-- INVARIANT: MARKED -->\nno marker here\n")
+        errs, _ = check_invariants(root, marker_mapping, {}, ("SECURITY.md", "VERIFIER.md"))
+        expect(not any("marker missing" in e for e in errs), "marker in every claimed file accepted")
 
         # Unknown marker detection against a tiny mapping.
         (root / "SECURITY.md").write_text("<!-- INVARIANT: KNOWN -->\n<!-- INVARIANT: GHOST -->\n")
@@ -944,7 +1259,6 @@ def self_test() -> int:
                 "static": [("Cargo.toml", "x")], "marker": True,
             }
         ]
-        (root / "Cargo.toml").write_text("x = 1\n")
         errors, _ = check_invariants(root, mapping, {}, ("SECURITY.md",))
         expect(any("GHOST" in e for e in errors), "unknown marker detected")
         expect(not any("invariant 'KNOWN'" in e for e in errors), "known marker accepted")
@@ -964,7 +1278,10 @@ def self_test() -> int:
             print(f"[UNEXPECTED] {f}")
         print(f"\nself-test FAILED ({len(failures)} case(s))")
         return 1
-    print("self-test passed (marker extraction, body matching, direction, unknowns)")
+    print(
+        "self-test passed (marker extraction, body matching, direction, "
+        "comment-stripping, #[ignore], duplicate names, marker coverage, unknowns)"
+    )
     return 0
 
 
