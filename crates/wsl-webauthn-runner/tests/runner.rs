@@ -422,6 +422,25 @@ fn signal_death_reports_signal_reason_and_name() {
     }
 }
 
+/// L8-11: a status with neither an exit code nor a terminating signal must not be
+/// fabricated into `signal 0`; it is reported as [`ExitReason::Unknown`].
+#[test]
+fn unknown_termination_status_is_not_signal_zero() {
+    use std::os::unix::process::ExitStatusExt;
+    // WIFSTOPPED (`0x7f`): neither `WIFEXITED` nor `WIFSIGNALED`, so `code()` and
+    // `signal()` are both `None`. `from_raw` does not validate the raw wait status.
+    let status = std::process::ExitStatus::from_raw(0x7f);
+    assert_eq!(status.code(), None);
+    assert_eq!(status.signal(), None);
+
+    let reason = ExitReason::from_status(&status);
+    assert_eq!(reason, ExitReason::Unknown);
+    assert_eq!(reason.code(), None);
+    assert_eq!(reason.signal(), None);
+    assert_eq!(reason.to_string(), "unknown termination status");
+    assert_ne!(reason, ExitReason::Signal(0));
+}
+
 /// L8-4: the bridge's stderr tail (its HRESULT/error line) is folded into the failure
 /// diagnostic instead of being discarded.
 #[test]
