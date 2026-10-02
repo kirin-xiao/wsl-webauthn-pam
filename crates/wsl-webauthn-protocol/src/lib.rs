@@ -17,9 +17,24 @@
 //! * All binary fields on the wire are `base64url` (RFC 4648 §5) **without** padding.
 //! * `clientDataJSON` is built on the Linux side (which owns the challenge) and passed
 //!   verbatim; see [`build_client_data`].
+//!
+//! # Crate layout (L7-7)
+//!
+//! The items above are the genuine two-sided wire contract and live in the crate root.
+//! Linux/client-only members — [`build_client_data`], [`ClientDataKind`], the
+//! [`ProtocolError`] it returns, and the process-deadline / bridge-`timeout_ms` defaults
+//! — are grouped in the [`client`] module (re-exported here for the Linux callers). The
+//! Windows bridge **must not** use them: it treats `client_data_json` as an opaque
+//! base64url string and never rebuilds the Linux-side timing defaults.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+// `Response`'s variant fields are necessarily public (Rust gives enum-variant fields the
+// enum's visibility), so the opaque `OkFlag` used to pin `ok` trip the
+// `private_interfaces` lint. The field is intentionally reachable-but-not-constructible:
+// callers can read it by `..`-pattern/shadow-matching but cannot `use` its type or build
+// it, which is exactly the invariant L6-2 asks for.
+#![allow(private_interfaces)]
 
 use std::io::Read;
 
@@ -27,6 +42,14 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+pub mod client;
+
+// Linux/client-only helpers, re-exported from [`client`] for the flat-layout callers.
+pub use client::{
+    BRIDGE_AUTH_TIMEOUT_MS, BRIDGE_ENROLL_TIMEOUT_MS, ClientDataKind, DEFAULT_AUTH_TIMEOUT_SECS,
+    DEFAULT_ENROLL_TIMEOUT_SECS, MIN_CHALLENGE_BYTES, ProtocolError, build_client_data,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -49,28 +72,15 @@ pub const RP_NAME: &str = "sudo on WSL (wsl-webauthn-pam)";
 pub const ORIGIN: &str = RP_ID;
 
 /// Wire/client-data protocol version, mirrored from the crate version.
+///
+/// Client-side metadata only; the bridge has no use for it (L7-7).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Default Linux hard deadline for the whole authentication child process.
-pub const DEFAULT_AUTH_TIMEOUT_SECS: u64 = 60;
-
-/// `timeout_ms` sent to the bridge for authentication (advisory platform timeout + watchdog).
-pub const BRIDGE_AUTH_TIMEOUT_MS: u32 = 55_000;
-
-/// Default Linux hard deadline for the whole enrollment child process (CLI).
-pub const DEFAULT_ENROLL_TIMEOUT_SECS: u64 = 180;
-
-/// `timeout_ms` sent to the bridge for enrollment.
-pub const BRIDGE_ENROLL_TIMEOUT_MS: u32 = 175_000;
 
 /// Maximum accepted framed request size (8 KiB).
 pub const MAX_REQUEST_BYTES: usize = 8 * 1024;
 
 /// Maximum accepted framed response size (64 KiB).
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
-
-/// Minimum challenge length in bytes accepted by [`build_client_data`].
-pub const MIN_CHALLENGE_BYTES: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -102,17 +112,6 @@ impl From<std::io::Error> for FrameError {
     fn from(e: std::io::Error) -> Self {
         FrameError::Io(e.to_string())
     }
-}
-
-/// Errors from [`build_client_data`].
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum ProtocolError {
-    /// The supplied challenge was shorter than [`MIN_CHALLENGE_BYTES`].
-    #[error("challenge too short: {len} bytes (minimum {MIN_CHALLENGE_BYTES})")]
-    ChallengeTooShort {
-        /// Length of the offending challenge.
-        len: usize,
-    },
 }
 
 // ---------------------------------------------------------------------------
@@ -266,20 +265,36 @@ pub enum BridgeError {
     Internal,
 }
 
+/// The `ok` discriminant of a [`Response`].
+///
+/// A variant's `ok` is **fixed by the variant**: `true` for the three success replies,
+/// `false` for [`Response::Error`]. Modelling it as this opaque, crate-private type
+/// rather than a public `bool` means a caller in another crate cannot construct a
+/// well-formed frame with a contradictory `ok` (e.g. `Response::Probe { ok: false, .. }`),
+/// which the peer would reject as a transport failure (L6-2).
+///
+/// Serde still serializes it as the plain boolean on the wire, byte-identically, and
+/// deserialization is validated by [`expect_true`]/[`expect_false`]. Enum-variant fields
+/// are always public, so a plain `bool` cannot be made private; an opaque field type is
+/// the way to keep the invariant under the type system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+struct OkFlag(bool);
+
 /// A response from the Windows bridge to the Linux side.
 ///
 /// Serialized as a single JSON object tagged by `"op"`, mirroring [`Request`]. The `ok`
-/// field is **implicit per variant**: the three success variants imply `ok: true`, and
-/// [`Response::Error`] always serializes `"ok":false`. Deserialization validates that
-/// `ok` matches the variant, so a mismatched `ok` is a parse error.
+/// field is **fixed per variant**: the three success variants always serialize
+/// `"ok":true`, and [`Response::Error`] always serializes `"ok":false`. Deserialization
+/// validates that `ok` matches the variant, so a mismatched `ok` is a parse error.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Response {
     /// Reply to [`Request::Probe`].
     Probe {
-        /// Always `true` for this variant; checked on deserialization.
+        /// Always `true` for this variant; fixed by construction, checked on deserialize.
         #[serde(deserialize_with = "expect_true")]
-        ok: bool,
+        ok: OkFlag,
         /// Whether a user-verifying platform authenticator is available.
         uv_platform_available: bool,
         /// `WebAuthNGetApiVersionNumber()` as seen by the bridge.
@@ -287,9 +302,9 @@ pub enum Response {
     },
     /// Reply to [`Request::Enroll`].
     Enroll {
-        /// Always `true` for this variant; checked on deserialization.
+        /// Always `true` for this variant; fixed by construction, checked on deserialize.
         #[serde(deserialize_with = "expect_true")]
-        ok: bool,
+        ok: OkFlag,
         /// Attestation statement format (e.g. `packed`, `none`).
         format: String,
         /// Full CBOR attestation object (b64url).
@@ -299,9 +314,9 @@ pub enum Response {
     },
     /// Reply to [`Request::Assert`].
     Assert {
-        /// Always `true` for this variant; checked on deserialization.
+        /// Always `true` for this variant; fixed by construction, checked on deserialize.
         #[serde(deserialize_with = "expect_true")]
-        ok: bool,
+        ok: OkFlag,
         /// Authenticator data (b64url).
         authenticator_data: String,
         /// Signature over `authenticatorData || SHA-256(clientDataJSON)` (b64url).
@@ -314,9 +329,9 @@ pub enum Response {
     /// A ceremony failure (transport itself succeeded).
     #[serde(rename = "*")]
     Error {
-        /// Always `false` for this variant; checked on deserialization.
+        /// Always `false` for this variant; fixed by construction, checked on deserialize.
         #[serde(deserialize_with = "expect_false")]
-        ok: bool,
+        ok: OkFlag,
         /// Which failure occurred.
         error: BridgeError,
     },
@@ -326,20 +341,20 @@ pub enum Response {
 // `{"op":"*","ok":false,"error":"…"}` shape.
 
 /// Deserialize helper enforcing `ok == true` for success variants.
-fn expect_true<'de, D>(d: D) -> Result<bool, D::Error>
+fn expect_true<'de, D>(d: D) -> Result<OkFlag, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let v = bool::deserialize(d)?;
     if v {
-        Ok(true)
+        Ok(OkFlag(true))
     } else {
         Err(serde::de::Error::custom("expected `ok` to be true"))
     }
 }
 
 /// Deserialize helper enforcing `ok == false` for the error variant.
-fn expect_false<'de, D>(d: D) -> Result<bool, D::Error>
+fn expect_false<'de, D>(d: D) -> Result<OkFlag, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -347,7 +362,7 @@ where
     if v {
         Err(serde::de::Error::custom("expected `ok` to be false"))
     } else {
-        Ok(false)
+        Ok(OkFlag(false))
     }
 }
 
@@ -355,7 +370,7 @@ impl Response {
     /// Build a probe success response.
     pub fn probe(uv_platform_available: bool, api_version: u32) -> Self {
         Response::Probe {
-            ok: true,
+            ok: OkFlag(true),
             uv_platform_available,
             api_version,
         }
@@ -368,7 +383,7 @@ impl Response {
         credential_id: impl Into<String>,
     ) -> Self {
         Response::Enroll {
-            ok: true,
+            ok: OkFlag(true),
             format: format.into(),
             attestation_object: attestation_object.into(),
             credential_id: credential_id.into(),
@@ -383,7 +398,7 @@ impl Response {
         client_data_json_echo: Option<String>,
     ) -> Self {
         Response::Assert {
-            ok: true,
+            ok: OkFlag(true),
             authenticator_data: authenticator_data.into(),
             signature: signature.into(),
             credential_id: credential_id.into(),
@@ -393,80 +408,16 @@ impl Response {
 
     /// Build a ceremony-failure response.
     pub fn error(error: BridgeError) -> Self {
-        Response::Error { ok: false, error }
+        Response::Error {
+            ok: OkFlag(false),
+            error,
+        }
     }
 
     /// Encode this response as a framed JSON payload.
     pub fn to_frame(&self) -> Result<Vec<u8>, serde_json::Error> {
         Ok(encode_frame(&serde_json::to_vec(self)?))
     }
-}
-
-// ---------------------------------------------------------------------------
-// clientDataJSON
-// ---------------------------------------------------------------------------
-
-/// Which WebAuthn ceremony a `clientDataJSON` is for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClientDataKind {
-    /// Assertion (`webauthn.get`).
-    Get,
-    /// Registration (`webauthn.create`).
-    Create,
-}
-
-impl ClientDataKind {
-    /// The WebAuthn `type` string for this ceremony.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ClientDataKind::Get => "webauthn.get",
-            ClientDataKind::Create => "webauthn.create",
-        }
-    }
-}
-
-/// The exact JSON object shape of a `clientDataJSON`, in field order
-/// `type`, `challenge`, `origin`.
-///
-/// Serialized via `serde_json`, which emits struct fields in declaration order. Keeping
-/// this a typed struct (rather than `json!`) guarantees byte-stable output.
-#[derive(Debug, Serialize)]
-struct ClientData<'a> {
-    r#type: &'a str,
-    challenge: String,
-    origin: &'a str,
-}
-
-/// Build the exact `clientDataJSON` bytes for a ceremony.
-///
-/// Produces `{"type":"webauthn.get"|"webauthn.create","challenge":"<b64url>","origin":"<ORIGIN>"}`
-/// with that fixed field order. The challenge must be at least
-/// [`MIN_CHALLENGE_BYTES`] bytes; a shorter challenge yields
-/// [`ProtocolError::ChallengeTooShort`].
-pub fn build_client_data(kind: ClientDataKind, challenge: &[u8]) -> Result<Vec<u8>, ProtocolError> {
-    if challenge.len() < MIN_CHALLENGE_BYTES {
-        return Err(ProtocolError::ChallengeTooShort {
-            len: challenge.len(),
-        });
-    }
-    let data = ClientData {
-        r#type: kind.as_str(),
-        challenge: b64u_encode(challenge),
-        origin: ORIGIN,
-    };
-    // Serializing this fixed, all-`String`/`&str` struct cannot fail; fall back to a
-    // hand-built object rather than panicking if serde_json ever surprises us.
-    Ok(serde_json::to_vec(&data).unwrap_or_else(|_| {
-        let mut out = Vec::new();
-        out.extend_from_slice(br#"{"type":""#);
-        out.extend_from_slice(kind.as_str().as_bytes());
-        out.extend_from_slice(br#"","challenge":""#);
-        out.extend_from_slice(b64u_encode(challenge).as_bytes());
-        out.extend_from_slice(br#"","origin":""#);
-        out.extend_from_slice(ORIGIN.as_bytes());
-        out.extend_from_slice(br#""}"#);
-        out
-    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -722,6 +673,38 @@ mod tests {
         );
     }
 
+    /// L6-2: `ok` is pinned by the variant (the opaque [`OkFlag`] type cannot be named or
+    /// constructed outside this crate), and the wire bytes for every valid case are
+    /// unchanged — a deserialize→serialize round trip is byte-identical.
+    #[test]
+    fn response_ok_flag_wire_bytes_are_pinned() {
+        let cases: [(Response, bool); 4] = [
+            (Response::probe(true, 7), true),
+            (Response::enroll("packed", "AAAA", "YWJj"), true),
+            (Response::assertion("AAAA", "BBBB", "YWJj", None), true),
+            (Response::error(BridgeError::Timeout), false),
+        ];
+        for (resp, ok) in cases {
+            let json = serde_json::to_string(&resp).unwrap();
+            let token = format!(r#""ok":{ok}"#);
+            assert!(
+                json.contains(&token),
+                "expected {token} for {resp:?}: {json}"
+            );
+        }
+
+        // Two-sided wire: the exact bytes the peer produces must survive a round trip.
+        for wire in [
+            r#"{"op":"probe","ok":true,"uv_platform_available":true,"api_version":7}"#,
+            r#"{"op":"enroll","ok":true,"format":"packed","attestation_object":"AAAA","credential_id":"YWJj"}"#,
+            r#"{"op":"assert","ok":true,"authenticator_data":"AAAA","signature":"BBBB","credential_id":"YWJj","client_data_json_echo":null}"#,
+            r#"{"op":"*","ok":false,"error":"timeout"}"#,
+        ] {
+            let resp: Response = serde_json::from_str(wire).unwrap();
+            assert_eq!(serde_json::to_string(&resp).unwrap(), wire);
+        }
+    }
+
     #[test]
     fn request_to_frame_round_trips_through_read_frame() {
         let req = Request::Assert {
@@ -744,6 +727,25 @@ mod tests {
     }
 
     // ---- clientDataJSON ----
+
+    /// L7-7: the Linux-only client helpers are grouped under [`client`] and re-exported
+    /// at the crate root; both paths name the same items.
+    #[test]
+    fn client_helpers_are_reachable_via_module_and_root() {
+        let via_root = build_client_data(ClientDataKind::Get, &[0u8; 16]).unwrap();
+        let via_mod = crate::client::build_client_data(ClientDataKind::Get, &[0u8; 16]).unwrap();
+        assert_eq!(via_root, via_mod);
+        assert_eq!(crate::client::ClientDataKind::Get, ClientDataKind::Get);
+        assert_eq!(crate::client::MIN_CHALLENGE_BYTES, MIN_CHALLENGE_BYTES);
+        assert_eq!(
+            crate::client::BRIDGE_AUTH_TIMEOUT_MS,
+            BRIDGE_AUTH_TIMEOUT_MS
+        );
+        assert_eq!(
+            crate::client::DEFAULT_ENROLL_TIMEOUT_SECS,
+            DEFAULT_ENROLL_TIMEOUT_SECS
+        );
+    }
 
     #[test]
     fn client_data_get_golden_bytes() {
