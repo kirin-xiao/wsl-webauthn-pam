@@ -16,11 +16,14 @@
 //!
 //! Deliberately **no shell**: this module only performs direct syscalls.
 
+use std::fmt::Write as _;
 use std::fs::{File, Metadata, OpenOptions, Permissions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use sha2::{Digest as _, Sha256};
 
 /// Monotonic suffix for temporary files, so concurrent installers never collide.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -233,6 +236,11 @@ pub(crate) fn remove_dir_if_empty(path: &Path) -> io::Result<()> {
 ///
 /// Symlinked entries are unlinked (the link, not its target). Regular files are
 /// removed; directories are emptied bottom-up. This is the uninstall path.
+///
+/// The walk is an explicit worklist rather than recursion: the uninstaller runs as root
+/// and an attacker-supplied (or accidental) pathologically deep tree must not overflow the
+/// stack. Directories are removed only after their children, by visiting each one twice
+/// (pre-order to descend, post-order to `rmdir`).
 pub(crate) fn remove_tree(path: &Path) -> io::Result<()> {
     let md = match lstat_opt(path)? {
         Some(md) => md,
@@ -246,11 +254,66 @@ pub(crate) fn remove_tree(path: &Path) -> io::Result<()> {
         // unexpected.
         return Ok(());
     }
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        remove_tree(&entry.path())?;
+
+    // `(path, visited)`: `visited == false` means "descend", `true` means "all children
+    // are gone, so remove this now-empty directory".
+    let mut stack: Vec<(PathBuf, bool)> = vec![(path.to_path_buf(), false)];
+    while let Some((dir, visited)) = stack.pop() {
+        if visited {
+            remove_dir_if_empty(&dir)?;
+            continue;
+        }
+        stack.push((dir.clone(), true));
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let child = entry.path();
+            let cmd = entry.metadata()?;
+            if cmd.is_dir() && !cmd.file_type().is_symlink() {
+                // `DirEntry::metadata` does not follow symlinks, so this is an lstat.
+                stack.push((child, false));
+            } else {
+                remove_file(&child)?;
+            }
+        }
     }
-    remove_dir_if_empty(path)
+    Ok(())
+}
+
+/// Lowercase hex encoding of `bytes`.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// A short preview (first 12 characters) of a hex digest.
+pub(crate) fn short_hash(hex: &str) -> String {
+    let preview: String = hex.chars().take(12).collect();
+    if hex.len() > 12 {
+        format!("{preview}…")
+    } else {
+        preview
+    }
+}
+
+/// SHA-256 of a regular file as lowercase hex, read in bounded chunks.
+///
+/// Streaming keeps the CLI's memory use independent of the (potentially large) bridge
+/// executable; the whole-file variant it replaces allocated the entire file.
+pub(crate) fn sha256_hex_file(path: &Path) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex(&hasher.finalize()))
 }
 
 #[cfg(test)]
@@ -377,5 +440,58 @@ mod tests {
         // A normal nested create works.
         create_dir_all(&dir.path().join("a/b/c")).unwrap();
         assert!(dir.path().join("a/b/c").is_dir());
+    }
+
+    /// L4-2: `remove_tree` must not consume one stack frame per directory level.
+    ///
+    /// A ~1500-deep chain is built (the deepest that fits `PATH_MAX`) and removed on a
+    /// deliberately tiny 128 KiB thread stack. The recursive form this replaced would
+    /// overflow such a stack; the explicit worklist must not.
+    #[test]
+    fn remove_tree_handles_a_deep_tree_without_stack_overflow() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("deep");
+        let mut path = root.clone();
+        // Two bytes of path per level ("/d") keeps the total under PATH_MAX (4096).
+        for _ in 0..1500 {
+            path.push("d");
+        }
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("leaf"), b"x").unwrap();
+
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || remove_tree(&root))
+            .unwrap()
+            .join()
+            .expect("remove_tree must not overflow the stack")
+            .expect("remove_tree must succeed");
+
+        assert!(!dir.path().join("deep").exists());
+    }
+
+    /// L7-5 = L10-1: the shared helpers must agree with the SHA-256 test vector.
+    #[test]
+    fn sha256_hex_file_matches_known_vector() {
+        let dir = TempDir::new().unwrap();
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(
+            sha256_hex_file(&empty).unwrap(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        let abc = dir.path().join("abc");
+        std::fs::write(&abc, b"abc").unwrap();
+        assert_eq!(
+            sha256_hex_file(&abc).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn hex_and_short_hash_are_bounded() {
+        assert_eq!(hex(&[0x00, 0xab, 0xff]), "00abff");
+        assert_eq!(short_hash("0123456789abcdef"), "0123456789ab…");
+        assert_eq!(short_hash("abc"), "abc");
     }
 }
