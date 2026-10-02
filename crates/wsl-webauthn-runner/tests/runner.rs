@@ -251,6 +251,29 @@ fn missing_bridge_is_bridge_missing() {
     ));
 }
 
+/// L2-2: the bridge is opened `O_NOFOLLOW`, so a symlinked bridge path is refused rather
+/// than followed. The `ELOOP` is surfaced as a `Spawn` error (not disguised as missing).
+#[test]
+fn symlinked_bridge_is_rejected() {
+    let dir = cwd_dir();
+    let real = dir.path().join("real-bridge");
+    fs::write(&real, b"not a real bridge").unwrap();
+    let link = dir.path().join("bridge-link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let r = Runner::without_interop_check(&link, dir.path());
+    match r.probe(Duration::from_secs(1)).unwrap_err() {
+        RunnerError::Spawn { source, .. } => {
+            assert_eq!(
+                source.raw_os_error(),
+                Some(libc::ELOOP),
+                "O_NOFOLLOW must refuse the symlink: {source}"
+            );
+        }
+        other => panic!("expected a symlink Spawn error, got {other:?}"),
+    }
+}
+
 #[test]
 fn bridge_inside_unreadable_dir_is_permission_error_not_missing() {
     // Root bypasses directory DAC, so this scenario is only observable as a normal user.

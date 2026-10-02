@@ -19,10 +19,17 @@
 //! * **Timeout handling.** On deadline expiry the shim is `SIGKILL`ed and reaped; if the
 //!   bridge printed its Windows PID as the first stderr line (`PID <n>`), a best-effort
 //!   `taskkill.exe /F /PID <n>` is spawned with `current_dir = win_mnt` under a 5 s
-//!   budget. Failures are ignored.
+//!   budget. Failures are ignored. The deadline is therefore a *lower bound* on the total
+//!   time when an escalation runs; see [`RunnerError::Timeout`].
+//! * **Held-fd spawn (tamper resistance).** The bridge is opened
+//!   `O_RDONLY|O_NOFOLLOW|O_CLOEXEC` and that descriptor — not the path — is what is
+//!   spawned, so a check-then-use swap between the module's hash and the exec cannot change
+//!   the executed image. A `pre_exec` guard re-checks `(dev, ino)` immediately before
+//!   `execve` as belt-and-braces. See the `L2-2` note in `proc::TrustedFile`.
 //! * **Pre-flight.** [`RunnerError::BridgeMissing`] only if the bridge path genuinely
-//!   does not exist (`NotFound`); any other `stat` failure (e.g. `EACCES` on an
-//!   unreadable parent) is [`RunnerError::Spawn`] carrying the real `io::Error`.
+//!   does not exist (`NotFound`); any other open failure (e.g. `EACCES` on an
+//!   unreadable parent, or `ELOOP` for a symlinked bridge) is [`RunnerError::Spawn`]
+//!   carrying the real `io::Error`.
 //!   [`RunnerError::InteropUnavailable`] if the WSL interop binfmt entry is absent or not
 //!   `enabled`. All fail fast without spawning.
 //! * **Ceremony vs. transport.** A well-formed `ok:false` framed response is returned as
@@ -464,7 +471,7 @@ impl Runner {
 
     /// Run one request/response exchange against the bridge.
     fn run(&self, request: Request, deadline: Duration) -> Result<RunnerExchange, RunnerError> {
-        self.preflight()?;
+        let bridge = self.preflight()?;
 
         let payload = serde_json::to_vec(&request).map_err(|e| RunnerError::Transport {
             message: format!("encoding request: {e}"),
@@ -477,17 +484,23 @@ impl Runner {
         }
         let frame = wsl_webauthn_protocol::encode_frame(&payload);
 
-        let child = Command::new(&self.bridge)
+        // Spawn the *held descriptor*, not the path: `/proc/self/fd/N` resolves to the
+        // inode opened (O_NOFOLLOW) during pre-flight, so a path swap after that open
+        // cannot change the executed image. `bridge` owns the descriptor until the end of
+        // this function; the child has its own inheritable duplicate. A `pre_exec` guard
+        // re-checks (dev,ino) immediately before `execve` as belt-and-braces.
+        let mut command = Command::new(bridge.fd_path());
+        command
             .args(&self.args)
             .current_dir(&self.win_mnt)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|source| RunnerError::Spawn {
-                path: self.bridge.clone(),
-                source,
-            })?;
+            .stderr(Stdio::piped());
+        proc::set_spawn_guard(&mut command, &bridge);
+        let child = command.spawn().map_err(|source| RunnerError::Spawn {
+            path: self.bridge.clone(),
+            source,
+        })?;
 
         // Own the child for the rest of the exchange: every early return below (including
         // the `?`-propagated ones) now kills and reaps it via `ChildGuard::drop`.
@@ -515,26 +528,28 @@ impl Runner {
         self.pump(guard, stdout, stderr, deadline)
     }
 
-    /// Fast-fail pre-flight checks (no process is spawned if these fail).
-    fn preflight(&self) -> Result<(), RunnerError> {
-        // `Path::exists()` collapses *every* `stat` failure into "missing" (ENOENT, but
-        // also EACCES on an unreadable parent, ENAMETOOLONG, …). Use `metadata` so only a
-        // genuine `NotFound` is reported as [`RunnerError::BridgeMissing`]; any other OS
-        // error is surfaced with its real `io::Error` instead of being disguised.
-        match std::fs::metadata(&self.bridge) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(RunnerError::BridgeMissing {
+    /// Fast-fail pre-flight checks, then hold the bridge descriptor for the spawn.
+    ///
+    /// The bridge is opened `O_RDONLY|O_NOFOLLOW` and the descriptor is returned, so the
+    /// caller spawns exactly the opened inode rather than re-resolving the path (closing
+    /// the hash→exec check-then-use window; see `L2-2`). Because the path is never used
+    /// for the spawn, a symlink is refused (`O_NOFOLLOW` → `ELOOP`), not followed.
+    fn preflight(&self) -> Result<proc::TrustedFile, RunnerError> {
+        // `Path::exists()`/`metadata` collapse *every* `stat` failure into "missing".
+        // Open directly so only a genuine `NotFound` is reported as
+        // [`RunnerError::BridgeMissing`]; any other OS error (EACCES on an unreadable
+        // parent, ELOOP on a symlink, ENAMETOOLONG, …) is surfaced with its real
+        // `io::Error` instead of being disguised.
+        let bridge =
+            proc::TrustedFile::open(&self.bridge).map_err(|source| match source.kind() {
+                std::io::ErrorKind::NotFound => RunnerError::BridgeMissing {
                     path: self.bridge.clone(),
-                });
-            }
-            Err(source) => {
-                return Err(RunnerError::Spawn {
+                },
+                _ => RunnerError::Spawn {
                     path: self.bridge.clone(),
                     source,
-                });
-            }
-        }
+                },
+            })?;
         if self.check_interop {
             let contents = std::fs::read_to_string(&self.interop_path).map_err(|e| {
                 RunnerError::InteropUnavailable {
@@ -550,7 +565,7 @@ impl Runner {
                 });
             }
         }
-        Ok(())
+        Ok(bridge)
     }
 
     /// Write `frame` to the child's stdin with a non-blocking, deadline-bounded loop.
@@ -1458,7 +1473,10 @@ mod tests {
     fn stderr_flood_does_not_spin() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let deadline = Duration::from_millis(400);
-        let runner = Runner::without_interop_check("/bin/sh", dir.path())
+        // The bridge is now opened O_NOFOLLOW, so use the resolved binary rather than a
+        // symlink (which the runner deliberately refuses).
+        let sh = std::fs::canonicalize("/bin/sh").expect("resolve /bin/sh");
+        let runner = Runner::without_interop_check(sh, dir.path())
             .args(["-c", "while :; do printf x 1>&2; done"]);
 
         let cpu_before = proc::thread_cpu_time();
