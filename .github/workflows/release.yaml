@@ -197,6 +197,14 @@ jobs:
             cp dist/windows-${arch}/WSLWebAuthnBridge.exe   "dist/out/${dir}/"
             cp install.sh pam-config README.md              "dist/out/${dir}/"
             tar -czf "dist/${dir}.tar.gz" -C dist/out "${dir}"
+            # L15-6: the tarball root must be exactly the one named directory, so
+            # `tar xzf … && cd …` (README) works and the layout cannot silently
+            # regress to "contents at the root".
+            top="$(tar -tzf "dist/${dir}.tar.gz" | sed -n '1p')"
+            if [ "${top}" != "${dir}/" ]; then
+              echo "::error::${dir}.tar.gz root entry is '${top}', expected '${dir}/'"
+              exit 1
+            fi
           done
           cd dist
           sha256sum wsl-webauthn-pam-*.tar.gz > SHA256SUMS
