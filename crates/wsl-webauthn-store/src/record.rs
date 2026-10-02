@@ -141,8 +141,40 @@ pub struct Config {
 }
 
 impl Config {
-    /// Default Windows mount root when the config file omits `win_mnt`.
+    /// The single canonical Windows mount root default (`/mnt/c`).
+    ///
+    /// The CLI and installer must re-export this constant rather than declaring their own
+    /// copy; [`Config::to_toml`] and the `RawConfig` parser both key off it.
     pub const DEFAULT_WIN_MNT: &'static str = "/mnt/c";
+
+    /// Serialize this config as the exact TOML shape [`crate::Store::load_config`] parses.
+    ///
+    /// The store owns both sides of the on-disk format (see `L7-4`): this is the writer
+    /// counterpart to the `deny_unknown_fields` `RawConfig` parser, so a field
+    /// added to one side cannot silently drift from the other. The `timeout_secs` line is
+    /// omitted when `None` (matching the installer's historical output and the parser's
+    /// default).
+    ///
+    /// `bridge_path`/`win_mnt` are rendered with `to_string_lossy`, mirroring the
+    /// installer; non-UTF-8 paths are not representable in a TOML basic string.
+    pub fn to_toml(&self) -> String {
+        // Serialize a writer type rather than `Self` because `toml` cannot round-trip a
+        // `PathBuf` field (`PathBuf` serializes as a map, which is not a TOML string).
+        #[derive(Serialize)]
+        struct ConfigToml<'a> {
+            bridge_path: std::borrow::Cow<'a, str>,
+            win_mnt: std::borrow::Cow<'a, str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            timeout_secs: Option<u64>,
+        }
+        let writer = ConfigToml {
+            bridge_path: self.bridge_path.to_string_lossy(),
+            win_mnt: self.win_mnt.to_string_lossy(),
+            timeout_secs: self.timeout_secs,
+        };
+        // The shape is a flat struct of owned primitives, so serialization cannot fail.
+        toml::to_string(&writer).expect("Config serialization cannot fail")
+    }
 }
 
 /// Default serialization of [`Config`]'s TOML shape.

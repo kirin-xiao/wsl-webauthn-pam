@@ -12,8 +12,9 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 use wsl_webauthn_store::{
-    AttestationRecord, CONFIG_MODE, CredentialRecord, DIR_MODE, FILE_MODE, MODE_STRICT,
-    MODE_UNATTESTED_OPT_IN, Store, StoreError, WindowsIdentity, current_euid, validate_username,
+    AttestationRecord, BASE_MODE, CONFIG_MODE, Config, CredentialRecord, DIR_MODE, FILE_MODE,
+    MODE_STRICT, MODE_UNATTESTED_OPT_IN, Store, StoreError, WindowsIdentity, current_euid,
+    validate_username,
 };
 
 /// Byte-for-byte golden encoding of [`sample_record("alice")`] (schema version 1).
@@ -842,6 +843,133 @@ fn config_is_symlink_refused() {
         store.load_config(),
         Err(StoreError::SymlinkedPath { .. })
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Config serialization / persistence (L7-4)
+// ---------------------------------------------------------------------------
+
+fn sample_config() -> Config {
+    Config {
+        bridge_path: PathBuf::from("/mnt/c/Users/alice/WSLWebAuthnBridge.exe"),
+        win_mnt: PathBuf::from("/mnt/c"),
+        timeout_secs: Some(60),
+    }
+}
+
+#[test]
+fn to_toml_matches_the_installer_shape() {
+    // The historical installer emitted exactly this key order/format; the store-owned
+    // serializer must stay byte-compatible for the handoff (L7-4).
+    assert_eq!(
+        sample_config().to_toml(),
+        "bridge_path = \"/mnt/c/Users/alice/WSLWebAuthnBridge.exe\"\nwin_mnt = \"/mnt/c\"\ntimeout_secs = 60\n"
+    );
+}
+
+#[test]
+fn to_toml_omits_timeout_when_none() {
+    let mut cfg = sample_config();
+    cfg.timeout_secs = None;
+    assert_eq!(
+        cfg.to_toml(),
+        "bridge_path = \"/mnt/c/Users/alice/WSLWebAuthnBridge.exe\"\nwin_mnt = \"/mnt/c\"\n"
+    );
+}
+
+#[test]
+fn to_toml_round_trips_paths_with_special_characters() {
+    // `toml` may choose a literal (single-quoted) string for values containing `"`; the
+    // parser accepts it, so only round-trip fidelity is required (not a fixed quoting).
+    let (_d, store) = fresh();
+    let mut cfg = sample_config();
+    cfg.bridge_path = PathBuf::from("/mnt/c/a\"b\\c");
+    write_private(&store.config_path(), cfg.to_toml().as_bytes());
+    assert_eq!(store.load_config().unwrap(), cfg);
+}
+
+#[test]
+fn to_toml_omits_win_mnt_default_but_round_trips_custom() {
+    // `win_mnt` is always emitted (the installer always wrote it); its default value is
+    // what the parser falls back to when absent.
+    let mut cfg = sample_config();
+    cfg.win_mnt = PathBuf::from("/mnt/d");
+    let (_d, store) = fresh();
+    write_private(&store.config_path(), cfg.to_toml().as_bytes());
+    assert_eq!(store.load_config().unwrap(), cfg);
+
+    write_private(
+        &store.config_path(),
+        b"bridge_path = \"/x/WSLWebAuthnBridge.exe\"\n",
+    );
+    assert_eq!(
+        store.load_config().unwrap().win_mnt,
+        PathBuf::from(Config::DEFAULT_WIN_MNT)
+    );
+}
+
+#[test]
+fn save_config_writes_0600_and_loads_back() {
+    let (_d, store) = fresh();
+    store.save_config(&sample_config()).expect("save_config");
+    let meta = fs::metadata(store.config_path()).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o7777, CONFIG_MODE);
+    assert_eq!(store.load_config().unwrap(), sample_config());
+    assert!(no_temp_files(store.base()));
+}
+
+#[test]
+fn save_config_creates_missing_base() {
+    // Only the final base component is created (the store does not `mkdir -p`); the
+    // installer owns creating the parent (`/etc`), matching `ensure_credentials_dir`.
+    let d = TempDir::new().unwrap();
+    let missing = d.path().join("wsl_webauthn");
+    let store = Store::with_owner(&missing, current_euid());
+    store.save_config(&sample_config()).expect("save_config");
+    let meta = fs::metadata(&missing).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o7777, BASE_MODE);
+    assert_eq!(store.load_config().unwrap(), sample_config());
+}
+
+#[test]
+fn save_config_replaces_existing() {
+    let (_d, store) = fresh();
+    write_private(&store.config_path(), VALID_CONFIG.as_bytes());
+    let cfg = Config {
+        bridge_path: PathBuf::from("/new/WSLWebAuthnBridge.exe"),
+        win_mnt: PathBuf::from("/mnt/e"),
+        timeout_secs: None,
+    };
+    store.save_config(&cfg).unwrap();
+    assert_eq!(store.load_config().unwrap(), cfg);
+    assert!(no_temp_files(store.base()));
+}
+
+#[test]
+fn save_config_refuses_insecure_base() {
+    // Pre-existing 0770 base: refused by the same check as every other store op, so the
+    // config is never written into an attacker-writable directory.
+    let (d, store) = fresh();
+    fs::set_permissions(d.path(), fs::Permissions::from_mode(0o770)).unwrap();
+    assert!(matches!(
+        store.save_config(&sample_config()),
+        Err(StoreError::InsecureBase { .. })
+    ));
+    assert!(!store.config_path().exists());
+}
+
+#[test]
+fn default_win_mnt_is_the_canonical_constant() {
+    // L7-5 = L16-9: the CLI/installer must re-export this one constant.
+    assert_eq!(Config::DEFAULT_WIN_MNT, "/mnt/c");
+    let mut cfg = sample_config();
+    cfg.win_mnt = PathBuf::from(Config::DEFAULT_WIN_MNT);
+    let (_d, store) = fresh();
+    write_private(&store.config_path(), cfg.to_toml().as_bytes());
+    assert_eq!(
+        store.load_config().unwrap().win_mnt,
+        PathBuf::from("/mnt/c")
+    );
 }
 
 // ---------------------------------------------------------------------------
