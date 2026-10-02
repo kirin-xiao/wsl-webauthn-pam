@@ -72,7 +72,7 @@ fail, stall, or attempt consent phishing.
 - **Forge an assertion for an enrolled credential.** The signature is verified
   on the Linux side against the enrolled public key over a challenge the Linux
   side minted; a replaced bridge has no private key. The bridge pin also refuses
-  to launch a changed `.exe` unless the operator disabled it with `noverifypin`.
+  to launch a changed `.exe`; there is no module argument that disables it.
 - **Silently raise privilege.** Even a successful ceremony is checked against
   `rpIdHash`, UP/UV, the enrolled credential id, and the signature.
 - **Enroll a software key under the default policy.** Strict attestation chains
@@ -99,7 +99,8 @@ intend — is accepted and documented as SR-OUT-1/3 (see
   `PAM_AUTH_ERR` or `PAM_AUTHINFO_UNAVAIL` (`crates/wsl-webauthn-pam/src/lib.rs`
   mapping table; `crates/wsl-webauthn-runner/src/lib.rs` bounded read loop).
 - Be launched unchanged by the module if its hash differs from the one pinned at
-  enrollment (unless `noverifypin`). The pin is fail-closed.
+  enrollment. The pin is fail-closed and cannot be disabled from the module
+  arguments.
 
 Because the bridge holds no trust, an attacker who fully controls it gains only
 the ability to deny authentication or to relay a genuine ceremony — not to
