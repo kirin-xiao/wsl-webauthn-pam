@@ -1112,6 +1112,12 @@ fn enroll_with_double_enroll(
 /// record" would run a ceremony that `save_atomic` then rejects, orphaning the Windows
 /// credential exactly as in the `AlreadyExists` case. `--replace` bypasses the check and
 /// lets [`Store::save_atomic`] decide.
+///
+/// **Store precondition first (critical).** Before *any* of the above, the store's write
+/// preconditions are validated with [`Store::preflight_write`]. The ceremony mints a
+/// non-removable Windows-side credential, so a store that cannot accept the write (a
+/// missing or insecure base) must fail fast rather than after the touch/PIN. The typed
+/// error is preserved so the caller's `error_code` can emit its stable token.
 fn enroll_checked(
     store: &Store,
     runner: &dyn EnrollCeremony,
@@ -1120,6 +1126,15 @@ fn enroll_checked(
     allow_unattested: bool,
     replace: bool,
 ) -> anyhow::Result<EnrollOutcome> {
+    if let Err(error) = store.preflight_write() {
+        let context = if matches!(error, StoreError::NotFound { .. }) {
+            "the credential store is not initialized; run `install` first"
+        } else {
+            "the credential store is not writable"
+        };
+        return Err(anyhow::Error::new(error).context(context));
+    }
+
     if !replace {
         match store.load(&target.name) {
             Ok(_) => bail!(
@@ -2737,6 +2752,45 @@ mod tests {
         .unwrap();
         assert_eq!(ceremony.calls.get(), 1);
         assert_eq!(outcome.attestation.format, "none");
+    }
+
+    /// A missing store base must fail before any ceremony, with `--replace` or without:
+    /// otherwise the Windows-side credential is created and then orphaned when the write
+    /// is rejected. The typed error must survive so the stable `not-found` token is emitted.
+    #[test]
+    fn enroll_on_missing_store_base_runs_zero_ceremonies() {
+        for replace in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            // The base is deliberately never created.
+            let store = Store::with_owner(
+                dir.path().join("absent"),
+                wsl_webauthn_store::current_euid(),
+            );
+            let ceremony = ScriptedCeremony::none_attestation();
+            let error = enroll_checked(
+                &store,
+                &ceremony,
+                &test_target(),
+                &AttestationPolicy::Strict,
+                false,
+                replace,
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("install"),
+                "the refusal must point at `install`: {error}"
+            );
+            assert_eq!(
+                error_code(&error),
+                "not-found",
+                "the typed store error must survive for the stable token (replace={replace})"
+            );
+            assert_eq!(
+                ceremony.calls.get(),
+                0,
+                "no Windows Hello ceremony when the store base is missing (replace={replace})"
+            );
+        }
     }
 
     // ---- record construction ----

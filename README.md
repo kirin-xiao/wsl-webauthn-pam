@@ -223,9 +223,12 @@ serial/SSH) and remove the module line.
 | `uninstall` | Remove a credential or all components (root) | `--user <NAME>`; `--all`; `--module-dir <DIR>`; `--win-mnt <PATH>`; `--yes`, `-y`; `--non-interactive` |
 
 `--bridge` and `--win-mnt` fall back to the config, then (`--win-mnt`) to
-`/mnt/c`. `--artifact-dir` falls back to `$WSL_WEBAUTHN_ARTIFACTS` or the current
-directory. A value beginning with `-` must use the `--flag=value` form; in the
-`--flag value` form a `-`-prefixed token is read as the next flag.
+`/mnt/c`. `--bridge` only supplies the bridge path; it does not initialize the
+store, so `install` must have run first (otherwise `enroll` fails with
+`error[not-found]` and guidance to run `install`). `--artifact-dir` falls back to
+`$WSL_WEBAUTHN_ARTIFACTS` or the current directory. A value beginning with `-`
+must use the `--flag=value` form; in the `--flag value` form a `-`-prefixed token
+is read as the next flag.
 
 Exit codes: `0` success; `1` operational failure (in `status` list mode this
 includes unreadable/corrupt credential records — re-run as root); `2` usage

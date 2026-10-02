@@ -588,6 +588,23 @@ impl Store {
         Ok(record)
     }
 
+    /// Validate that this store can accept a [`Store::save_atomic`] write, without
+    /// writing a record.
+    ///
+    /// Runs the same write preconditions as `save_atomic`: `check_base` rejects a
+    /// missing, symlinked, or insecure base, and `ensure_credentials_dir` creates
+    /// `<base>/credentials` (`0700`) if absent or validates it otherwise. Surfacing them
+    /// separately lets a caller fail *before* side effects that cannot be undone.
+    ///
+    /// A missing base stays [`StoreError::NotFound`]; it is deliberately not created here,
+    /// because provisioning the base (including `config`) belongs to `install`, and a base
+    /// created without a `config` would let `enroll` persist a record that PAM cannot use.
+    pub fn preflight_write(&self) -> Result<(), StoreError> {
+        self.check_base()?;
+        let _dir_fd = self.ensure_credentials_dir()?;
+        Ok(())
+    }
+
     /// Atomically write a credential record (enrollment path).
     ///
     /// Fails with [`StoreError::AlreadyExists`] if a record exists and `replace` is
