@@ -9,7 +9,8 @@ use std::sync::LazyLock;
 use ciborium::value::Value;
 use proptest::prelude::*;
 use wsl_webauthn_verifier::{
-    AttestationPolicy, EnrollCheck, testing, verify_attestation_with_anchor,
+    AssertionCheck, AttestationPolicy, EnrollCheck, testing, verify_assertion,
+    verify_attestation_with_anchor,
 };
 
 proptest! {
@@ -43,18 +44,90 @@ proptest! {
         }
     }
 
-    /// Arbitrary CBOR values round-trip through ciborium (the property the
-    /// attestation-object parser relies on when it re-encodes a COSE value).
+    /// Canonical-CBOR / trailing-byte rejection for COSE keys (replaces the former
+    /// `ciborium`-only round-trip property, L14-9). A key the parser accepts is an
+    /// exact single CBOR item; appending any byte must therefore be rejected.
     #[test]
-    fn cbor_value_roundtrip(value in cbor_value_strategy()) {
-        let mut encoded = Vec::new();
-        ciborium::into_writer(&value, &mut encoded).expect("encode");
-        let decoded: Value = ciborium::from_reader(&encoded[..]).expect("decode");
-        let mut reencoded = Vec::new();
-        ciborium::into_writer(&decoded, &mut reencoded).expect("re-encode");
-        // Ciborium canonicalizes numeric widths, so re-encoding is a fixed point.
-        let decoded2: Value = ciborium::from_reader(&reencoded[..]).expect("decode2");
-        prop_assert_eq!(decoded, decoded2);
+    fn cose_trailing_byte_rejected(
+        extra in proptest::collection::vec(any::<u8>(), 1..8),
+    ) {
+        let good = common::es256().cose;
+        prop_assert!(testing::parse_cose_key(&good));
+        let mut with_trailing = good.clone();
+        with_trailing.extend_from_slice(&extra);
+        prop_assert!(
+            !testing::parse_cose_key(&with_trailing),
+            "a COSE key with appended bytes must be rejected"
+        );
+    }
+
+    /// The WebAuthn §7.2 counter policy is monotone: with a persisted count, the
+    /// assertion is rejected exactly when `stored != 0 || observed != 0` and
+    /// `observed <= stored`. A genuinely signed assertion is used each iteration so
+    /// the only variable is the counter policy.
+    #[test]
+    fn counter_policy_monotone(stored in 0u32..16, observed in 0u32..16) {
+        let key = common::es256();
+        let challenge = [0x5au8; 32];
+        let credential_id = b"counter-prop".to_vec();
+        let client_data_json =
+            common::client_data(wsl_webauthn_protocol::ClientDataKind::Get, &challenge);
+        let auth_data = common::build_auth_data(
+            wsl_webauthn_protocol::RP_ID,
+            0x01 | 0x04,
+            observed,
+            None,
+        );
+        let signature = key
+            .signer
+            .sign(&common::signed_message(&auth_data, &client_data_json));
+        let check = AssertionCheck {
+            expected_challenge: &challenge,
+            credential_id: &credential_id,
+            cose_public_key: &key.cose,
+            client_data_json: &client_data_json,
+            authenticator_data: &auth_data,
+            signature: &signature,
+            expected_sign_count: Some(stored),
+            now: common::fixture_now(),
+        };
+        let outcome = verify_assertion(&check);
+        let should_reject = (stored != 0 || observed != 0) && observed <= stored;
+        if should_reject {
+            prop_assert_eq!(
+                outcome,
+                Err(wsl_webauthn_verifier::VerifyError::CounterRegression {
+                    stored,
+                    observed
+                })
+            );
+        } else {
+            prop_assert!(outcome.is_ok(), "counter pair {stored}/{observed} must pass");
+        }
+    }
+
+    /// Assertion verification is deterministic: the same inputs yield the same
+    /// result (and never panic) across repeated calls.
+    #[test]
+    fn assertion_verify_is_deterministic(
+        auth_data in proptest::collection::vec(any::<u8>(), 0..256),
+        signature in proptest::collection::vec(any::<u8>(), 0..128),
+    ) {
+        let cose = common::es256().cose;
+        let challenge = [0x11u8; 32];
+        let client_data_json =
+            common::client_data(wsl_webauthn_protocol::ClientDataKind::Get, &challenge);
+        let check = AssertionCheck {
+            expected_challenge: &challenge,
+            credential_id: b"determinism",
+            cose_public_key: &cose,
+            client_data_json: &client_data_json,
+            authenticator_data: &auth_data,
+            signature: &signature,
+            expected_sign_count: None,
+            now: common::fixture_now(),
+        };
+        prop_assert_eq!(verify_assertion(&check), verify_assertion(&check));
     }
 
     /// Random COSE maps never panic and never accept a non-allow-listed algorithm.
@@ -293,21 +366,4 @@ fn rebuild_tpm_fields(obj: &[u8], pub_area: &[u8], cert_info: &[u8], sig: &[u8])
     let mut out = Vec::new();
     ciborium::into_writer(&Value::Map(map), &mut out).expect("re-encode");
     out
-}
-
-/// A reasonably rich CBOR value strategy.
-fn cbor_value_strategy() -> impl Strategy<Value = Value> {
-    let leaf = prop_oneof![
-        any::<i64>().prop_map(|v| Value::from(v as i128)),
-        proptest::collection::vec(any::<u8>(), 0..64).prop_map(Value::Bytes),
-        any::<bool>().prop_map(Value::Bool),
-        ".*".prop_map(Value::Text),
-        Just(Value::Null),
-    ];
-    leaf.prop_recursive(4, 64, 8, |inner| {
-        prop_oneof![
-            proptest::collection::vec(inner.clone(), 0..8).prop_map(Value::Array),
-            proptest::collection::vec((inner.clone(), inner), 0..8).prop_map(Value::Map),
-        ]
-    })
 }

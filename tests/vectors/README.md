@@ -6,9 +6,20 @@ committed here.
 
 ## What is committed
 
-Nothing binary. The behavioural gate for this crate is covered by:
-
-* `crates/wsl-webauthn-verifier/tests/` — the **synthesized** positive/negative
+* `crates/wsl-webauthn-verifier/tests/independent.rs` — a **committed, sanitized
+  independent vector**. Every byte (ECDSA P-256 chain, `packed` attestation
+  object, credential COSE key, `clientDataJSON`, and both signatures) was produced
+  **off-line, outside Rust**, with `python3` + the `cryptography` package and a
+  hand-rolled minimal CBOR encoder. The test calls neither `tests/common`'s
+  builders nor `build_client_data`, so it is a second implementation of the
+  signed-message/certificate construction and does not share the verifier's
+  assumptions (L14-5). It also pins the signed-message definition to an off-line
+  SHA-256 literal and runs a mutation oracle (every single-byte corruption of the
+  known-good object must be rejected). The synthetic names are obviously fake
+  ("Independent Test …"); no real machine identifier, serial, key, or user is
+  present.
+* The remainder of the behavioural gate is covered by
+  `crates/wsl-webauthn-verifier/tests/` — the **synthesized** positive/negative
   suite. Every COSE key, `authenticatorData`, `attestationObject`, `attStmt`,
   X.509 chain, and TPM `certInfo`/`pubArea` is generated in-process, so there is
   no third-party licensing or machine-identifier concern. It covers one negative

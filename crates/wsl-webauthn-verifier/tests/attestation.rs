@@ -10,12 +10,14 @@ mod common;
 
 use ciborium::value::Value;
 use common::*;
+use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 use wsl_webauthn_protocol::{ClientDataKind, RP_ID};
 use wsl_webauthn_verifier::{
     AttestationMode, AttestationPolicy, EnrollCheck, EnrollOutcome, VerifyError,
     verify_attestation, verify_attestation_with_anchor,
 };
+use x509_cert::name::Name;
 
 /// A positive packed/x5c enrollment, parameterized by chain shape.
 struct Fixture {
@@ -77,7 +79,7 @@ fn check<'a>(f: &'a Fixture, _policy: &'a AttestationPolicy) -> EnrollCheck<'a> 
         attestation_object: &f.attestation_object,
         client_data_json: &f.client_data_json,
         reported_credential_id: &f.credential_id,
-        now: SystemTime::now(),
+        now: fixture_now(),
     }
 }
 
@@ -575,6 +577,36 @@ fn chain_fixture(opts: ChainOptions, alg: i64) -> Fixture {
     fixture_with(es256(), opts, alg, None)
 }
 
+/// A `packed`/x5c fixture whose `x5c` is a single standalone leaf. The leaf's own
+/// fingerprint is the injected anchor, so chain-walking succeeds trivially and only
+/// the leaf-shape checks run before the issuer link is reached.
+fn packed_leaf_fixture(leaf: &ChainLeaf) -> Fixture {
+    let challenge = vec![0x77u8; 32];
+    let credential_id = b"enroll-cred-id".to_vec();
+    let client_data_json = client_data(ClientDataKind::Create, &challenge);
+    let key = es256();
+    let attested = AttestedData {
+        aaguid: AAGUID_ALLOWED,
+        credential_id: credential_id.clone(),
+        cose_public_key: key.cose.clone(),
+    };
+    let auth_data = build_auth_data(RP_ID, 0x01 | 0x04, 0, Some(&attested));
+    let sig = leaf
+        .signer
+        .sign(&signed_message(&auth_data, &client_data_json));
+    let att_stmt = packed_att_stmt(-7, &sig, Some(std::slice::from_ref(&leaf.der)));
+    let attestation_object = attestation_object("packed", &auth_data, att_stmt);
+    Fixture {
+        challenge,
+        credential_id,
+        client_data_json,
+        attestation_object,
+        root_fingerprint: sha256(&leaf.der),
+        aaguid: AAGUID_ALLOWED,
+        auth_data,
+    }
+}
+
 #[test]
 fn negative_broken_chain_leaf_signature() {
     let f = chain_fixture(
@@ -607,7 +639,7 @@ fn negative_missing_anchor() {
 
 #[test]
 fn negative_expired_leaf() {
-    let now = SystemTime::now();
+    let now = fixture_now();
     let f = chain_fixture(
         ChainOptions {
             leaf_validity: validity_from(
@@ -626,7 +658,7 @@ fn negative_expired_leaf() {
 
 #[test]
 fn negative_not_yet_valid_leaf() {
-    let now = SystemTime::now();
+    let now = fixture_now();
     let f = chain_fixture(
         ChainOptions {
             leaf_validity: validity_from(
@@ -640,6 +672,228 @@ fn negative_not_yet_valid_leaf() {
     assert_eq!(
         verify(&f, AttestationPolicy::Strict),
         Err(VerifyError::CertificateNotYetValid)
+    );
+}
+
+#[test]
+fn negative_expired_intermediate() {
+    // Only the intermediate is expired; the leaf and root remain valid.
+    let now = fixture_now();
+    let f = chain_fixture(
+        ChainOptions {
+            intermediate_validity: validity_from(
+                now - Duration::from_secs(7200),
+                now - Duration::from_secs(3600),
+            ),
+            ..Default::default()
+        },
+        -7,
+    );
+    assert_eq!(
+        verify(&f, AttestationPolicy::Strict),
+        Err(VerifyError::CertificateExpired)
+    );
+}
+
+#[test]
+fn negative_expired_root() {
+    let now = fixture_now();
+    let f = chain_fixture(
+        ChainOptions {
+            root_validity: validity_from(
+                now - Duration::from_secs(7200),
+                now - Duration::from_secs(3600),
+            ),
+            ..Default::default()
+        },
+        -7,
+    );
+    assert_eq!(
+        verify(&f, AttestationPolicy::Strict),
+        Err(VerifyError::CertificateExpired)
+    );
+}
+
+#[test]
+fn boundary_not_before_equals_now_is_accepted() {
+    // `check_validity` uses inclusive bounds; a leaf whose `notBefore` is exactly
+    // the pinned instant must still verify.
+    let f = chain_fixture(
+        ChainOptions {
+            leaf_validity: validity_from(fixture_now(), fixture_now() + Duration::from_secs(3600)),
+            ..Default::default()
+        },
+        -7,
+    );
+    verify(&f, AttestationPolicy::Strict).expect("notBefore == now is valid");
+}
+
+#[test]
+fn boundary_not_after_equals_now_is_accepted() {
+    let f = chain_fixture(
+        ChainOptions {
+            leaf_validity: validity_from(fixture_now() - Duration::from_secs(3600), fixture_now()),
+            ..Default::default()
+        },
+        -7,
+    );
+    verify(&f, AttestationPolicy::Strict).expect("notAfter == now is valid");
+}
+
+#[test]
+fn boundary_one_second_before_not_before_is_rejected() {
+    let f = chain_fixture(
+        ChainOptions {
+            leaf_validity: validity_from(
+                fixture_now() + Duration::from_secs(1),
+                fixture_now() + Duration::from_secs(3600),
+            ),
+            ..Default::default()
+        },
+        -7,
+    );
+    assert_eq!(
+        verify(&f, AttestationPolicy::Strict),
+        Err(VerifyError::CertificateNotYetValid)
+    );
+}
+
+#[test]
+fn boundary_one_second_after_not_after_is_rejected() {
+    let f = chain_fixture(
+        ChainOptions {
+            leaf_validity: validity_from(
+                fixture_now() - Duration::from_secs(3600),
+                fixture_now() - Duration::from_secs(1),
+            ),
+            ..Default::default()
+        },
+        -7,
+    );
+    assert_eq!(
+        verify(&f, AttestationPolicy::Strict),
+        Err(VerifyError::CertificateExpired)
+    );
+}
+
+#[test]
+fn negative_leaf_not_v3() {
+    let f = chain_fixture(
+        ChainOptions {
+            leaf_version_v1: true,
+            ..Default::default()
+        },
+        -7,
+    );
+    assert_eq!(
+        verify(&f, AttestationPolicy::Strict),
+        Err(VerifyError::CertificateVersionNotV3)
+    );
+}
+
+#[test]
+fn negative_leaf_missing_basic_constraints() {
+    // A standalone leaf (acting as its own trust anchor) with no BasicConstraints
+    // extension. The leaf is checked before any issuer link and the extension is
+    // mandatory, so the rejection is unambiguous.
+    let leaf = chain_leaf(&ChainOptions {
+        omit_leaf_basic_constraints: true,
+        ..Default::default()
+    });
+    let f = packed_leaf_fixture(&leaf);
+    assert_eq!(
+        verify(&f, AttestationPolicy::Strict),
+        Err(VerifyError::CertificateMissingBasicConstraints)
+    );
+}
+
+#[test]
+fn positive_leaf_empty_basic_constraints_is_non_ca() {
+    // RFC 5280: `basicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE }`, so an
+    // empty SEQUENCE is a valid *non-CA* constraints extension and must be accepted.
+    // This pins the default and guards against a regression that treats an absent
+    // `cA` as CA=true.
+    let leaf = chain_leaf(&ChainOptions {
+        leaf_basic_constraints_empty: true,
+        ..Default::default()
+    });
+    let f = packed_leaf_fixture(&leaf);
+    verify(&f, AttestationPolicy::Strict).expect("empty basicConstraints defaults to cA=false");
+}
+
+#[test]
+fn negative_intermediate_missing_basic_constraints() {
+    // The intermediate lacks BasicConstraints; the leaf and root are fine. Because
+    // `basic_constraints` requires the extension to be *present* (`.ok_or` before any
+    // `ca` check), the rejection is reported as `CertificateMissingBasicConstraints`
+    // rather than `CertificateIntermediateNotCa`. Both are constructed variants; this
+    // locks in which one an absent intermediate extension maps to.
+    let f = chain_fixture(
+        ChainOptions {
+            omit_intermediate_basic_constraints: true,
+            ..Default::default()
+        },
+        -7,
+    );
+    assert_eq!(
+        verify(&f, AttestationPolicy::Strict),
+        Err(VerifyError::CertificateMissingBasicConstraints)
+    );
+}
+
+#[test]
+fn negative_issuer_subject_mismatch() {
+    // The leaf's `issuer` field names a different CA than the one whose key actually
+    // signed it and that follows it in `x5c`.
+    let f = chain_fixture(
+        ChainOptions {
+            issuer_name_override: Some(
+                Name::from_str("CN=Not The Issuer,O=wsl-webauthn-pam tests,C=US")
+                    .expect("override name"),
+            ),
+            ..Default::default()
+        },
+        -7,
+    );
+    assert_eq!(
+        verify(&f, AttestationPolicy::Strict),
+        Err(VerifyError::CertificateChainIssuerMismatch)
+    );
+}
+
+#[test]
+fn negative_unsupported_certificate_algorithm() {
+    // `1.2.840.113549.1.1.4` = md5WithRSAEncryption, which the chain walker does not
+    // implement. The leaf link reaches `UnsupportedCertificateAlgorithm`.
+    let f = chain_fixture(
+        ChainOptions {
+            leaf_sig_oid: Some(der::asn1::ObjectIdentifier::new_unwrap(
+                "1.2.840.113549.1.1.4",
+            )),
+            ..Default::default()
+        },
+        -7,
+    );
+    assert_eq!(
+        verify(&f, AttestationPolicy::Strict),
+        Err(VerifyError::UnsupportedCertificateAlgorithm)
+    );
+}
+
+#[test]
+fn negative_malformed_aaguid_extension() {
+    // The `id-fido-gen-ce-aaguid` extension is present but its value is not a valid
+    // (possibly double-wrapped) 16-byte OCTET STRING.
+    let f = chain_fixture(
+        ChainOptions {
+            malformed_aaguid_ext: true,
+            ..Default::default()
+        },
+        -7,
+    );
+    assert_eq!(
+        verify(&f, AttestationPolicy::Strict),
+        Err(VerifyError::CertificateAaguidMalformed)
     );
 }
 
@@ -903,7 +1157,7 @@ fn verify_tpm(f: &TpmFixture, policy: AttestationPolicy) -> Result<EnrollOutcome
         attestation_object: &f.attestation_object,
         client_data_json: &f.client_data_json,
         reported_credential_id: &f.credential_id,
-        now: SystemTime::now(),
+        now: fixture_now(),
     };
     verify_attestation_with_anchor(&check, &policy, &f.root_fingerprint)
 }
@@ -941,7 +1195,7 @@ fn positive_tpm_rs256_credential_key_strict() {
         attestation_object: &e.attestation_object,
         client_data_json: &e.client_data_json,
         reported_credential_id: &e.credential_id,
-        now: SystemTime::now(),
+        now: fixture_now(),
     };
     let outcome =
         verify_attestation_with_anchor(&check, &AttestationPolicy::Strict, &e.root_fingerprint)
@@ -1081,7 +1335,7 @@ fn negative_tpm_pub_area_key_bits_mismatch() {
         attestation_object: &obj,
         client_data_json: &e.client_data_json,
         reported_credential_id: &e.credential_id,
-        now: SystemTime::now(),
+        now: fixture_now(),
     };
     assert_eq!(
         verify_attestation_with_anchor(&check, &AttestationPolicy::Strict, &e.root_fingerprint),
@@ -1236,7 +1490,7 @@ fn negative_tpm_aik_subject_not_empty() {
         attestation_object: &e.attestation_object,
         client_data_json: &e.client_data_json,
         reported_credential_id: &e.credential_id,
-        now: SystemTime::now(),
+        now: fixture_now(),
     };
     assert_eq!(
         verify_attestation_with_anchor(&check, &policy, &e.root_fingerprint),
@@ -1318,7 +1572,7 @@ fn tpm_check<'a>(f: &'a TpmFixture) -> EnrollCheck<'a> {
         attestation_object: &f.attestation_object,
         client_data_json: &f.client_data_json,
         reported_credential_id: &f.credential_id,
-        now: SystemTime::now(),
+        now: fixture_now(),
     }
 }
 

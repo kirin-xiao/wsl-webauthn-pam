@@ -8,7 +8,6 @@
 mod common;
 
 use common::*;
-use std::time::SystemTime;
 use wsl_webauthn_protocol::{ClientDataKind, RP_ID};
 use wsl_webauthn_verifier::{AssertionCheck, VerifyError, verify_assertion};
 
@@ -49,7 +48,7 @@ fn check<'a>(a: &'a Assertion) -> AssertionCheck<'a> {
         authenticator_data: &a.auth_data,
         signature: &a.signature,
         expected_sign_count: None,
-        now: SystemTime::now(),
+        now: fixture_now(),
     }
 }
 
@@ -365,6 +364,88 @@ fn negative_credential_key_malformed_cbor() {
         verify_assertion(&c),
         Err(VerifyError::MalformedCoseKey { .. })
     ));
+}
+
+#[test]
+fn negative_credential_key_rsa_modulus_too_small() {
+    // A 1024-bit RSA modulus is below the 2048-bit floor. Table-driven over the
+    // 1024/2048/4096/8192 boundaries: only 2048 and 4096 are accepted, 1024 and
+    // 8192 are rejected with the observed bit length (L14-3).
+    let a = build_assertion(&es256());
+    for bits in [1024u64, 2048, 4096, 8192] {
+        let n = modulus_of_bits(bits);
+        let cose = cbor_map(&[
+            (1, int(3)),
+            (3, int(-257)),
+            (-1, bytes(n)),
+            (-2, bytes(vec![0x01, 0x00, 0x01])),
+        ]);
+        let mut c = check(&a);
+        c.cose_public_key = &cose;
+        if bits == 2048 || bits == 4096 {
+            // Accepted structurally; the ES256 signature then fails under the RSA key.
+            assert!(
+                matches!(
+                    verify_assertion(&c),
+                    Err(VerifyError::SignatureInvalid)
+                        | Err(VerifyError::MalformedSignature { .. })
+                ),
+                "{bits}-bit must be structurally accepted"
+            );
+        } else {
+            assert_eq!(
+                verify_assertion(&c),
+                Err(VerifyError::CoseKeyModulusSize { bits }),
+                "{bits}-bit must be rejected"
+            );
+        }
+    }
+}
+
+#[test]
+fn negative_credential_key_kty_alg_mismatch() {
+    // Each known kty paired with a known-but-wrong alg must be rejected as an
+    // unsupported *key type* (the allow-listed alg is not valid for that kty).
+    let a = build_assertion(&es256());
+    let cases: [(i64, i64); 3] = [
+        (2, -257), // kty=EC2 with RS256
+        (3, -7),   // kty=RSA with ES256
+        (1, -257), // kty=OKP with RS256
+    ];
+    for (kty, alg) in cases {
+        let cose = cbor_map(&[(1, int(kty)), (3, int(alg))]);
+        let mut c = check(&a);
+        c.cose_public_key = &cose;
+        assert_eq!(
+            verify_assertion(&c),
+            Err(VerifyError::UnsupportedKeyType { kty }),
+            "kty={kty}/alg={alg} must be a key-type mismatch"
+        );
+    }
+}
+
+#[test]
+fn negative_credential_key_unknown_kty_known_alg() {
+    // A kty outside {EC2, RSA, OKP} with an allow-listed alg is rejected as an
+    // unsupported key type.
+    let a = build_assertion(&es256());
+    let cose = cbor_map(&[(1, int(4)), (3, int(-7))]);
+    let mut c = check(&a);
+    c.cose_public_key = &cose;
+    assert_eq!(
+        verify_assertion(&c),
+        Err(VerifyError::UnsupportedKeyType { kty: 4 })
+    );
+}
+
+/// A big-endian RSA modulus of exactly `bits` bits with no leading zero.
+fn modulus_of_bits(bits: u64) -> Vec<u8> {
+    let len = (bits / 8) as usize;
+    let mut n = vec![0u8; len];
+    n[0] = 0x80; // high bit set -> exactly `bits` bits
+    // Keep it odd (not that the verifier requires primality for a public modulus).
+    n[len - 1] = 0x01;
+    n
 }
 
 #[test]

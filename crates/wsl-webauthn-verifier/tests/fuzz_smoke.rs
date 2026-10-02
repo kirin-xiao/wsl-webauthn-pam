@@ -5,7 +5,6 @@
 mod common;
 
 use proptest::prelude::*;
-use std::time::SystemTime;
 use wsl_webauthn_protocol::{ClientDataKind, RP_ID, build_client_data};
 use wsl_webauthn_verifier::{
     AssertionCheck, AttestationPolicy, EnrollCheck, testing, verify_assertion,
@@ -98,7 +97,7 @@ proptest! {
             authenticator_data: &auth_data,
             signature: &signature,
             expected_sign_count: None,
-            now: SystemTime::now(),
+            now: common::fixture_now(),
         };
         let _ = verify_assertion(&check);
     }

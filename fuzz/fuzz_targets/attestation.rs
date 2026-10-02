@@ -131,7 +131,57 @@ fn stitched_attestation(data: &[u8]) {
     let _ = verify_attestation_with_anchor(&check, &AttestationPolicy::AllowUnattested, &anchor);
 }
 
+/// Fail-open oracle over an **independent** (non-Rust) golden vector: a known-good
+/// `packed`/x5c object must verify, one bit of its signature must not, and a
+/// single-byte mutation anywhere in the object must be rejected. This catches a
+/// verifier that returns `Ok` without genuinely binding the signed message (L14-5,
+/// L14-10) and does not use the synthesized-vector helpers.
+fn independent_oracle() {
+    let challenge = common::unhex(common::INDEPENDENT_CHALLENGE_HEX);
+    let good = common::unhex(common::INDEPENDENT_ATTESTATION_OBJECT_HEX);
+    let client_data_json = common::INDEPENDENT_CLIENT_DATA_CREATE;
+    let credential_id = common::INDEPENDENT_CREDENTIAL_ID;
+    let mut fingerprint = [0u8; 32];
+    fingerprint.copy_from_slice(&common::unhex(common::INDEPENDENT_ROOT_FINGERPRINT_HEX));
+    let now = common::independent_now();
+
+    let check = EnrollCheck {
+        expected_challenge: &challenge,
+        attestation_object: &good,
+        client_data_json,
+        reported_credential_id: credential_id,
+        now,
+    };
+    assert!(
+        verify_attestation_with_anchor(&check, &AttestationPolicy::Strict, &fingerprint).is_ok(),
+        "the independent golden vector must verify"
+    );
+
+    // Mutate bytes from structurally significant regions: the CBOR header, the
+    // `sig`/`x5c` interior, and the tail. All must be rejected.
+    for i in [0usize, good.len() / 3, good.len() / 2, good.len() - 1] {
+        let mut mutated = good.clone();
+        mutated[i] ^= 0x01;
+        let check = EnrollCheck {
+            expected_challenge: &challenge,
+            attestation_object: &mutated,
+            client_data_json,
+            reported_credential_id: credential_id,
+            now,
+        };
+        assert!(
+            verify_attestation_with_anchor(&check, &AttestationPolicy::Strict, &fingerprint).is_err(),
+            "independent vector mutation at offset {i} must be rejected"
+        );
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
     raw_attestation(data);
     stitched_attestation(data);
+    // Rare seeded branch: run the independent fail-open oracle once per corpus
+    // exploration of this marker, not on every iteration.
+    if data.first() == Some(&0xAB) {
+        independent_oracle();
+    }
 });

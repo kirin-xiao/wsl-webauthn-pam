@@ -14,6 +14,7 @@ use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
 use ciborium::value::Value;
+use der::asn1::BitString;
 use der::asn1::OctetString;
 use der::{Encode, Length, Writer};
 use p256::ecdsa::SigningKey as P256SigningKey;
@@ -22,7 +23,8 @@ use rand::rngs::OsRng;
 use sha2::{Digest as _, Sha256};
 use x509_cert::Certificate;
 use x509_cert::builder::{Builder as _, CertificateBuilder, Profile};
-use x509_cert::ext::pkix::{ExtendedKeyUsage, KeyUsage, KeyUsages};
+use x509_cert::certificate::Version;
+use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage, KeyUsages};
 use x509_cert::ext::{AsExtension, Extension};
 use x509_cert::name::Name;
 use x509_cert::serial_number::SerialNumber;
@@ -46,6 +48,27 @@ pub const ID_FIDO_GEN_CE_AAGUID: der::asn1::ObjectIdentifier =
 /// OID `tcg-kp-AIKCertificate` (2.23.133.8.3).
 pub const OID_TCG_KP_AIK_CERTIFICATE: der::asn1::ObjectIdentifier =
     der::asn1::ObjectIdentifier::new_unwrap("2.23.133.8.3");
+
+/// The single wall-clock instant every synthesized fixture is pinned to
+/// (2020-09-13T12:26:40Z). Fixture validity windows and `EnrollCheck::now` are
+/// both derived from it, so no test depends on the verifier re-reading the real
+/// clock independently of the fixture (L14-7). It sits well inside the default
+/// ±1 h validity windows and inside the committed independent vector's
+/// 2020..2049 certificate window.
+pub const FIXTURE_NOW_SECS: u64 = 1_600_000_000;
+
+/// [`FIXTURE_NOW_SECS`] as a [`SystemTime`].
+pub fn fixture_now() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(FIXTURE_NOW_SECS)
+}
+
+/// A default certificate validity window around [`fixture_now`].
+pub fn fixture_validity() -> Validity {
+    validity_from(
+        fixture_now() - Duration::from_secs(3600),
+        fixture_now() + Duration::from_secs(3600),
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Authenticator-data / client-data / attestation-object builders
@@ -318,6 +341,28 @@ pub struct ChainOptions {
     pub aik_key_usage_forbids_signature: bool,
     /// Remove the `tpm` leaf's KeyUsage extension entirely (absent is allowed).
     pub omit_aik_key_usage: bool,
+    /// Sign the leaf with a certificate name that does not match the issuer's
+    /// subject, so the issuer/subject link must be rejected even though the
+    /// signature still checks out.
+    pub issuer_name_override: Option<Name>,
+    /// Emit the leaf certificate as X.509 **version 1** (default V3). Extension-less
+    /// v1 certs are the realistic shape; the verifier must reject any non-v3 leaf.
+    pub leaf_version_v1: bool,
+    /// Omit the leaf's BasicConstraints extension (it is mandatory for us).
+    pub omit_leaf_basic_constraints: bool,
+    /// Omit the intermediate's BasicConstraints extension.
+    pub omit_intermediate_basic_constraints: bool,
+    /// Override the leaf's OID and its `TBSCertificate.signature` OID with an
+    /// unsupported value (e.g. `1.2.840.113549.1.1.4` = md5WithRSA), so the link
+    /// check reaches `UnsupportedCertificateAlgorithm`.
+    pub leaf_sig_oid: Option<der::asn1::ObjectIdentifier>,
+    /// Replace the leaf's `id-fido-gen-ce-aaguid` extension value with arbitrary
+    /// (malformed) bytes, so `CertificateAaguidMalformed` is reached.
+    pub malformed_aaguid_ext: bool,
+    /// Replace the leaf's BasicConstraints extension with the empty SEQUENCE
+    /// encoding of `basicConstraints`; RFC 5280 defines `cA BOOLEAN DEFAULT FALSE`,
+    /// so this is a valid *non-CA* constraints extension and must be accepted.
+    pub leaf_basic_constraints_empty: bool,
     pub leaf_validity: Validity,
     pub intermediate_validity: Validity,
     pub root_validity: Validity,
@@ -337,9 +382,16 @@ impl Default for ChainOptions {
             include_aik_eku: true,
             aik_key_usage_forbids_signature: false,
             omit_aik_key_usage: false,
-            leaf_validity: Validity::from_now(Duration::from_secs(3600)).unwrap(),
-            intermediate_validity: Validity::from_now(Duration::from_secs(3600)).unwrap(),
-            root_validity: Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            issuer_name_override: None,
+            leaf_version_v1: false,
+            omit_leaf_basic_constraints: false,
+            omit_intermediate_basic_constraints: false,
+            leaf_sig_oid: None,
+            malformed_aaguid_ext: false,
+            leaf_basic_constraints_empty: false,
+            leaf_validity: fixture_validity(),
+            intermediate_validity: fixture_validity(),
+            root_validity: fixture_validity(),
         }
     }
 }
@@ -381,7 +433,7 @@ pub fn build_chain(opts: &ChainOptions) -> TestChain {
         root_subject.clone(),
         None,
     );
-    let intermediate = build_cert(
+    let intermediate = build_cert_full(
         &root_key,         // signed by the root
         &intermediate_key, // subject key
         if opts.intermediate_is_ca {
@@ -400,6 +452,11 @@ pub fn build_chain(opts: &ChainOptions) -> TestChain {
         opts.intermediate_validity,
         intermediate_subject.clone(),
         None,
+        &[],
+        &ChainOptions {
+            omit_leaf_basic_constraints: opts.omit_intermediate_basic_constraints,
+            ..Default::default()
+        },
     );
 
     let leaf_profile = if opts.leaf_is_ca {
@@ -422,7 +479,7 @@ pub fn build_chain(opts: &ChainOptions) -> TestChain {
     } else {
         &intermediate_key
     };
-    let leaf = build_cert(
+    let leaf = build_cert_full(
         leaf_issuer_key, // signed by the intermediate (or the wrong key)
         &leaf_key,       // subject key: what the attestation verifies against
         leaf_profile,
@@ -434,6 +491,8 @@ pub fn build_chain(opts: &ChainOptions) -> TestChain {
         } else {
             None
         },
+        &[],
+        opts,
     );
 
     let root_der = root.to_der().expect("root der");
@@ -464,6 +523,49 @@ fn build_cert_with_signer(
     aaguid: Option<[u8; 16]>,
     eku: &[der::asn1::ObjectIdentifier],
 ) -> Certificate {
+    build_cert_full(
+        signing_key,
+        subject_key,
+        profile,
+        serial,
+        validity,
+        subject,
+        aaguid,
+        eku,
+        &ChainOptions::default(),
+    )
+}
+
+/// Build a certificate, applying the [`ChainOptions`] leaf-shape knobs that are
+/// relevant to `profile` (issuer mismatch, version, BasicConstraints, signature OID,
+/// malformed AAGUID extension). Used by both the packed and tpm chain builders, and
+/// by [`chain_leaf`] for standalone leaf construction.
+#[allow(clippy::too_many_arguments)]
+fn build_cert_full(
+    signing_key: &TestKey,
+    subject_key: &TestKey,
+    profile: Profile,
+    serial: u32,
+    validity: Validity,
+    subject: Name,
+    aaguid: Option<[u8; 16]>,
+    eku: &[der::asn1::ObjectIdentifier],
+    opts: &ChainOptions,
+) -> Certificate {
+    let issuer_override = opts.issuer_name_override.clone();
+    let profile = match profile {
+        Profile::Leaf {
+            issuer,
+            enable_key_agreement,
+            enable_key_encipherment,
+        } => Profile::Leaf {
+            issuer: issuer_override.unwrap_or(issuer),
+            enable_key_agreement,
+            enable_key_encipherment,
+        },
+        // `issuer_name_override` targets the leaf's issuer/subject link only.
+        other => other,
+    };
     let spki = subject_key.signer.spki();
     let serial = SerialNumber::from(serial);
     match signing_key {
@@ -483,12 +585,74 @@ fn build_cert_with_signer(
                     .add_extension(&ExtendedKeyUsage(eku.to_vec()))
                     .expect("eku ext");
             }
-            builder
+            let mut cert = builder
                 .build::<p256::ecdsa::DerSignature>()
-                .expect("build cert")
+                .expect("build cert");
+            if opts.leaf_version_v1 {
+                cert.tbs_certificate.version = Version::V1;
+            }
+            if opts.omit_leaf_basic_constraints {
+                remove_extension(
+                    &mut cert,
+                    <BasicConstraints as const_oid::AssociatedOid>::OID,
+                );
+            }
+            if opts.leaf_basic_constraints_empty {
+                set_extension_raw(
+                    &mut cert,
+                    <BasicConstraints as const_oid::AssociatedOid>::OID,
+                    &[0x30, 0x00],
+                );
+            }
+            if opts.malformed_aaguid_ext {
+                set_extension_raw(&mut cert, ID_FIDO_GEN_CE_AAGUID, &[0x01, 0x02, 0x03]);
+            }
+            if let Some(oid) = opts.leaf_sig_oid {
+                cert.tbs_certificate.signature.oid = oid;
+                cert.signature_algorithm.oid = oid;
+            }
+            // Any TBS edit above invalidates the signature; re-sign with the issuer key.
+            re_sign(&mut cert, signer_ref(signing_key));
+            cert
         }
         _ => unimplemented!("test chains use P-256 signers"),
     }
+}
+
+/// The [`Signer`] for a [`TestKey`].
+fn signer_ref(key: &TestKey) -> &Signer {
+    &key.signer
+}
+
+/// Remove an extension by OID, if present.
+fn remove_extension(cert: &mut Certificate, oid: der::asn1::ObjectIdentifier) {
+    if let Some(exts) = cert.tbs_certificate.extensions.as_mut() {
+        exts.retain(|e| e.extn_id != oid);
+    }
+}
+
+/// Replace (or insert) an extension's `extnValue` with raw bytes.
+fn set_extension_raw(cert: &mut Certificate, oid: der::asn1::ObjectIdentifier, value: &[u8]) {
+    let exts = cert
+        .tbs_certificate
+        .extensions
+        .get_or_insert_with(Default::default);
+    let octets = OctetString::new(value.to_vec()).expect("octet string");
+    if let Some(e) = exts.iter_mut().find(|e| e.extn_id == oid) {
+        e.extn_value = octets;
+    } else {
+        exts.push(Extension {
+            extn_id: oid,
+            critical: false,
+            extn_value: octets,
+        });
+    }
+}
+
+/// Re-sign a certificate's TBS with `issuer` so it remains a valid chain link.
+fn re_sign(cert: &mut Certificate, issuer: &Signer) {
+    let tbs_der = cert.tbs_certificate.to_der().expect("tbs der");
+    cert.signature = BitString::from_bytes(&issuer.sign(&tbs_der)).expect("signature bit string");
 }
 
 /// Build a cert signed by `issuer_key` whose own subject key is `subject_key`.
@@ -501,7 +665,7 @@ fn build_cert(
     subject: Name,
     aaguid: Option<[u8; 16]>,
 ) -> Certificate {
-    build_cert_with_signer(
+    build_cert_full(
         issuer_key,
         subject_key,
         profile,
@@ -510,7 +674,54 @@ fn build_cert(
         subject,
         aaguid,
         &[],
+        &ChainOptions::default(),
     )
+}
+
+/// A standalone leaf certificate, used for the BasicConstraints leaf-negative test.
+pub struct ChainLeaf {
+    /// The leaf DER.
+    pub der: Vec<u8>,
+    /// The leaf's public key, to sign the attestation statement.
+    pub signer: Signer,
+}
+
+/// Build just a leaf certificate shaped by `opts` (issuer and subject key are
+/// throwaway P-256 keys). Used where the desired rejection happens at the leaf
+/// before any chain link is checked.
+pub fn chain_leaf(opts: &ChainOptions) -> ChainLeaf {
+    let issuer_key = es256();
+    let leaf_key = es256();
+    let issuer_subject =
+        Name::from_str("CN=ChainLeaf Issuer,O=wsl-webauthn-pam tests,C=US").expect("issuer name");
+    let leaf_subject = Name::from_str(&format!(
+        "CN=ChainLeaf,OU={},O=wsl-webauthn-pam tests,C=US",
+        opts.leaf_ou
+    ))
+    .expect("leaf name");
+    let leaf = build_cert_full(
+        &issuer_key,
+        &leaf_key,
+        Profile::Leaf {
+            issuer: issuer_subject,
+            enable_key_agreement: false,
+            enable_key_encipherment: false,
+        },
+        77,
+        opts.leaf_validity,
+        leaf_subject,
+        if opts.include_aaguid_ext {
+            Some(opts.cert_aaguid.unwrap_or(opts.aaguid))
+        } else {
+            None
+        },
+        &[],
+        opts,
+    );
+    ChainLeaf {
+        der: leaf.to_der().expect("leaf der"),
+        signer: leaf_key.signer,
+    }
 }
 
 /// Set (or, with `None`, remove) a certificate's KeyUsage extension, re-signing the
@@ -577,7 +788,7 @@ pub fn build_tpm_chain(aik: &TestKey, opts: &ChainOptions) -> TestChain {
         root_subject.clone(),
         None,
     );
-    let intermediate = build_cert(
+    let intermediate = build_cert_full(
         &root_key,
         &intermediate_key,
         if opts.intermediate_is_ca {
@@ -596,6 +807,11 @@ pub fn build_tpm_chain(aik: &TestKey, opts: &ChainOptions) -> TestChain {
         opts.intermediate_validity,
         intermediate_subject.clone(),
         None,
+        &[],
+        &ChainOptions {
+            omit_leaf_basic_constraints: opts.omit_intermediate_basic_constraints,
+            ..Default::default()
+        },
     );
 
     // The AIK leaf: signed by the intermediate, own subject key = RSA AIK, empty
