@@ -26,6 +26,9 @@
 //!   (SIGPIPE-driver test); still answers a synthesized `probe`.
 //! * `stderrflood=<n>` — write `n` bytes of filler to stderr (over-cap drain test).
 //! * `exit=<code>` — exit with the given code without writing a response.
+//! * `abort=1` — terminate by `SIGABRT` without writing a response (signal-death path).
+//! * `postclose_sleep=<ms>` — after writing a valid frame, close stdout (EOF) and sleep
+//!   `ms` before exiting (EOF fast-path timing).
 //! * `garbage=1` — write non-framed bytes, then exit 0.
 //! * `badframe=1` — write a plausible length prefix followed by *too few* bytes, then
 //!   exit 0 (truncated frame).
@@ -62,6 +65,8 @@ struct Opts {
     empty: bool,
     trailing: bool,
     noisy: bool,
+    abort: bool,
+    postclose_sleep: Option<u64>,
     payload: usize,
 }
 
@@ -85,6 +90,8 @@ impl Default for Opts {
             empty: false,
             trailing: false,
             noisy: false,
+            abort: false,
+            postclose_sleep: None,
             payload: 0,
         }
     }
@@ -116,6 +123,8 @@ fn parse_args() -> Opts {
             "empty" => opts.empty = value == "1",
             "trailing" => opts.trailing = value == "1",
             "noisy" => opts.noisy = value == "1",
+            "abort" => opts.abort = value == "1",
+            "postclose_sleep" => opts.postclose_sleep = value.parse().ok(),
             "payload" => opts.payload = value.parse().unwrap_or(0),
             _ => {}
         }
@@ -206,6 +215,17 @@ fn main() -> ExitCode {
         std::thread::sleep(Duration::from_millis(opts.sleep_ms));
     }
 
+    if opts.abort {
+        // Die by SIGABRT (signal 6) without writing a frame, to exercise the runner's
+        // signal-death modeling (L8-11). The real bridge is a Windows exe, but a Linux
+        // signal stands in for "terminated by a signal".
+        unsafe {
+            libc::signal(libc::SIGABRT, libc::SIG_DFL);
+            libc::raise(libc::SIGABRT);
+        }
+        // Unreachable if the signal is delivered.
+        return ExitCode::from(134);
+    }
     if let Some(code) = opts.exit_code {
         return ExitCode::from(code as u8);
     }
@@ -274,6 +294,16 @@ fn main() -> ExitCode {
         let mut stdout = std::io::stdout();
         let _ = stdout.write_all(b"trailing-garbage-after-frame");
         let _ = stdout.flush();
+    }
+    if let Some(ms) = opts.postclose_sleep {
+        // Close both stdout and stderr (the runner sees EOF on both) and linger, so the
+        // runner is on its EOF fast path waiting for the child to be reaped (L10-3 timing
+        // test). SAFETY: close owned fds; the frame was already flushed.
+        unsafe {
+            libc::close(1);
+            libc::close(2);
+        }
+        std::thread::sleep(Duration::from_millis(ms));
     }
     ExitCode::SUCCESS
 }

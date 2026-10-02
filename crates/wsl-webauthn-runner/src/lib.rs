@@ -85,6 +85,15 @@ pub const TASKKILL_BUDGET: Duration = Duration::from_secs(5);
 /// Poll granularity used while waiting for the child (keeps deadline checks responsive).
 const POLL_GRANULARITY: Duration = Duration::from_millis(20);
 
+/// Short backoff used on the EOF fast path (both child pipes closed, child not yet
+/// reaped). A full [`POLL_GRANULARITY`] tick would add up to ~20 ms after the response is
+/// already in hand, delaying the `sudo` shell.
+const EOF_SPIN: Duration = Duration::from_millis(1);
+
+/// How long [`EOF_SPIN`] is used before backing off to [`POLL_GRANULARITY`]. Bounds the
+/// extra wakeups a child that closed its stdio but stays alive for a long time can cause.
+const EOF_SPIN_WINDOW: Duration = Duration::from_millis(5);
+
 /// Errors from spawning or talking to the bridge.
 ///
 /// These are all *transport* failures. A ceremony failure arrives as
@@ -127,14 +136,15 @@ pub enum RunnerError {
     },
     /// The child exited non-zero (transport failure per the process contract).
     ///
-    /// `code` carries the raw exit status; `message` is the pre-composed human-readable
-    /// description: the documented meaning of the exit code plus a bounded, sanitized
-    /// tail of the child's stderr (the bridge's HRESULT/error line, when present).
+    /// `reason` distinguishes a normal exit code from death by signal; `message` is the
+    /// pre-composed human-readable description: the documented meaning of the exit code
+    /// (or the signal name/number) plus a bounded, sanitized tail of the child's stderr
+    /// (the bridge's HRESULT/error line, when present).
     #[error("{message}")]
     BridgeFailed {
-        /// The exit code, or `None` if the child was terminated by a signal.
-        code: Option<i32>,
-        /// Exit-code meaning plus the bounded stderr tail, ready for a log line.
+        /// How the child terminated (exit code or signal).
+        reason: ExitReason,
+        /// Exit-code/signal meaning plus the bounded stderr tail, ready for a log line.
         message: String,
     },
     /// Malformed framing, unexpected EOF, oversize response, or an IO failure mid-stream.
@@ -144,6 +154,11 @@ pub enum RunnerError {
         message: String,
     },
     /// The caller's deadline expired before a complete response arrived.
+    ///
+    /// This is a **lower bound**: when the bridge reported a Windows PID on stderr, a
+    /// best-effort `taskkill.exe` escalation runs afterwards with its own
+    /// [`TASKKILL_BUDGET`] (5 s), so the call can take up to that much longer than
+    /// `deadline_ms`. The escalation is a backstop, not part of the promise.
     #[error("bridge exceeded deadline of {deadline_ms} ms")]
     Timeout {
         /// The deadline that expired, in milliseconds.
@@ -167,6 +182,79 @@ PATH (when running under sudo, secure_path can hide the Windows mount; use the a
         /// The Windows mount root it was searched under.
         win_mnt: PathBuf,
     },
+}
+
+/// How a bridge process terminated.
+///
+/// Distinguishes a normal exit code from death by an unmasked signal, so a transport
+/// failure names the actual cause instead of an ambiguous `None` status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitReason {
+    /// Exited normally with this code (`0..=255`).
+    Code(i32),
+    /// Killed by this signal number (e.g. `9` = `SIGKILL`).
+    Signal(i32),
+}
+
+impl ExitReason {
+    /// Classify an [`ExitStatus`].
+    pub fn from_status(status: &ExitStatus) -> ExitReason {
+        use std::os::unix::process::ExitStatusExt;
+        match status.code() {
+            Some(code) => ExitReason::Code(code),
+            // No exit code means the child was terminated by a signal.
+            None => ExitReason::Signal(status.signal().unwrap_or(0)),
+        }
+    }
+
+    /// The exit code, if this was a normal exit.
+    pub fn code(self) -> Option<i32> {
+        match self {
+            ExitReason::Code(code) => Some(code),
+            ExitReason::Signal(_) => None,
+        }
+    }
+
+    /// The terminating signal, if any.
+    pub fn signal(self) -> Option<i32> {
+        match self {
+            ExitReason::Code(_) => None,
+            ExitReason::Signal(sig) => Some(sig),
+        }
+    }
+}
+
+impl std::fmt::Display for ExitReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExitReason::Code(code) => write!(f, "exit code {code}"),
+            ExitReason::Signal(signal) => {
+                write!(f, "signal {signal} ({})", signal_name(*signal))
+            }
+        }
+    }
+}
+
+/// Name of a POSIX signal number, for diagnostics (falls back to the raw number).
+fn signal_name(signal: i32) -> String {
+    match signal {
+        libc::SIGHUP => "SIGHUP".to_string(),
+        libc::SIGINT => "SIGINT".to_string(),
+        libc::SIGQUIT => "SIGQUIT".to_string(),
+        libc::SIGILL => "SIGILL".to_string(),
+        libc::SIGTRAP => "SIGTRAP".to_string(),
+        libc::SIGABRT => "SIGABRT".to_string(),
+        libc::SIGBUS => "SIGBUS".to_string(),
+        libc::SIGFPE => "SIGFPE".to_string(),
+        libc::SIGKILL => "SIGKILL".to_string(),
+        libc::SIGUSR1 => "SIGUSR1".to_string(),
+        libc::SIGSEGV => "SIGSEGV".to_string(),
+        libc::SIGUSR2 => "SIGUSR2".to_string(),
+        libc::SIGPIPE => "SIGPIPE".to_string(),
+        libc::SIGALRM => "SIGALRM".to_string(),
+        libc::SIGTERM => "SIGTERM".to_string(),
+        other => format!("signal {other}"),
+    }
 }
 
 /// A decoded, protocol-valid response from the bridge.
@@ -516,7 +604,7 @@ impl Runner {
                 let status = guard.try_wait().ok().flatten();
                 guard.kill_and_reap();
                 return Err(match status {
-                    Some(status) if !status.success() => bridge_failed(status.code(), &[]),
+                    Some(status) if !status.success() => bridge_failed(&status, &[]),
                     _ => e,
                 });
             }
@@ -694,7 +782,7 @@ impl Runner {
     ) -> Result<RunnerExchange, RunnerError> {
         // Non-zero exit is a transport failure even if bytes happen to parse.
         if !status.success() {
-            return Err(bridge_failed(status.code(), err_buf));
+            return Err(bridge_failed(&status, err_buf));
         }
 
         let mut cursor = std::io::Cursor::new(out_buf);
@@ -788,7 +876,7 @@ impl Runner {
                 let _ = child.wait();
                 return;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 }
@@ -910,35 +998,42 @@ fn runner_response(response: Response) -> RunnerResponse {
 }
 
 /// Documented meaning of a bridge exit code (see the bridge process contract).
-fn bridge_exit_meaning(code: Option<i32>) -> &'static str {
-    match code {
-        Some(3) => {
+fn bridge_exit_meaning(reason: ExitReason) -> &'static str {
+    match reason {
+        ExitReason::Code(3) => {
             "malformed/oversized/truncated request frame or invalid request body \
              (bridge transport failure)"
         }
-        Some(4) => {
+        ExitReason::Code(4) => {
             "valid JSON object whose `op` is not probe/enroll/assert (bridge transport failure)"
         }
-        Some(5) => {
+        ExitReason::Code(5) => {
             "stdout write/flush failure while emitting the response (bridge transport failure)"
         }
-        Some(_) => "unrecognized bridge transport failure",
-        None => "bridge terminated by signal before writing a response",
+        ExitReason::Code(_) => "unrecognized bridge transport failure",
+        ExitReason::Signal(_) => "terminated by a signal before writing a response",
     }
 }
 
-/// Build a [`RunnerError::BridgeFailed`] carrying the exit-code meaning and stderr tail.
-fn bridge_failed(code: Option<i32>, err_buf: &[u8]) -> RunnerError {
-    let mut message = format!(
-        "bridge exited with status {code:?}: {}",
-        bridge_exit_meaning(code)
-    );
+/// Build a [`RunnerError::BridgeFailed`] carrying the exit reason and stderr tail.
+fn bridge_failed(status: &ExitStatus, err_buf: &[u8]) -> RunnerError {
+    let reason = ExitReason::from_status(status);
+    let label = match reason {
+        ExitReason::Code(code) => format!("bridge exited with status {code}"),
+        ExitReason::Signal(signal) => {
+            format!(
+                "bridge terminated by signal {signal} ({})",
+                signal_name(signal)
+            )
+        }
+    };
+    let mut message = format!("{label}: {}", bridge_exit_meaning(reason));
     if let Some(tail) = stderr_tail(err_buf, STDERR_DIAGNOSTIC_BYTES) {
         message.push_str(" (stderr: ");
         message.push_str(&tail);
         message.push(')');
     }
-    RunnerError::BridgeFailed { code, message }
+    RunnerError::BridgeFailed { reason, message }
 }
 
 /// Attach the bounded stderr tail to a transport error message.
@@ -1133,18 +1228,6 @@ fn drive_child(
 
     let mut out = DrainState::new(out_fd, out_cap);
     let mut err = DrainState::new(err_fd, err_cap);
-    let mut fds = [
-        libc::pollfd {
-            fd: out_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: err_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        },
-    ];
 
     loop {
         out.drain();
@@ -1177,6 +1260,9 @@ fn drive_child(
             return DriveOutcome::StdoutOverflow;
         }
 
+        // Check the deadline *before* sleeping, and never sleep past it: `remaining` (or
+        // `remaining - 1 ms` when non-zero) bounds every wait, so the loop returns at or
+        // just after the deadline rather than up to a full tick late.
         let elapsed = start.elapsed();
         if elapsed >= deadline {
             return DriveOutcome::TimedOut { stderr: err.buf };
@@ -1186,18 +1272,40 @@ fn drive_child(
         let out_active = out.pollin();
         let err_active = err.pollin();
         if !out_active && !err_active {
-            // Nothing more can be read (EOF/HUP, or an over-cap stderr fd). Polling would
-            // return immediately and spin; sleep out the remaining budget instead. The
-            // child is reaped above and killed by the guard if the deadline fires.
-            std::thread::sleep(POLL_GRANULARITY.min(remaining));
+            // Nothing more can be read (EOF/HUP, or an over-cap stderr fd), so waiting on
+            // the child is the only remaining work. On the EOF fast path (both pipes
+            // cleanly closed, not overflowed) a child is usually about to exit within
+            // microseconds; wake on a short spin for a bounded window so a completed
+            // response is not delayed by a whole 20 ms tick, then back off to the coarse
+            // tick to bound wakeups for a child that lingers after closing stdio.
+            let clean_eof = !out.overflow && !err.overflow;
+            let step = if clean_eof && elapsed < EOF_SPIN_WINDOW {
+                EOF_SPIN
+            } else {
+                POLL_GRANULARITY
+            };
+            std::thread::sleep(step.min(remaining));
             continue;
         }
 
-        fds[0].fd = if out_active { out_fd } else { -1 };
-        fds[1].fd = if err_active { err_fd } else { -1 };
-        fds[0].revents = 0;
-        fds[1].revents = 0;
-        let poll_ms = remaining.as_millis().min(POLL_GRANULARITY.as_millis()) as i32;
+        let mut fds = [
+            libc::pollfd {
+                fd: if out_active { out_fd } else { -1 },
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: if err_active { err_fd } else { -1 },
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // `poll` only wakes early; its timeout must not exceed `remaining`, or a spurious
+        // wakeup plus the timeout can drift past the deadline.
+        let poll_ms = remaining
+            .as_millis()
+            .min(POLL_GRANULARITY.as_millis())
+            .max(1) as i32;
         match proc::poll(&mut fds, poll_ms) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,

@@ -14,7 +14,7 @@ use tempfile::TempDir;
 
 use wsl_webauthn_protocol::{BridgeError, MAX_RESPONSE_BYTES};
 use wsl_webauthn_runner::{
-    AssertParams, EnrollParams, Runner, RunnerError, RunnerResponse, decode_probe,
+    AssertParams, EnrollParams, ExitReason, Runner, RunnerError, RunnerResponse, decode_probe,
 };
 
 const FAKE: &str = env!("CARGO_BIN_EXE_fake-bridge");
@@ -237,6 +237,43 @@ fn noisy_stderr_does_not_break_pid_parsing() {
     }
 }
 
+/// L10-3: on the EOF fast path (a child that writes a full response, closes its pipes,
+/// then lingers before exiting) the runner must not add a whole 20 ms poll tick after the
+/// response is already complete. The adaptive 1 ms spin reaps the child promptly.
+#[test]
+fn eof_fast_path_does_not_wait_a_full_tick() {
+    let dir = cwd_dir();
+    // The child answers immediately, closes stdout/stderr, then sleeps 15 ms and exits.
+    let r = build_runner(dir.path(), &["ok", "postclose_sleep=15"]);
+    let start = Instant::now();
+    let resp = r.probe(Duration::from_secs(5)).expect("probe succeeds");
+    let elapsed = start.elapsed();
+    assert!(matches!(resp, RunnerResponse::Probe { .. }));
+    // Spawn overhead dominates; assert we did not compound it with a full coarse tick.
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "EOF fast path should reap promptly, took {elapsed:?}"
+    );
+}
+
+/// L9-4: `reap_bounded` must not overshoot the deadline by a full poll tick. A child that
+/// ignores stdin and sleeps must be killed and its Timeout returned at ~deadline.
+#[test]
+fn timeout_does_not_overshoot_deadline_by_a_full_tick() {
+    let dir = cwd_dir();
+    let r = build_runner(dir.path(), &["ok", "sleep=5000"]);
+    let deadline = Duration::from_millis(150);
+    let start = Instant::now();
+    let err = r.probe(deadline).expect_err("must time out");
+    let elapsed = start.elapsed();
+    assert!(matches!(err, RunnerError::Timeout { .. }), "{err:?}");
+    // Allow for process spawn + scheduling, but well under deadline + several ticks.
+    assert!(
+        elapsed < deadline + Duration::from_millis(100),
+        "timeout overshot the deadline, took {elapsed:?} for {deadline:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Transport failures
 // ---------------------------------------------------------------------------
@@ -324,8 +361,8 @@ fn nonzero_exit_is_bridge_failed() {
     let dir = cwd_dir();
     let r = build_runner(dir.path(), &["exit=3"]);
     match r.probe(Duration::from_secs(5)).unwrap_err() {
-        RunnerError::BridgeFailed { code, message } => {
-            assert_eq!(code, Some(3));
+        RunnerError::BridgeFailed { reason, message } => {
+            assert_eq!(reason, ExitReason::Code(3));
             // L8-4: exit code 3 is documented as a bad-frame request failure.
             assert!(
                 message.contains("malformed") || message.contains("request frame"),
@@ -343,12 +380,45 @@ fn bridge_exit_codes_map_to_documented_meaning() {
         let dir = cwd_dir();
         let r = build_runner(dir.path(), &[&format!("exit={code}")]);
         match r.probe(Duration::from_secs(5)).unwrap_err() {
-            RunnerError::BridgeFailed { code: got, message } => {
-                assert_eq!(got, Some(code));
+            RunnerError::BridgeFailed { reason, message } => {
+                assert_eq!(reason, ExitReason::Code(code));
                 assert!(message.contains(needle), "exit {code}: {message}");
             }
             other => panic!("expected BridgeFailed for exit {code}, got {other:?}"),
         }
+    }
+}
+
+/// L8-11: a signal death is modeled distinctly (not an ambiguous `None` status) and the
+/// rendered message names the signal.
+#[test]
+fn signal_death_reports_signal_reason_and_name() {
+    let dir = cwd_dir();
+    // `abort=1` makes the fake bridge raise SIGABRT (signal 6) without writing a frame.
+    let r = build_runner(dir.path(), &["abort=1"]);
+    let err = r.probe(Duration::from_secs(5)).unwrap_err();
+    match &err {
+        RunnerError::BridgeFailed { reason, message } => {
+            assert_eq!(
+                *reason,
+                ExitReason::Signal(libc::SIGABRT),
+                "signal death must be modeled as ExitReason::Signal: {err:?}"
+            );
+            assert!(
+                message.contains("SIGABRT") && message.contains('6'),
+                "message must name the signal: {message}"
+            );
+            assert!(
+                !message.contains("status None"),
+                "signal death must not render an ambiguous None status: {message}"
+            );
+        }
+        other => panic!("expected BridgeFailed, got {other:?}"),
+    }
+    // `ExitReason` accessors agree with the variant.
+    if let RunnerError::BridgeFailed { reason, .. } = err {
+        assert_eq!(reason.code(), None);
+        assert_eq!(reason.signal(), Some(libc::SIGABRT));
     }
 }
 
