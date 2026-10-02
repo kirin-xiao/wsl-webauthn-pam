@@ -977,7 +977,8 @@ fn provision_bridge(
         rollback.push(action);
     }
 
-    let hash = fsutil::sha256_hex_file(&dest).unwrap_or_default();
+    let hash = fsutil::sha256_hex_file(&dest)
+        .with_context(|| format!("hashing the installed bridge at {}", dest.display()))?;
     println!(
         "  bridge:      {} (sha256 {})",
         dest.display(),
