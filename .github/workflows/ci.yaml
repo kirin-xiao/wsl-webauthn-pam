@@ -147,6 +147,16 @@ jobs:
       - name: Cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      # Same Ubuntu 24.04 (`ubuntu-latest`) AppArmor workaround as `pam-ffi`:
+      # `cargo test --workspace` also builds and runs the `c_host` provisioned
+      # tier, which needs `unshare -rm`. Without this the tier falls back to
+      # passwordless `sudo -n unshare -m`; with `WSL_WEBAUTHN_REQUIRE_LIBPAM=1`
+      # a host that blocks both would fail the job rather than skip. The
+      # sysctl is an optimisation (its failure is tolerated) so the gate keeps
+      # its "green means the FFI path ran" signal without becoming brittle.
+      - name: Allow unprivileged user namespaces (ubuntu-24.04 workaround)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
       # L14-6: this gate makes the libpam (`pam_start`) and ABI (`dlopen`) tiers
       # FAIL rather than silently skip when the built `.so` (or libpam itself) is
       # absent. Without it a locate-library regression would leave CI green while
