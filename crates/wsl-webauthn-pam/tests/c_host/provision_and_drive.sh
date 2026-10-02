@@ -103,6 +103,10 @@ fi
 export WSLWT_TEST_SIGNING_KEY="$SECRET_HEX"
 export WSLWT_TEST_CRED_ID="$CRED_ID_B64"
 export WSLWT_TEST_ECHO="$ECHO"
+# This script only ever drives the module in a test, so opt the module into its
+# in-process audit recorder: otherwise the C host's synthetic authentication events
+# would be written to the real journal under the production `pam_wsl_webauthn` tag.
+export WSL_WEBAUTHN_TEST_CAPTURE=1
 
 case "$MODE" in
     single)

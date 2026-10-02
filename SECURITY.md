@@ -104,6 +104,8 @@ The verifier is `#![forbid(unsafe_code)]` and non-panicking on every parse path.
 **Build requirement — unwinding panics.** The PAM module wraps every exported entry point in `catch_unwind`, returning `PAM_ABORT` instead of unwinding across the C ABI; the Windows bridge must fail in-band. Both crates require `panic = "unwind"` and carry a `#[cfg(not(panic = "unwind"))] compile_error!` guard, so a `panic = "abort"` profile fails the build.
 <!-- INVARIANT: PAM-BUILD-PANIC-UNWIND, MSRV-1.88 -->
 
+**No test seam in shipped artifacts.** `Deps::panic_probe` is a no-op trait default that no production implementation overrides, so no shipped module can panic through it. The audit sink is chosen at **runtime**: the `syslog` path is always compiled (present as an undefined `nm` symbol in both the release and `--all-targets` `.so`), so no build profile produces a module that silently loses its `authpriv` path. A process switches to an in-process recorder only if code calls `logger::enable_capture` (test harnesses) or sets the hidden `WSL_WEBAUTHN_TEST_CAPTURE` marker, and the marker is ignored under an `AT_SECURE` privilege transition; no production code path enables either.
+
 ---
 
 ## Enrollment security properties

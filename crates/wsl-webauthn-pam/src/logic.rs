@@ -92,8 +92,12 @@ pub trait Deps {
         params: AssertParams,
         deadline: Duration,
     ) -> Result<RunnerResponse, RunnerError>;
-    /// Test-only panic injection point (production is a no-op).
-    fn panic_probe(&self);
+    /// Test-only panic injection point.
+    ///
+    /// The default is a no-op and no production `Deps` implementation overrides it, so no
+    /// shipped artifact can panic here. The test double overrides it to drive the
+    /// `PAM_ABORT`-on-panic contract.
+    fn panic_probe(&self) {}
 }
 
 /// Build a [`Deps`] driven by the real store and runner.
@@ -152,7 +156,6 @@ impl Deps for SystemDeps {
         }
         Ok(exchange.response)
     }
-    fn panic_probe(&self) {}
 }
 
 /// Hash a file with SHA-256 from an `O_NOFOLLOW` descriptor, streaming so an
@@ -346,8 +349,8 @@ fn fail(code: i32, reason: impl Into<String>) -> AuthOutcome {
     AuthOutcome::Failure { code, reason }
 }
 
-/// Run the authentication state machine. May panic only through [`Deps::panic_probe`]
-/// (test injection); production never panics.
+/// Run the authentication state machine. May panic only through the test-only
+/// [`Deps::panic_probe`]; production never panics.
 pub fn authenticate<S: PamSeam, D: Deps>(
     seam: &mut S,
     deps: &D,
@@ -355,7 +358,8 @@ pub fn authenticate<S: PamSeam, D: Deps>(
     args: &ModuleArgs,
 ) -> AuthOutcome {
     let silent = (flags & PAM_SILENT) != 0;
-    // Test-only injection point just inside the guarded region.
+    // Test-only injection point just inside the guarded region; only the test double
+    // overrides `panic_probe`.
     deps.panic_probe();
 
     // --- 1. Username -----------------------------------------------------

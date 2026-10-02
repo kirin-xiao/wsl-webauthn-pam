@@ -600,6 +600,14 @@ pub fn enrolled_store(dir: &Path, record: &CredentialRecord, config: &Config) ->
 // Composed happy-path fixture
 // ---------------------------------------------------------------------------
 
+/// Opt this test process into the module's in-process audit recorder.
+///
+/// Integration tests link the module as a library, so they are not `cfg(test)` and would
+/// otherwise write synthetic events to the real auth journal. Idempotent and process-wide.
+pub fn install_capture() {
+    pam_wsl_webauthn::logger::enable_capture();
+}
+
 /// A ready-to-use happy-path fixture: a real ES256 key, the pinned challenge, the
 /// signed assertion, a tempdir workspace, and the fake-bridge path.
 pub struct Fixture {

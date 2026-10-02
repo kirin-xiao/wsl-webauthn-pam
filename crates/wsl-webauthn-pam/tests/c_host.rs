@@ -275,6 +275,8 @@ fn c_host_libpam_loads_module_and_fails_closed() {
         .args(["libpam"])
         .arg(confdir.path())
         .args(["wslwt-test", "alice", "failclosed", "0"])
+        // Keep the expected fail-closed audit line out of the real journal.
+        .env(pam_wsl_webauthn::logger::CAPTURE_ENV, "1")
         .output()
         .expect("spawn pam_host libpam");
     assert!(
@@ -547,6 +549,9 @@ fn run_provisioned(
     .into_iter()
     .collect();
 
+    // The C host `dlopen`s the module in a child process, so it cannot call
+    // `logger::enable_capture`; the env marker opts that process into the in-process
+    // recorder instead, keeping synthetic auth events out of the real journal.
     let mut cmd = if user_namespace_available() {
         // Unprivileged tier: map this uid to 0 and mount a private /etc.
         let mut c = Command::new("unshare");
@@ -565,6 +570,12 @@ fn run_provisioned(
         c
     };
     cmd.args(&script_args);
+    cmd.env(
+        pam_wsl_webauthn::logger::CAPTURE_ENV,
+        // `sudo` resets the environment, so forward the marker explicitly; the script
+        // exports it for the C host.
+        "1",
+    );
     let status = cmd.status().expect("spawn provision_and_drive.sh");
     assert!(
         status.success(),

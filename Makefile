@@ -73,6 +73,9 @@ bridge:
 		$(CARGO) build --release --locked -p wsl-webauthn-bridge --target $(GNU_TARGET); \
 	fi
 
+# Tests opt into the module's in-process audit recorder (a runtime switch, not a cargo
+# feature) so their synthetic auth lines never reach the real journal. Production never
+# calls the switch, so the shipped cdylib always compiles and uses the syslog path.
 test:
 	$(CARGO) test --workspace --locked
 

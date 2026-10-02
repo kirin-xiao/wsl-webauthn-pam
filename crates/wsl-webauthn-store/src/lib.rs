@@ -344,7 +344,8 @@ impl Store {
     }
 
     /// `<base>/credentials/<username>.json` (username must already be validated).
-    fn record_path(&self, username: &str) -> PathBuf {
+    #[must_use]
+    pub fn record_path(&self, username: &str) -> PathBuf {
         self.credentials_dir().join(format!("{username}.json"))
     }
 

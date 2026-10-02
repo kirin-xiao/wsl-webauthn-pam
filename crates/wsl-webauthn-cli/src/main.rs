@@ -813,12 +813,14 @@ fn resolve_target_user(explicit: Option<String>) -> anyhow::Result<UserInfo> {
         current_user()?
     };
 
-    wsl_webauthn_store::validate_username(&resolved.name).map_err(|_| {
-        anyhow!(
+    // Keep the typed `InvalidUsername` as the source so `error_code` emits
+    // `invalid-username` rather than the generic `error`.
+    wsl_webauthn_store::validate_username(&resolved.name).map_err(|error| {
+        anyhow::Error::new(error).context(format!(
             "username {:?} is not a valid Linux login name \
              (the store accepts ^[A-Za-z_][A-Za-z0-9._-]{{0,31}}$)",
             resolved.name
-        )
+        ))
     })?;
     Ok(resolved)
 }
@@ -846,21 +848,20 @@ fn lookup_name(uid: u32) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// A resolved bridge invocation configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct BridgeConfig {
     bridge: PathBuf,
     win_mnt: PathBuf,
-    /// A non-fatal error reading the on-disk config (e.g. a read-permission failure as
-    /// a non-root user despite `--bridge`/`--win-mnt` being supplied). Surfaced as a
-    /// warning by every subcommand that consults the config (see [`Self::warn_config_error`]);
-    /// `enroll` also folds it into its missing-bridge error.
-    config_error: Option<String>,
+    /// Rendered non-fatal config-read error (e.g. a permission failure as a non-root user
+    /// despite `--bridge`/`--win-mnt`). Warning-only; the missing-bridge path instead
+    /// returns the typed error directly from [`resolve_bridge_with_store`].
+    config_error_display: Option<String>,
 }
 
 impl BridgeConfig {
     /// The warning to print for a non-fatal config read error, if any.
     fn config_warning(&self) -> Option<String> {
-        self.config_error
+        self.config_error_display
             .as_ref()
             .map(|error| format!("warning: {error}"))
     }
@@ -897,30 +898,36 @@ fn resolve_bridge_with_store(
     // Only consult the config when a flag does not already supply the value; this keeps
     // `probe --bridge … --win-mnt …` usable as non-root (the config is root-readable).
     let mut config: Option<wsl_webauthn_store::Config> = None;
-    let mut config_error: Option<String> = None;
+    let mut config_error: Option<StoreError> = None;
     if bridge_flag.is_none() || win_mnt_flag.is_none() {
         match store.load_config() {
             Ok(config_value) => config = Some(config_value),
             Err(StoreError::ConfigMissing { .. }) => {}
-            Err(error) => {
-                config_error = Some(format!(
-                    "could not read {}: {error}",
-                    store.config_path().display()
-                ));
-            }
+            Err(error) => config_error = Some(error),
         }
     }
+    let config_error_display = config_error
+        .as_ref()
+        .map(|error| format!("could not read {}: {error}", store.config_path().display()));
 
     let bridge = match bridge_flag.or_else(|| config.as_ref().map(|c| c.bridge_path.clone())) {
         Some(bridge) => bridge,
         None => {
-            let detail = config_error.clone().unwrap_or_else(|| {
-                format!(
-                    "{} is missing (run `install` to create it)",
-                    store.config_path().display()
-                )
-            });
-            bail!("no bridge executable configured: {detail} — pass --bridge <PATH>");
+            // Preserve the typed config error (`config-invalid`) when the config exists but
+            // cannot be parsed, so `error_code` emits its token rather than `error`.
+            if let Some(error) = config_error {
+                let path = store.config_path();
+                return Err(anyhow::Error::new(error).context(format!(
+                    "no bridge executable configured: could not read {} \
+                         — pass --bridge <PATH>",
+                    path.display()
+                )));
+            }
+            bail!(
+                "no bridge executable configured: {} is missing (run `install` to create it) \
+                 — pass --bridge <PATH>",
+                store.config_path().display()
+            );
         }
     };
 
@@ -938,7 +945,7 @@ fn resolve_bridge_with_store(
     Ok(BridgeConfig {
         bridge,
         win_mnt,
-        config_error,
+        config_error_display,
     })
 }
 
@@ -972,9 +979,13 @@ fn cmd_enroll(
     }
 
     if !config.bridge.exists() {
-        bail!(
-            "bridge executable not found: {} (run as root, or pass --bridge)",
-            config.bridge.display()
+        // Typed `BridgeMissing` so `error_code` emits `bridge-missing` (as `probe` does)
+        // rather than the generic `error`.
+        return Err(
+            anyhow::Error::new(wsl_webauthn_runner::RunnerError::BridgeMissing {
+                path: config.bridge.clone(),
+            })
+            .context("bridge executable not found (run as root, or pass --bridge)"),
         );
     }
 
@@ -1040,13 +1051,17 @@ fn cmd_enroll(
 
     match store.save_atomic(&record, replace) {
         Ok(()) => {}
-        Err(StoreError::AlreadyExists { .. }) => {
-            bail!(
+        // The pre-ceremony check above should have caught this, but the atomic write is the
+        // second guard against a race. Keep the typed error so `error_code` still emits
+        // `already-exists`.
+        Err(error @ StoreError::AlreadyExists { .. }) => {
+            return Err(anyhow::Error::new(error).context(format!(
                 "a credential for \"{}\" already exists; pass --replace to overwrite it",
                 target.name
-            );
+            )));
         }
-        Err(error) => bail!("failed to save credential: {error}"),
+        // Preserve any other typed store error (I/O, insecure store, …) for the token.
+        Err(error) => return Err(anyhow::Error::new(error).context("failed to save credential")),
     }
 
     let short = short_credential_id(&outcome.credential_id);
@@ -1162,16 +1177,29 @@ fn enroll_checked(
 
     if !replace {
         match store.load(&target.name) {
-            Ok(_) => bail!(
-                "a credential for \"{}\" already exists; pass --replace to overwrite it",
-                target.name
-            ),
+            // Construct the typed `AlreadyExists` (the record was read successfully, so
+            // there is no `StoreError` in hand) to keep the `already-exists` token.
+            Ok(_) => {
+                return Err(anyhow::Error::new(StoreError::AlreadyExists {
+                    path: store.record_path(&target.name),
+                })
+                .context(format!(
+                    "a credential for \"{}\" already exists; pass --replace to overwrite it",
+                    target.name
+                )));
+            }
             Err(StoreError::NotFound { .. }) => {}
-            Err(error) => bail!(
-                "refusing to enroll \"{}\": the credential store is not readable ({error}); \
-                 fix or remove the existing record, or pass --replace",
-                target.name
-            ),
+            // Preserve the typed store error (corrupt record, bad ownership, symlink, …)
+            // so `error_code` can emit `record-corrupt`/`insecure-store`/…. `main` prints the
+            // full chain (`{error:#}`), so the operator still sees the record path.
+            Err(error) => {
+                let kind = error.kind_str();
+                return Err(anyhow::Error::new(error).context(format!(
+                    "refusing to enroll \"{}\": the credential store is not readable \
+                     ({kind}); fix or remove the existing record, or pass --replace",
+                    target.name
+                )));
+            }
         }
     }
     enroll_with_double_enroll(runner, target, policy, allow_unattested)
@@ -1532,10 +1560,14 @@ fn status_with_store(store: &Store, user: Option<String>) -> anyhow::Result<i32>
 
     let users = match store.list() {
         Ok(users) => users,
-        Err(error) => bail!(
-            "could not list credentials ({error}); re-run as root to read {}",
-            store.credentials_dir().display()
-        ),
+        // Keep the typed store error so the list path emits its exact token
+        // (e.g. `insecure-store`) rather than the generic `error`.
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context(format!(
+                "could not list credentials; re-run as root to read {}",
+                store.credentials_dir().display()
+            )));
+        }
     };
 
     if users.is_empty() {
@@ -1599,8 +1631,16 @@ fn cmd_status_one(store: &Store, name: &str) -> anyhow::Result<i32> {
             }
             Ok(EXIT_OK)
         }
-        Err(StoreError::NotFound { .. }) => bail!("no credential record for \"{name}\""),
-        Err(error) => bail!("could not read the record for \"{name}\": {error}"),
+        // Preserve the typed `NotFound` so `error_code` emits `not-found` rather than `error`.
+        Err(error @ StoreError::NotFound { .. }) => {
+            Err(anyhow::Error::new(error).context(format!("no credential record for \"{name}\"")))
+        }
+        // Preserve a corrupt/unreadable record's typed error so `status --user` emits
+        // `record-corrupt` (or the exact store kind), not the generic `error`.
+        Err(error) => {
+            Err(anyhow::Error::new(error)
+                .context(format!("could not read the record for \"{name}\"")))
+        }
     }
 }
 
@@ -2729,6 +2769,11 @@ mod tests {
                 "the refusal must point at --replace: {error}"
             );
             assert_eq!(
+                error_code(&error),
+                "already-exists",
+                "the typed error must survive for the stable token"
+            );
+            assert_eq!(
                 ceremony.calls.get(),
                 0,
                 "no Windows Hello ceremony when the record exists and --replace is absent"
@@ -2760,6 +2805,11 @@ mod tests {
         assert!(
             error.to_string().contains("not readable"),
             "the refusal must explain the store problem: {error}"
+        );
+        assert_eq!(
+            error_code(&error),
+            "record-corrupt",
+            "the typed corrupt-record error must survive for the stable token"
         );
         assert_eq!(
             ceremony.calls.get(),
@@ -3023,6 +3073,57 @@ mod tests {
         );
         // `--user` bails (exit 1 via `main`) for the same bad-record state.
         assert!(status_with_store(&store, Some("bob".into())).is_err());
+    }
+
+    /// `status --user` for an unknown account must emit `not-found`, not the generic `error`.
+    #[test]
+    fn status_unknown_user_emits_not_found() {
+        let (_dir, store) = tempdir_store();
+        let error = status_with_store(&store, Some("nobody".into())).unwrap_err();
+        assert!(
+            error.to_string().contains("no credential record"),
+            "the refusal must name the missing record: {error}"
+        );
+        assert_eq!(
+            error_code(&error),
+            "not-found",
+            "the typed error must survive for the stable token"
+        );
+    }
+
+    /// A config that exists but cannot be parsed must produce `config-invalid` when no
+    /// `--bridge` is supplied, not the generic `error`.
+    #[test]
+    fn invalid_config_without_bridge_emits_config_invalid() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_dir, store) = tempdir_store();
+        std::fs::write(store.config_path(), b"\x00 not = valid toml[").unwrap();
+        // Match the store's expected 0600 so the failure is a parse error, not a mode error.
+        std::fs::set_permissions(store.config_path(), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        let error = resolve_bridge_with_store(&store, None, Some(PathBuf::from("/mnt/c")))
+            .expect_err("a corrupt config with no --bridge must fail");
+        assert_eq!(error_code(&error), "config-invalid", "{error:#}");
+    }
+
+    /// `status --user` on a *corrupt* record must emit `record-corrupt`, not the generic
+    /// `error`.
+    #[test]
+    fn status_corrupt_user_emits_record_corrupt() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_dir, store) = tempdir_store();
+        store
+            .save_atomic(&sample_record("alice", 1000), false)
+            .unwrap();
+        let bad = store.credentials_dir().join("bob.json");
+        std::fs::write(&bad, b"not a credential record").unwrap();
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let error = status_with_store(&store, Some("bob".into())).unwrap_err();
+        assert_eq!(
+            error_code(&error),
+            "record-corrupt",
+            "the typed corrupt error must survive for the stable token: {error}"
+        );
     }
 
     /// Removing one user never touches another user's record.

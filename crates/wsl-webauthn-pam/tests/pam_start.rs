@@ -152,6 +152,16 @@ fn strerror(pamh: *mut pam_handle_t, rc: c_int) -> String {
 
 #[test]
 fn real_libpam_loads_module_and_fails_closed() {
+    // libpam `dlopen`s the module as a separate shared object with its own statics, so the
+    // test crate's link-time copy cannot switch its sink: only the process environment
+    // crosses that boundary. Opt this process into the in-process recorder so the expected
+    // fail-closed audit line does not pollute the real journal.
+    //
+    // SAFETY: set before any thread is spawned, so no concurrent reader of the environment
+    // exists yet.
+    unsafe {
+        std::env::set_var(pam_wsl_webauthn::logger::CAPTURE_ENV, "1");
+    }
     let Some(lib) = locate_library() else {
         // Dev boxes may not have built the cdylib; CI sets the gate and must fail.
         // The provisioned success/deny/conversation path through libpam is covered

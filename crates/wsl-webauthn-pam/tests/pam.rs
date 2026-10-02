@@ -21,8 +21,17 @@ use pam_wsl_webauthn::seam::SeamError;
 // ---------------------------------------------------------------------------
 
 fn run_basic(seam: &mut FakeSeam, deps: &TestDeps, flags: i32, args: &[&str]) -> i32 {
+    // An integration test links the library without `cfg(test)`, so the in-process
+    // recorder must be opted into explicitly.
+    install_capture();
     let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     run(seam, deps, flags, &owned)
+}
+
+/// [`authenticate`] with the in-process audit recorder enabled.
+fn authenticate_basic(seam: &mut FakeSeam, deps: &TestDeps) -> AuthOutcome {
+    install_capture();
+    authenticate(seam, deps, 0, &ModuleArgs::default())
 }
 
 /// A happy-path fixture with a random ES256 key, enrolled record and config.
@@ -60,6 +69,26 @@ fn success_es256_with_echo() {
 fn success_is_authenticated_under_pam_silent() {
     let (_f, mut seam, deps) = happy();
     assert_eq!(run_basic(&mut seam, &deps, PAM_SILENT, &[]), PAM_SUCCESS);
+}
+
+/// The module's audit lines go to the in-process recorder rather than `syslog(3)`, so this
+/// cannot write synthetic events into the real auth journal. The captured success line is
+/// the same text production logs.
+#[test]
+fn run_captures_audit_lines_without_touching_syslog() {
+    use pam_wsl_webauthn::logger::{begin_capture, captured};
+
+    let (_f, mut seam, deps) = happy();
+    install_capture();
+    begin_capture();
+    assert_eq!(run_basic(&mut seam, &deps, 0, &[]), PAM_SUCCESS);
+    let records = captured();
+    assert!(
+        records
+            .iter()
+            .any(|(_, msg)| msg.contains("authentication succeeded for user alice")),
+        "the success audit line must be captured in-process: {records:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -174,7 +203,7 @@ fn corrupt_store_reason_is_kind_only_and_has_no_username_or_path() {
     deps.record = RecordReply::Corrupt(std::path::PathBuf::from(
         "/etc/wsl_webauthn/credentials/alice.json",
     ));
-    let outcome = authenticate(&mut seam, &deps, 0, &ModuleArgs::default());
+    let outcome = authenticate_basic(&mut seam, &deps);
     match outcome {
         AuthOutcome::Failure { code, reason } => {
             assert_eq!(code, PAM_AUTHINFO_UNAVAIL);
@@ -534,7 +563,7 @@ fn injected_panic_returns_pam_abort() {
 fn entropy_failure_outcome_is_authinfo_unavail() {
     let (_f, mut seam, mut deps) = happy();
     deps.random_error = Some("getrandom: no entropy".to_string());
-    let outcome = authenticate(&mut seam, &deps, 0, &ModuleArgs::default());
+    let outcome = authenticate_basic(&mut seam, &deps);
     match outcome {
         AuthOutcome::Failure { code, reason } => {
             assert_eq!(code, PAM_AUTHINFO_UNAVAIL);
