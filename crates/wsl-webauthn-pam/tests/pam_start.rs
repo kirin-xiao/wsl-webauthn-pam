@@ -25,14 +25,15 @@
 
 #![cfg(target_os = "linux")]
 
+mod gate;
+mod support;
+
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use pam_wsl_webauthn::bindings::{
-    PAM_ABORT, PAM_AUTHINFO_UNAVAIL, PAM_SUCCESS, PAM_USER_UNKNOWN, pam_conv, pam_handle_t,
-    pam_message, pam_response,
-};
+use support::{PAM_ABORT, PAM_AUTHINFO_UNAVAIL, PAM_SUCCESS, PAM_USER_UNKNOWN};
+use support::{pam_conv, pam_handle_t, pam_message, pam_response};
 
 // ---------------------------------------------------------------------------
 // libpam application-side API (not needed by the module itself, so declared here)
@@ -152,9 +153,11 @@ fn strerror(pamh: *mut pam_handle_t, rc: c_int) -> String {
 #[test]
 fn real_libpam_loads_module_and_fails_closed() {
     let Some(lib) = locate_library() else {
-        eprintln!(
-            "skipping real-libpam test: libpam_wsl_webauthn.so not found; \
-             run `cargo build -p wsl-webauthn-pam` first"
+        // Dev boxes may not have built the cdylib; CI sets the gate and must fail.
+        // The provisioned success/deny/conversation path through libpam is covered
+        // by `tests/c_host.rs` (which needs a namespace and a scripted bridge).
+        gate::enforce(
+            "libpam_wsl_webauthn.so not found; run `cargo build -p wsl-webauthn-pam` first",
         );
         return;
     };

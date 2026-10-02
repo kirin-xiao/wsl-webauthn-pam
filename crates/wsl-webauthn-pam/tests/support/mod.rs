@@ -36,6 +36,73 @@ use wsl_webauthn_store::{
 use pam_wsl_webauthn::logic::Deps;
 use pam_wsl_webauthn::seam::{PamSeam, SeamError};
 
+// ---------------------------------------------------------------------------
+// Minimal PAM ABI surface for the integration tests
+// ---------------------------------------------------------------------------
+//
+// `pam_wsl_webauthn::bindings` is crate-private (L6-7), and these tests live in a
+// separate crate, so they declare the handful of `pam_*` constants and types they
+// need themselves — exactly as an out-of-tree consumer would. The values are
+// pinned by the module's own `bindings.rs` layout tests; keeping the test copies
+// here means the test does not depend on a widened production API.
+
+/// `PAM_SUCCESS`.
+pub const PAM_SUCCESS: std::ffi::c_int = 0;
+/// `PAM_AUTH_ERR`.
+pub const PAM_AUTH_ERR: std::ffi::c_int = 7;
+/// `PAM_AUTHINFO_UNAVAIL`.
+pub const PAM_AUTHINFO_UNAVAIL: std::ffi::c_int = 9;
+/// `PAM_USER_UNKNOWN`.
+pub const PAM_USER_UNKNOWN: std::ffi::c_int = 10;
+/// `PAM_IGNORE`.
+pub const PAM_IGNORE: std::ffi::c_int = 25;
+/// `PAM_ABORT`.
+pub const PAM_ABORT: std::ffi::c_int = 26;
+/// `PAM_SILENT`.
+pub const PAM_SILENT: std::ffi::c_int = 0x8000;
+/// `PAM_TEXT_INFO` message style.
+pub const PAM_TEXT_INFO: std::ffi::c_int = 4;
+
+/// Opaque PAM handle (only ever passed through).
+#[repr(C)]
+pub struct pam_handle_t {
+    _private: [u8; 0],
+}
+
+/// Message passed to the application conversation function.
+#[repr(C)]
+pub struct pam_message {
+    /// One of the `PAM_*_MSG` / prompt styles.
+    pub msg_style: std::ffi::c_int,
+    /// The message text (NUL-terminated).
+    pub msg: *const std::ffi::c_char,
+}
+
+/// The application's reply to a [`pam_message`].
+#[repr(C)]
+pub struct pam_response {
+    /// Reply text (NUL-terminated), or null when none is expected.
+    pub resp: *mut std::ffi::c_char,
+    /// Return code; unused (libpam convention).
+    pub resp_retcode: std::ffi::c_int,
+}
+
+/// The application conversation function and its opaque application data.
+#[repr(C)]
+pub struct pam_conv {
+    /// The callback libpam invokes to talk to the user.
+    pub conv: Option<
+        unsafe extern "C" fn(
+            num_msg: std::ffi::c_int,
+            msg: *mut *const pam_message,
+            resp: *mut *mut pam_response,
+            appdata_ptr: *mut std::ffi::c_void,
+        ) -> std::ffi::c_int,
+    >,
+    /// Opaque pointer passed back to [`pam_conv::conv`].
+    pub appdata_ptr: *mut std::ffi::c_void,
+}
+
 /// The `pam-test-fake-bridge` binary built alongside this test crate.
 pub const FAKE_BRIDGE: &str = env!("CARGO_BIN_EXE_pam-test-fake-bridge");
 
