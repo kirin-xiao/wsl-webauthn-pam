@@ -211,6 +211,11 @@ jobs:
             cp dist/linux-${arch}/wsl-webauthn-pam          "dist/out/${dir}/"
             cp dist/windows-${arch}/WSLWebAuthnBridge.exe   "dist/out/${dir}/"
             cp bootstrap.sh pam-config README.md            "dist/out/${dir}/"
+            # `actions/upload-artifact`/`download-artifact` do not preserve Unix
+            # permissions, so the CLI arrives mode 0644. `bootstrap.sh` executes
+            # the tarball's CLI directly (`"$DIR/wsl-webauthn-pam" install`), so
+            # restore the exec bit here; the post-release smoke asserts it.
+            chmod 0755 "dist/out/${dir}/wsl-webauthn-pam" "dist/out/${dir}/bootstrap.sh"
             tar -czf "dist/${dir}.tar.gz" -C dist/out "${dir}"
             # The tarball root must be exactly the one named directory, so
             # `tar xzf … && cd …` (README) works and the layout cannot silently
