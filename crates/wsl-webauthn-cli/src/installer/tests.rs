@@ -567,6 +567,38 @@ fn install_provisions_everything() {
     );
 }
 
+/// L7-4: the config bytes the installer writes must come from the store's serializer
+/// (`Config::to_toml`) and round-trip through the store's `deny_unknown_fields` parser.
+///
+/// `install_provisions_everything` already round-trips via `store.load_config()`; this
+/// pins the exact bytes to the store-owned serializer so the installer cannot quietly
+/// reintroduce a hand-rolled TOML shape.
+#[test]
+fn provision_config_writes_store_serialized_toml() {
+    let h = Harness::new();
+    // `provision_config` needs the config directory's parent to exist; the harness root does.
+    let mut rollback = Rollback::new();
+    provision_config(&h.paths, &h.win_mnt, &h.bridge_dest(), &mut rollback).unwrap();
+
+    let expected = wsl_webauthn_store::Config {
+        bridge_path: h.bridge_dest(),
+        win_mnt: h.win_mnt.clone(),
+        timeout_secs: None,
+    }
+    .to_toml();
+    assert_eq!(
+        std::fs::read_to_string(h.paths.config_path()).unwrap(),
+        expected,
+        "config bytes must be the store serializer output"
+    );
+    // And the store parses them back (the deny_unknown_fields contract).
+    let store = Store::with_owner(&h.paths.etc_wsl_webauthn, h.paths.owner_uid);
+    let parsed = store.load_config().unwrap();
+    assert_eq!(parsed.bridge_path, h.bridge_dest());
+    assert_eq!(parsed.win_mnt, h.win_mnt);
+    assert_eq!(parsed.timeout_secs, None);
+}
+
 #[test]
 fn install_offers_and_runs_enrollment_when_confirmed() {
     let h = Harness::new();

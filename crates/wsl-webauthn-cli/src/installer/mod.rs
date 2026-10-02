@@ -40,7 +40,6 @@
 //! committing before migration means a failure can never remove the module/profile or
 //! un-rewrite a `/etc/pam.d` file back into a stale `pam_wsl_hello` reference.
 
-use std::fmt::Write as _;
 use std::io::Write as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
@@ -48,10 +47,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, anyhow, bail};
 
-use wsl_webauthn_store::{CONFIG_MODE, Store};
+use wsl_webauthn_store::{CONFIG_MODE, Config, Store};
 
 use crate::confparse;
 use crate::fsutil;
+// Shared CLI constants (single definitions in the crate root, `main.rs`).
+use crate::{DEFAULT_WIN_MNT, EXIT_FAIL, EXIT_OK, WHOAMI_DEADLINE};
 
 /// The `pam-auth-update` profile text, embedded from the repository's single source of
 /// truth (`pam-config` at the workspace root). This path is relative to this file
@@ -85,13 +86,8 @@ pub(crate) const BRIDGE_MODE: u32 = 0o755;
 /// Directory mode for `credentials/`.
 pub(crate) const DIR_MODE: u32 = 0o700;
 
-/// Default Windows mount root (mirrors `wsl-webauthn-store`).
-pub(crate) const DEFAULT_WIN_MNT: &str = "/mnt/c";
-
 /// Deadline for the `cmd.exe` invocation that resolves `%LOCALAPPDATA%` (plan §10.3).
 const LOCALAPPDATA_DEADLINE: Duration = Duration::from_secs(5);
-/// Deadline for the install-time `whoami.exe` interop sanity check (plan §10.2).
-const WHOAMI_DEADLINE: Duration = Duration::from_secs(5);
 /// Hard cap on a Linux helper invocation (`pam-auth-update`). It is generous because an
 /// *interactive* debconf run still needs the operator, but it guarantees a helper can
 /// never block the installer forever (the `--non-interactive` hang this was added for).
@@ -99,8 +95,10 @@ const HELPER_TIMEOUT: Duration = Duration::from_secs(300);
 /// The environment variable that makes debconf clients (`pam-auth-update`) non-blocking.
 const DEBIAN_FRONTEND: &str = "DEBIAN_FRONTEND";
 
-const EXIT_OK: i32 = 0;
-const EXIT_FAIL: i32 = 1;
+// `DEFAULT_WIN_MNT`, `WHOAMI_DEADLINE`, `EXIT_OK`, and `EXIT_FAIL` are not declared here:
+// L7-5 = L16-9 requires the CLI to carry each of these exactly once. They are imported
+// from the crate root (`main.rs`), which in turn re-exports
+// `wsl_webauthn_store::Config::DEFAULT_WIN_MNT`.
 
 // ---------------------------------------------------------------------------
 // System paths
@@ -692,35 +690,19 @@ fn resolve_module_dir(paths: &InstallPaths, explicit: Option<&Path>) -> anyhow::
 // Small helpers
 // ---------------------------------------------------------------------------
 
-/// Quote a string as a TOML basic string.
-fn toml_basic_string(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for c in value.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04X}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-/// Serialize the `[base]/config` TOML (exactly the fields the store's `deny_unknown_fields`
-/// parser accepts: `bridge_path`, `win_mnt`, optional `timeout_secs`).
+/// The `[base]/config` contents for `bridge_path`/`win_mnt`, serialized by the store.
+///
+/// L7-4: the on-disk format is owned by [`wsl_webauthn_store::Config::to_toml`] (the writer
+/// counterpart to the store's `deny_unknown_fields` parser), so the installer no longer
+/// hand-rolls TOML. `timeout_secs` is `None` because the installer does not set an auth
+/// deadline override, matching the historical output.
 fn config_toml(bridge_path: &Path, win_mnt: &Path) -> String {
-    format!(
-        "bridge_path = {}\nwin_mnt = {}\n",
-        toml_basic_string(&bridge_path.to_string_lossy()),
-        toml_basic_string(&win_mnt.to_string_lossy()),
-    )
+    Config {
+        bridge_path: bridge_path.to_path_buf(),
+        win_mnt: win_mnt.to_path_buf(),
+        timeout_secs: None,
+    }
+    .to_toml()
 }
 
 /// A unique backup path for `path`. The marker is also skipped when scanning `/etc/pam.d`
@@ -995,11 +977,11 @@ fn provision_bridge(
         rollback.push(action);
     }
 
-    let hash = sha256_file(&dest).unwrap_or_default();
+    let hash = fsutil::sha256_hex_file(&dest).unwrap_or_default();
     println!(
         "  bridge:      {} (sha256 {})",
         dest.display(),
-        short_hash(&hash)
+        fsutil::short_hash(&hash)
     );
     Ok(dest)
 }
@@ -2066,32 +2048,6 @@ pub(crate) fn cmd_uninstall(
 // ---------------------------------------------------------------------------
 // helpers shared with tests
 // ---------------------------------------------------------------------------
-
-/// Lowercase hex SHA-256 of a file.
-fn sha256_file(path: &Path) -> anyhow::Result<String> {
-    use sha2::{Digest as _, Sha256};
-    let bytes = std::fs::read(path)?;
-    Ok(hex(&Sha256::digest(&bytes)))
-}
-
-/// Lowercase hex.
-fn hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
-
-/// A short preview of a hex digest.
-fn short_hash(hex: &str) -> String {
-    let preview: String = hex.chars().take(12).collect();
-    if hex.len() > 12 {
-        format!("{preview}…")
-    } else {
-        preview
-    }
-}
 
 #[cfg(test)]
 mod tests;
