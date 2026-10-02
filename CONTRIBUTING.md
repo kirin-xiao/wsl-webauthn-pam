@@ -44,10 +44,16 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-Or, where available, `make check` (adds `cargo-deny`). CI adds `cargo-deny
-check`, `actionlint`, the `pam-auth-update` profile-expansion guard, the Windows
-bridge build/tests, and a native aarch64 `cargo build --release` (which really
-links the PAM `cdylib`). See `.github/workflows/ci.yaml`.
+Or, where available, `make check` (adds `cargo-deny`, `shellcheck`, and the
+hermetic `bootstrap.sh` tests). CI adds `cargo-deny check`, `actionlint`, the
+`pam-auth-update` profile-expansion guard, the Windows bridge build/tests, and a
+native aarch64 `cargo build --release` (which really links the PAM `cdylib`). See
+`.github/workflows/ci.yaml`.
+
+`bootstrap.sh` is gated by `shellcheck` and by `scripts/test-bootstrap.sh` — a
+hermetic harness (no network, no privileges) that runs the script under a
+whole-`PATH` command shim against a synthetic release tree. Run it directly with
+`sh scripts/test-bootstrap.sh` or `make bootstrap`.
 
 Notes:
 

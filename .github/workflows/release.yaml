@@ -171,6 +171,17 @@ jobs:
       - name: test
         run: cargo test --workspace --locked
 
+      # bootstrap.sh ships in the release; shellcheck and the hermetic bootstrap
+      # tests gate the tagged commit.
+      - name: shellcheck
+        run: |
+          set -eu
+          shellcheck -s sh bootstrap.sh
+          shellcheck -s sh scripts/test-bootstrap.sh
+
+      - name: hermetic bootstrap tests
+        run: sh scripts/test-bootstrap.sh
+
   publish:
     name: publish release
     needs: [gate, build-linux, build-windows]
@@ -255,3 +266,55 @@ jobs:
           fail_on_unmatched_files: true
           # Tags carrying a pre-release suffix (vX.Y.Z-rc1) publish as pre-releases.
           prerelease: ${{ contains(github.ref_name, '-') }}
+
+  # Validate the *published* assets, not the local build tree: this is the only
+  # check that sees the real bytes. It stops at download → verify → extract →
+  # `--help`; the installer is not run, since that would execute a root install
+  # on the runner.
+  smoke:
+    name: post-release smoke (published assets)
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: download published bootstrap.sh + SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release download "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" \
+            -p bootstrap.sh -p SHA256SUMS -D dist
+
+      # The top-level bootstrap.sh must be the one in the tag, and must parse.
+      - name: bootstrap.sh matches the tag and parses
+        run: |
+          set -eu
+          cmp bootstrap.sh dist/bootstrap.sh
+          sh -n dist/bootstrap.sh
+          sh dist/bootstrap.sh --help | grep -q 'wsl-webauthn-pam bootstrap'
+
+      - name: download + checksum-verify the x86_64 tarball
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          arch=x86_64
+          ver="${GITHUB_REF_NAME#v}"
+          tarball="wsl-webauthn-pam-${ver}-${arch}.tar.gz"
+          gh release download "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" \
+            -p "$tarball" -D dist
+          # Same lookup+compare bootstrap.sh uses, so drift fails here.
+          expected="$(awk -v f="$tarball" '$2 == f { print $1 }' dist/SHA256SUMS)"
+          [ -n "$expected" ] || { echo "::error::$tarball not in SHA256SUMS"; exit 1; }
+          actual="$(sha256sum "dist/$tarball" | awk '{ print $1 }')"
+          [ "$expected" = "$actual" ] || { echo "::error::checksum mismatch"; exit 1; }
+          tar -xzf "dist/$tarball" -C dist
+          dir="dist/wsl-webauthn-pam-${ver}-${arch}"
+          test -x "$dir/wsl-webauthn-pam" || { echo "::error::CLI missing/not executable"; exit 1; }
+          test -f "$dir/pam_wsl_webauthn.so" || { echo "::error::module missing"; exit 1; }
+          test -f "$dir/WSLWebAuthnBridge.exe" || { echo "::error::bridge missing"; exit 1; }
+          "$dir/wsl-webauthn-pam" --help | grep -qi 'usage'
+          echo "published release layout verified"

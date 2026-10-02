@@ -162,6 +162,10 @@ set +e
 if [ "$(id -u)" = 0 ]; then
     "$DIR/wsl-webauthn-pam" install "$@" <"$TTY"
 else
+    # SC2024: the `<"$TTY"` redirect must apply to the `sudo` process so the
+    # child inherits the controlling terminal (a sudo-internal redirect would be
+    # wrong).
+    # shellcheck disable=SC2024
     sudo "$DIR/wsl-webauthn-pam" install "$@" <"$TTY"
 fi
 status=$?

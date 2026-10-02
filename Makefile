@@ -52,7 +52,7 @@ ACTIONLINT ?= $(HOME)/.local/bin/actionlint
 
 WORKFLOWS := .github/workflows/ci.yaml .github/workflows/release.yaml
 
-.PHONY: all bridge test check fmt clippy deny machete pam-profile crlf lint-actions release clean
+.PHONY: all bridge test check fmt clippy deny machete pam-profile crlf lint-actions bootstrap shellcheck release clean
 
 # Default: Linux module + CLI (linked against libpam0g-dev) and the Windows exe.
 all:
@@ -81,7 +81,7 @@ test:
 
 # Local pre-flight: fast local subset of the CI gate (see
 # .github/workflows/ci.yaml for the full set), best-effort for tools not installed.
-check: fmt clippy test crlf deny machete
+check: fmt clippy test crlf deny machete shellcheck bootstrap
 	@echo ">> check complete"
 
 fmt:
@@ -107,6 +107,20 @@ machete:
 pam-profile:
 	python3 .github/scripts/check-pam-profile.py --self-test
 	python3 .github/scripts/check-pam-profile.py --profile pam-config
+
+# Lint every shell script.
+shellcheck:
+	@if command -v shellcheck >/dev/null 2>&1; then \
+		shellcheck -s sh bootstrap.sh scripts/test-bootstrap.sh \
+			crates/wsl-webauthn-pam/tests/c_host/provision_and_drive.sh; \
+		shellcheck -s bash spike/build_testrp.sh; \
+	else \
+		echo ">> shellcheck not installed; skipping (apt-get install shellcheck)"; \
+	fi
+
+# Hermetic bootstrap.sh tests: no network, no privileges, whole-PATH shims.
+bootstrap:
+	sh scripts/test-bootstrap.sh
 
 # No tracked text file may contain CR: a CRLF committed into bootstrap.sh or
 # pam-config breaks them on Windows checkouts (autocrlf). `git grep -I` skips

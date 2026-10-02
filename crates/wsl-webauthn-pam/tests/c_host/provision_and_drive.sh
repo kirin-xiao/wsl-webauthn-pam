@@ -54,6 +54,7 @@ NTHREADS=${10:-8}
 SECRET_HEX=${11:-}
 CRED_ID_B64=${12:-}
 ECHO=${13:-1}
+: "$SO" # referenced by the caller's service files, not this script
 
 # Private /etc and a private binfmt directory (mount namespace only). The tmpfs
 # goes over /proc/sys/fs rather than `/proc/sys/fs/binfmt_misc` because the latter

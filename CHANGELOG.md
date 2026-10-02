@@ -30,7 +30,10 @@ Linux side.
   `webauthn.dll` FFI, carrying a `VERSIONINFO` resource (file metadata).
 - Packaging and CI: `pam-auth-update` profile (`Default: no`), a `bootstrap.sh`
   one-command installer, `Makefile`, and a release workflow producing
-  per-architecture tarballs plus `SHA256SUMS`.
+  per-architecture tarballs plus `SHA256SUMS`. `bootstrap.sh` is covered by
+  `shellcheck` and by `scripts/test-bootstrap.sh` (hermetic, whole-PATH shims,
+  no network), and the release workflow smoke-tests the published release
+  assets.
 - Docs: README, `SECURITY.md`, `SPIKE.md`, `CONTRIBUTING.md`.
 
 ### Changed

@@ -20,6 +20,7 @@ name: CI
 #   cargo-deny  supply-chain: advisories / bans / licenses / sources
 #   machete     lint for genuinely unused manifest dependencies
 #   actionlint  lint the workflow YAML itself
+#   bootstrap   shellcheck + hermetic bootstrap.sh tests
 #   pam-profile real pam-auth-update expansion guard
 #   doc-invariants  documented invariants map to tests
 #   fuzz-smoke  nightly cargo-fuzz smoke (pinned 0.13.2, locked, artifacts on failure)
@@ -173,6 +174,18 @@ jobs:
       # regression is caught in CI, not just by the in-test setrlimit.
       - name: test (runner, default nofile limit, locked)
         run: bash -c 'ulimit -n 1024; cargo test -p wsl-webauthn-runner --locked'
+
+      # Smoke the built CLI binary through its real argument dispatch,
+      # unprivileged and store-free: `verify` runs the production verifier
+      # against a synthetic ceremony and asserts two negative controls (a
+      # tampered signature and a disallowed AAGUID must both be rejected).
+      - name: CLI self-test (verify)
+        run: |
+          set -eu
+          cargo build -p wsl-webauthn-cli --locked
+          out="$(target/debug/wsl-webauthn-pam verify)"
+          echo "$out"
+          printf '%s\n' "$out" | grep -q '^verify: PASS$'
 
   # A *non-Rust* host for the module. It compiles
   # `crates/wsl-webauthn-pam/tests/c_host/pam_host.c`, dlopen(3)s the built cdylib
@@ -356,6 +369,31 @@ jobs:
           shellcheck: true
           pyflakes: false
           fail-on-error: true
+
+  # bootstrap.sh runs as root on end-user machines (`curl … | sudo bash`):
+  # shellcheck lints it, and the hermetic harness (`scripts/test-bootstrap.sh`)
+  # exercises it with a whole-PATH command shim against a synthetic release
+  # tree — no network, no privileges.
+  bootstrap:
+    name: shellcheck + bootstrap.sh (hermetic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # shellcheck is preinstalled on ubuntu-latest; print its version for the
+      # log, then lint the shell scripts.
+      - name: shellcheck
+        run: |
+          set -eu
+          shellcheck --version
+          # `-s sh` matches the shebang; bootstrap.sh is POSIX sh.
+          shellcheck -s sh bootstrap.sh
+          shellcheck -s sh scripts/test-bootstrap.sh
+          shellcheck -s sh crates/wsl-webauthn-pam/tests/c_host/provision_and_drive.sh
+          shellcheck -s bash spike/build_testrp.sh
+
+      - name: hermetic bootstrap tests
+        run: sh scripts/test-bootstrap.sh
 
   pam-profile:
     name: PAM profile expansion guard
