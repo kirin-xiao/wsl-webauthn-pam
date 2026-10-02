@@ -27,7 +27,7 @@ static PANIC_HOOK: OnceLock<()> = OnceLock::new();
 
 /// Configure whether [`debug`] emits messages for the lifetime of the process.
 ///
-/// Called once from [`crate::pam_args`] parsing in `pam_sm_authenticate`.
+/// Called once from [`crate::args::parse`] in `pam_sm_authenticate`.
 pub fn set_debug(enabled: bool) {
     DEBUG_ENABLED.store(enabled, Ordering::Relaxed);
 }
