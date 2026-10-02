@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] — Unreleased
+## 0.1.0 — Unreleased
 
 Initial release: a clean-room rewrite of WSL-Hello-sudo that authenticates
 `sudo`/`su` via the Windows Hello **WebAuthn platform authenticator**, with all
@@ -44,5 +44,3 @@ verification performed on the Linux side.
   and a release workflow producing per-architecture tarballs + `SHA256SUMS`.
 - **Docs** — this rewrite's README (security model and limits), `SECURITY.md`
   threat model, `SPIKE.md` empirical findings, `CONTRIBUTING.md`.
-
-[0.1.0]: https://github.com/kirin-xiao/wsl-webauthn-pam/releases/tag/v0.1.0
