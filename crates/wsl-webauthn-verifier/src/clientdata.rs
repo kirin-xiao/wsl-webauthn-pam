@@ -164,7 +164,7 @@ mod tests {
 
     #[test]
     fn rejects_non_base64url_challenge() {
-        let bytes = br#"{"type":"webauthn.get","challenge":"!!!","origin":"io.github.kirin-xiao.wsl-webauthn-pam"}"#;
+        let bytes = br#"{"type":"webauthn.get","challenge":"!!!","origin":"wsl-webauthn-pam"}"#;
         assert!(matches!(
             validate(bytes, ClientDataKind::Get, &[0u8; 32]),
             Err(VerifyError::MalformedClientData { .. })

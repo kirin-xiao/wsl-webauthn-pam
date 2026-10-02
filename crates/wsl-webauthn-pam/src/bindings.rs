@@ -54,6 +54,8 @@ pub const PAM_SILENT: c_int = 0x8000;
 pub const PAM_SERVICE: c_int = 1;
 /// `pam_get_item` item: the user name.
 pub const PAM_USER: c_int = 2;
+/// `pam_get_item` item: the terminal name (a C string such as `/dev/pts/0`), if any.
+pub const PAM_TTY: c_int = 3;
 /// `pam_get_item` item: the [`pam_conv`] structure.
 pub const PAM_CONV: c_int = 5;
 
@@ -213,6 +215,7 @@ mod tests {
         assert_eq!(PAM_SILENT, 0x8000);
         assert_eq!(PAM_SERVICE, 1);
         assert_eq!(PAM_USER, 2);
+        assert_eq!(PAM_TTY, 3);
         assert_eq!(PAM_CONV, 5);
         assert_eq!(PAM_TEXT_INFO, 4);
         assert_eq!(PAM_ERROR_MSG, 3);

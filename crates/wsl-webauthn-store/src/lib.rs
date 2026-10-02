@@ -53,8 +53,8 @@
 //! ```json
 //! {
 //!   "schema_version": 1,
-//!   "rp_id": "io.github.kirin-xiao.wsl-webauthn-pam",
-//!   "origin": "io.github.kirin-xiao.wsl-webauthn-pam",
+//!   "rp_id": "wsl-webauthn-pam",
+//!   "origin": "wsl-webauthn-pam",
 //!   "linux_user": "alice",
 //!   "linux_uid": 1000,
 //!   "credential_id": "<base64url>",

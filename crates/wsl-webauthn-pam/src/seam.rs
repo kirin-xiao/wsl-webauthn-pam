@@ -1,10 +1,11 @@
 //! The seam between the real PAM FFI and the authentication logic.
 //!
 //! [`PamSeam`] abstracts the handful of libpam calls the module makes (user name,
-//! service name, conversation, fail delay). Production uses [`RealPamSeam`], a thin
-//! wrapper over libpam. The unit tests implement the same trait with a fake, so the
-//! entire authentication state machine is exercised without a live PAM application
-//! and without the global system state the real store/runner would touch.
+//! service name, controlling terminal, conversation, fail delay). Production uses
+//! [`RealPamSeam`], a thin wrapper over libpam. The unit tests implement the same
+//! trait with a fake, so the entire authentication state machine is exercised without
+//! a live PAM application and without the global system state the real store/runner
+//! would touch.
 //!
 //! A `pam_start` harness would need a real PAM service, a real store under
 //! `/etc/wsl_webauthn`, and a real interop child — none of which belong in a
@@ -15,7 +16,7 @@
 use std::ffi::{CString, c_int, c_void};
 
 use crate::bindings::{
-    self, PAM_CONV, PAM_SERVICE, pam_conv, pam_handle_t, pam_message, pam_response,
+    self, PAM_CONV, PAM_SERVICE, PAM_TTY, pam_conv, pam_handle_t, pam_message, pam_response,
 };
 
 /// A failure from a seam operation.
@@ -45,6 +46,13 @@ pub trait PamSeam {
 
     /// Whether a usable conversation callback is installed.
     fn conv_available(&mut self) -> bool;
+
+    /// Whether the transaction has a controlling terminal (`PAM_TTY`).
+    ///
+    /// Under `PAM_SILENT` (as `sudo` sets) the action-cue notice is emitted only when
+    /// this is true: an interactive session benefits from the cue, while a scripted or
+    /// cron caller without a terminal does not need it.
+    fn has_tty(&mut self) -> bool;
 
     /// Send an info/error message to the application, if a conversation exists.
     ///
@@ -113,6 +121,18 @@ impl PamSeam for RealPamSeam {
         // SAFETY: PAM_CONV points at a `struct pam_conv` owned by libpam.
         let conv = unsafe { &*(item as *const pam_conv) };
         conv.conv.is_some()
+    }
+
+    fn has_tty(&mut self) -> bool {
+        // A transaction with a terminal carries a non-empty `PAM_TTY`; a caller with no
+        // tty (cron, a systemd unit, a piped script) leaves it null/empty. Only the
+        // presence is needed, so the tty name itself is never read or logged.
+        let Some(item) = self.get_item_ptr(PAM_TTY) else {
+            return false;
+        };
+        // SAFETY: PAM_TTY is a C string owned by libpam for the handle's lifetime.
+        unsafe { bindings::cstr_to_str(item as *const std::ffi::c_char) }
+            .is_some_and(|s| !s.is_empty())
     }
 
     fn conv_text(&mut self, style: c_int, text: &str) -> Result<(), SeamError> {

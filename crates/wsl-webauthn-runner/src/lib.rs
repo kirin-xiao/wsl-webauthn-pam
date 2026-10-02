@@ -49,8 +49,8 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use wsl_webauthn_protocol::{
-    BridgeError, FrameError, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, Request, Response, b64u_decode,
-    read_frame,
+    BridgeError, FrameError, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, PROGRESS_LINE_PREFIX, Request,
+    Response, b64u_decode, read_frame,
 };
 
 /// Path of the WSL interop binfmt_misc registration.
@@ -78,6 +78,80 @@ pub const STDERR_DIAGNOSTIC_BYTES: usize = 512;
 
 /// `taskkill.exe` escalation budget after a Linux-side timeout.
 pub const TASKKILL_BUDGET: Duration = Duration::from_secs(5);
+
+/// A coarse ceremony-phase notification from the bridge.
+///
+/// The Windows bridge may write out-of-band `PROGRESS <phase>` lines to its stderr (see
+/// [`wsl_webauthn_protocol::PROGRESS_LINE_PREFIX`]) while a blocking WebAuthn call is in
+/// flight. This turns those lines into an optional callback so the CLI and the PAM module
+/// can report that a prompt is open.
+///
+/// Progress is **advisory**: the ceremony result is decided solely by the framed stdout
+/// response, and a bridge that emits no progress lines simply produces no callbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CeremonyProgress {
+    /// A ceremony exchange is starting (emitted by the runner itself, not the bridge).
+    Starting,
+    /// The bridge has observed the Windows Hello dialog appear.
+    PromptOpen,
+    /// The bridge has observed the Windows Hello dialog disappear.
+    PromptClosed,
+    /// The ceremony exchange has finished (emitted by the runner itself, regardless
+    /// of success/failure). Lets a caller close out any open prompt state without
+    /// depending on the bridge's best-effort trailing `prompt_closed` line.
+    Finishing,
+}
+
+impl CeremonyProgress {
+    /// Parse the phase name following [`PROGRESS_LINE_PREFIX`].
+    ///
+    /// Returns `None` for any unrecognized phase, so an older/newer bridge cannot make
+    /// the runner emit an unexpected callback. `starting`/`finishing` are runner-emitted
+    /// boundaries and are intentionally not bridge-parseable.
+    fn from_phase(phase: &str) -> Option<CeremonyProgress> {
+        match phase {
+            "prompt_open" => Some(CeremonyProgress::PromptOpen),
+            "prompt_closed" => Some(CeremonyProgress::PromptClosed),
+            _ => None,
+        }
+    }
+}
+
+/// A callback invoked once per [`CeremonyProgress`] line observed on the bridge's stderr.
+///
+/// The runner borrows it as `&ProgressSink<'_>` for the duration of one exchange. It is
+/// invoked synchronously on the draining (calling) thread, so it is deliberately **not**
+/// required to be `Send`/`Sync`: the PAM module passes a closure that borrows its
+/// conversation seam, which must never leave the thread handling `pam_sm_authenticate`.
+pub type ProgressSink<'a> = dyn Fn(CeremonyProgress) + 'a;
+
+/// Parse a single trimmed stderr line into a progress event, if it is one.
+///
+/// Only a line beginning with exactly [`PROGRESS_LINE_PREFIX`] whose remainder names a
+/// known phase produces an event; everything else (`PID <n>`, HRESULT diagnostics,
+/// arbitrary chatter) is ignored.
+pub fn progress_event(line: &str) -> Option<CeremonyProgress> {
+    let line = line.trim();
+    let phase = line.strip_prefix(PROGRESS_LINE_PREFIX)?;
+    CeremonyProgress::from_phase(phase.trim())
+}
+
+/// Parse one bounded stderr buffer into ceremony-progress events, in order.
+///
+/// A line is a progress event only when it starts with exactly [`PROGRESS_LINE_PREFIX`];
+/// the remainder is trimmed and matched against the known phases. Anything else (the
+/// leading `PID <n>` line, HRESULT diagnostics, chatter) is ignored, so this is safe to
+/// run over the whole diagnostic tail.
+///
+/// This is the **batch** form used by tests; the live path uses [`ProgressScanner`].
+/// It only reports bridge-emitted phases (`prompt_open`/`prompt_closed`), not the
+/// runner's own `Starting`/`Finishing` boundaries.
+pub fn parse_progress(stderr: &[u8]) -> Vec<CeremonyProgress> {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .filter_map(progress_event)
+        .collect()
+}
 
 /// Poll granularity used while waiting for the child (keeps deadline checks responsive).
 const POLL_GRANULARITY: Duration = Duration::from_millis(20);
@@ -521,7 +595,20 @@ impl Runner {
         params: EnrollParams,
         deadline: Duration,
     ) -> Result<RunnerResponse, RunnerError> {
-        self.run(
+        self.enroll_with_progress(params, deadline, None)
+    }
+
+    /// Enroll a credential, emitting [`CeremonyProgress`] events as the bridge reports
+    /// them (see [`ProgressSink`]).
+    ///
+    /// `progress` is advisory only; the returned result is decided by the framed response.
+    pub fn enroll_with_progress(
+        &self,
+        params: EnrollParams,
+        deadline: Duration,
+        progress: Option<&ProgressSink<'_>>,
+    ) -> Result<RunnerResponse, RunnerError> {
+        self.run_with_progress(
             Request::Enroll {
                 client_data_json: params.client_data_json,
                 user_id: params.user_id,
@@ -531,6 +618,7 @@ impl Runner {
                 timeout_ms: params.timeout_ms,
             },
             deadline,
+            progress,
         )
         .map(|exchange| exchange.response)
     }
@@ -541,13 +629,25 @@ impl Runner {
         params: AssertParams,
         deadline: Duration,
     ) -> Result<RunnerResponse, RunnerError> {
-        self.run(
+        self.authenticate_with_progress(params, deadline, None)
+    }
+
+    /// Produce an assertion, emitting [`CeremonyProgress`] events as the bridge reports
+    /// them (see [`ProgressSink`]).
+    pub fn authenticate_with_progress(
+        &self,
+        params: AssertParams,
+        deadline: Duration,
+        progress: Option<&ProgressSink<'_>>,
+    ) -> Result<RunnerResponse, RunnerError> {
+        self.run_with_progress(
             Request::Assert {
                 client_data_json: params.client_data_json,
                 allow_credentials: params.allow_credentials,
                 timeout_ms: params.timeout_ms,
             },
             deadline,
+            progress,
         )
         .map(|exchange| exchange.response)
     }
@@ -564,18 +664,64 @@ impl Runner {
         params: AssertParams,
         deadline: Duration,
     ) -> Result<RunnerExchange, RunnerError> {
-        self.run(
+        self.authenticate_with_diagnostics_and_progress(params, deadline, None)
+    }
+
+    /// Like [`Runner::authenticate_with_diagnostics`], emitting [`CeremonyProgress`]
+    /// events while the ceremony is in flight.
+    pub fn authenticate_with_diagnostics_and_progress(
+        &self,
+        params: AssertParams,
+        deadline: Duration,
+        progress: Option<&ProgressSink<'_>>,
+    ) -> Result<RunnerExchange, RunnerError> {
+        self.run_with_progress(
             Request::Assert {
                 client_data_json: params.client_data_json,
                 allow_credentials: params.allow_credentials,
                 timeout_ms: params.timeout_ms,
             },
             deadline,
+            progress,
         )
     }
 
     /// Run one request/response exchange against the bridge.
     fn run(&self, request: Request, deadline: Duration) -> Result<RunnerExchange, RunnerError> {
+        self.run_with_progress(request, deadline, None)
+    }
+
+    /// Run one exchange, emitting [`CeremonyProgress`] events while the child is drained.
+    ///
+    /// Unlike the other seams this one is called on the hot path of a blocking ceremony,
+    /// so the sink is `&dyn` and never owned; all callers above pass `None`.
+    fn run_with_progress(
+        &self,
+        request: Request,
+        deadline: Duration,
+        progress: Option<&ProgressSink<'_>>,
+    ) -> Result<RunnerExchange, RunnerError> {
+        // Runner-emitted ceremony boundary, so a caller can reset per-ceremony state
+        // (e.g. the CLI's step counter) without relying on the bridge's first line.
+        // Emitted before pre-flight so it always brackets `Finishing`.
+        if let Some(sink) = progress {
+            sink(CeremonyProgress::Starting);
+        }
+        let result = self.run_exchange(request, deadline, progress);
+        if let Some(sink) = progress {
+            sink(CeremonyProgress::Finishing);
+        }
+        result
+    }
+
+    /// The exchange proper. `run_with_progress` brackets this with
+    /// [`CeremonyProgress::Starting`]/[`CeremonyProgress::Finishing`].
+    fn run_exchange(
+        &self,
+        request: Request,
+        deadline: Duration,
+        progress: Option<&ProgressSink<'_>>,
+    ) -> Result<RunnerExchange, RunnerError> {
         let bridge = self.preflight()?;
 
         let payload = serde_json::to_vec(&request).map_err(|e| RunnerError::Transport {
@@ -643,7 +789,7 @@ impl Runner {
             .stderr
             .take()
             .expect("stderr was piped above");
-        self.pump(guard, stdout, stderr, deadline)
+        self.pump(guard, stdout, stderr, deadline, progress)
     }
 
     /// Fast-fail pre-flight checks, then hold the bridge descriptor for the spawn.
@@ -770,12 +916,17 @@ impl Runner {
     ///
     /// Delegates the deadline/poll/drain mechanics to the shared [`drive_child`] engine
     /// and maps its outcome onto the runner's transport contract.
+    ///
+    /// `progress` is invoked once per complete `PROGRESS` line *as it arrives*, so the
+    /// caller can report `prompt_open` while the child is still blocked inside the
+    /// WebAuthn call. It is advisory and never changes the result.
     fn pump(
         &self,
         guard: ChildGuard,
         stdout: std::process::ChildStdout,
         stderr: std::process::ChildStderr,
         deadline: Duration,
+        progress: Option<&ProgressSink<'_>>,
     ) -> Result<RunnerExchange, RunnerError> {
         match drive_child(
             guard,
@@ -784,6 +935,7 @@ impl Runner {
             deadline,
             MAX_RESPONSE_BYTES + 4, // frame prefix + payload
             MAX_STDERR_BYTES,
+            progress,
         ) {
             DriveOutcome::Exited {
                 status,
@@ -1104,6 +1256,59 @@ fn stderr_tail(bytes: &[u8], cap: usize) -> Option<String> {
     }
 }
 
+/// Incremental `PROGRESS`-line scanner over a child's stderr as it is drained.
+///
+/// Feeds new bytes as they arrive and invokes the sink once per complete line, so the
+/// Linux side can report `prompt_open` *while* the child is still blocked inside the
+/// WebAuthn call. Partial/oversized/non-matching lines are dropped.
+struct ProgressScanner<'a> {
+    sink: Option<&'a ProgressSink<'a>>,
+    /// Bytes of the current, not-yet-terminated line.
+    line: Vec<u8>,
+    /// Set after a line exceeds [`MAX_PROGRESS_LINE_BYTES`]; the rest is discarded until
+    /// the next newline so a flooding child cannot grow `line` without bound.
+    overflow: bool,
+}
+
+/// Upper bound on a single scanned stderr line. A real `PROGRESS prompt_open` line is a
+/// few bytes; this only bounds a hostile/flooding bridge.
+const MAX_PROGRESS_LINE_BYTES: usize = 256;
+
+impl<'a> ProgressScanner<'a> {
+    fn new(sink: Option<&'a ProgressSink<'a>>) -> ProgressScanner<'a> {
+        ProgressScanner {
+            sink,
+            line: Vec::new(),
+            overflow: false,
+        }
+    }
+
+    /// Consume newly drained stderr bytes, emitting one event per matching line.
+    fn feed(&mut self, bytes: &[u8]) {
+        if self.sink.is_none() {
+            return;
+        }
+        for &b in bytes {
+            if b == b'\n' {
+                if !self.overflow
+                    && let Some(event) = progress_event(&String::from_utf8_lossy(&self.line))
+                    && let Some(sink) = self.sink
+                {
+                    sink(event);
+                }
+                self.line.clear();
+                self.overflow = false;
+            } else if !self.overflow {
+                if self.line.len() < MAX_PROGRESS_LINE_BYTES {
+                    self.line.push(b);
+                } else {
+                    self.overflow = true;
+                }
+            }
+        }
+    }
+}
+
 /// Owns a spawned child and guarantees it is killed and reaped on drop.
 ///
 /// `std::process::Child` does *not* reap on drop, so wrapping it makes every early return
@@ -1239,6 +1444,7 @@ fn drive_child(
     deadline: Duration,
     out_cap: usize,
     err_cap: usize,
+    progress_sink: Option<&ProgressSink<'_>>,
 ) -> DriveOutcome {
     let start = Instant::now();
     let out_fd = stdout.as_raw_fd();
@@ -1256,17 +1462,22 @@ fn drive_child(
 
     let mut out = DrainState::new(out_fd, out_cap);
     let mut err = DrainState::new(err_fd, err_cap);
+    let mut progress = ProgressScanner::new(progress_sink);
 
     loop {
         out.drain();
+        let err_before = err.buf.len();
         err.drain();
+        progress.feed(&err.buf[err_before..]);
 
         match guard.try_wait() {
             Ok(Some(status)) => {
                 // Final drain: the child has closed its write ends, so a complete frame
                 // (and any trailing stderr) is visible.
                 out.drain();
+                let err_before = err.buf.len();
                 err.drain();
+                progress.feed(&err.buf[err_before..]);
                 if out.overflow {
                     return DriveOutcome::StdoutOverflow;
                 }
@@ -1479,6 +1690,7 @@ impl InteropCommand {
             deadline,
             MAX_RESPONSE_BYTES,
             MAX_STDERR_BYTES,
+            None,
         ) {
             DriveOutcome::Exited {
                 status,

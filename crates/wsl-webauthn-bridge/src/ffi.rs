@@ -20,9 +20,10 @@
 //! * **Hidden window.** A dedicated thread registers a class and creates a
 //!   hidden top-level window, then runs a `GetMessageW` pump for the bridge's
 //!   whole lifetime. The blocking ceremony executes on the *calling* thread
-//!   using that HWND. This is deliberate: if the pump and the blocking
-//!   ceremony shared a thread, no messages would be dispatched during the
-//!   ceremony, defeating the purpose. The pump is stopped with a `WM_CLOSE`
+//!   using the handle chosen by [`Win32Api::hwnd`] (the foreground window is
+//!   preferred; see the next bullet). This is deliberate: if the pump and the
+//!   blocking ceremony shared a thread, no messages would be dispatched during
+//!   the ceremony, defeating the purpose. The pump is stopped with a `WM_CLOSE`
 //!   window message — the window proc answers by draining the thread queue
 //!   (`PostQuitMessage(0)`) — and with a `WM_QUIT` posted to
 //!   the pump *thread*'s queue. It is **not** stopped by posting `WM_QUIT` to
@@ -30,6 +31,20 @@
 //!   does not observe it. If window creation fails, the bridge falls
 //!   back to `GetForegroundWindow()` (then `GetTopWindow(NULL)`, then
 //!   `GetDesktopWindow()`), so the API never receives a NULL window.
+//! * **Foreground owner.** The WebAuthn `hWnd` is the *owner* of the Hello
+//!   dialog. A dialog owned by the window the user is looking at is created in
+//!   front of it; one owned by our hidden `WS_POPUP` window is created behind.
+//!   `Win32Api::hwnd()` therefore prefers `GetForegroundWindow()` and only
+//!   falls back to the hidden window — matching libfido2's `winhello.c`, which
+//!   passes `GetForegroundWindow()`.
+//! * **Focus watcher.** While a blocking `make_credential`/`get_assertion` call
+//!   runs, a separate best-effort thread polls for the
+//!   `Credential Dialog Xaml Host` window by class (never by its localized
+//!   title) and escalates `SetForegroundWindow` → input-queue attach → taskbar
+//!   `FlashWindowEx`, emitting `PROGRESS prompt_open`/`PROGRESS prompt_closed`
+//!   on stderr. It is advisory only: every failure is ignored, it never runs on
+//!   the blocked ceremony thread, and its guard stops it without joining (the
+//!   process is short-lived, so a leaked watcher is harmless).
 //! * **Hardened load.** `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)`
 //!   is applied process-wide before the first load, and `webauthn.dll`
 //!   is then loaded with `LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32)`,
@@ -43,12 +58,13 @@
 use std::ffi::c_void;
 use std::mem;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use wsl_webauthn_protocol::BridgeError;
+use wsl_webauthn_protocol::{BridgeError, PROGRESS_LINE_PREFIX};
 
 use crate::api::{
     AssertionOptions, AssertionResult, CancellationId, CredentialAttestation, Hresult,
@@ -63,6 +79,23 @@ type Hwnd = *mut c_void;
 const WS_POPUP: u32 = 0x8000_0000;
 const WM_CLOSE: u32 = 0x0010;
 const WM_QUIT: u32 = 0x0012;
+
+/// `WM_USER` — start of the application-private message range. Used to prime
+/// the focus watcher thread's message queue (see [`FocusWatcher::arm`]).
+const WM_USER: u32 = 0x0400;
+/// `PM_NOREMOVE` — `PeekMessageW` leaves the message in the queue.
+const PM_NOREMOVE: u32 = 0x0000;
+/// `SW_RESTORE` — un-minimize a window before foregrounding it.
+const SW_RESTORE: i32 = 9;
+/// `FLASHW_ALL` — flash both the caption and the taskbar button.
+const FLASHW_ALL: u32 = 0x0000_0003;
+/// `FLASHW_TIMERNOFG` — keep flashing until the window comes to the foreground.
+const FLASHW_TIMERNOFG: u32 = 0x0000_000C;
+/// `GW_OWNER` — `GetWindow` flag returning a window's owner.
+const GW_OWNER: u32 = 0x0004;
+/// `TRUE`/`FALSE` for the `AttachThreadInput` `fAttach` parameter.
+const ATTACH_TRUE: i32 = 1;
+const ATTACH_FALSE: i32 = 0;
 
 /// `LOAD_LIBRARY_SEARCH_SYSTEM32` — pin module resolution to
 /// `%SystemRoot%\System32`. Applied both process-wide (so a dependency of
@@ -116,6 +149,25 @@ unsafe extern "system" {
     fn GetForegroundWindow() -> Hwnd;
     fn GetTopWindow(hWnd: Hwnd) -> Hwnd;
     fn GetDesktopWindow() -> Hwnd;
+    fn GetWindow(hWnd: Hwnd, uCmd: u32) -> Hwnd;
+    fn GetCurrentThreadId() -> u32;
+    fn GetClassNameW(hWnd: Hwnd, lpClassName: *mut u16, nMaxCount: i32) -> i32;
+    fn IsWindowVisible(hWnd: Hwnd) -> i32;
+    fn EnumWindows(lpEnumFunc: Option<EnumWindowsProc>, lParam: isize) -> i32;
+    fn SetForegroundWindow(hWnd: Hwnd) -> i32;
+    fn AttachThreadInput(idAttach: u32, idAttachTo: u32, fAttach: i32) -> i32;
+    fn SetFocus(hWnd: Hwnd) -> Hwnd;
+    fn BringWindowToTop(hWnd: Hwnd) -> i32;
+    fn ShowWindow(hWnd: Hwnd, nCmdShow: i32) -> i32;
+    fn IsIconic(hWnd: Hwnd) -> i32;
+    fn PeekMessageW(
+        lpMsg: *mut Msg,
+        hWnd: Hwnd,
+        wMsgFilterMin: u32,
+        wMsgFilterMax: u32,
+        wRemoveMsg: u32,
+    ) -> i32;
+    fn FlashWindowEx(pfwi: *mut FlashWInfo) -> i32;
 }
 
 // ---------------------------------------------------------------------------
@@ -390,6 +442,7 @@ struct AssertionRaw {
 // ---------------------------------------------------------------------------
 
 type WndProc = unsafe extern "system" fn(Hwnd, u32, usize, isize) -> isize;
+type EnumWindowsProc = unsafe extern "system" fn(Hwnd, isize) -> i32;
 
 #[repr(C)]
 struct WndClassW {
@@ -419,6 +472,19 @@ struct Msg {
     l_private: u32,
 }
 
+/// `FLASHWINFO`. `#[repr(C)]` with a 64-bit pointer, so the layout is:
+/// `cbSize` (4) + 4 bytes padding + `hwnd` (8) + `dwFlags` (4) + `uCount` (4) +
+/// `dwTimeout` (4) + 4 bytes tail padding = 32 bytes. The padding is asserted
+/// by `flashwinfo_layout_matches_public_header`.
+#[repr(C)]
+struct FlashWInfo {
+    cb_size: u32,
+    hwnd: Hwnd,
+    dw_flags: u32,
+    u_count: u32,
+    dw_timeout: u32,
+}
+
 // ---------------------------------------------------------------------------
 // String helpers (leaked for the process lifetime so raw pointers stay valid)
 // ---------------------------------------------------------------------------
@@ -436,6 +502,13 @@ fn module_name() -> *const u16 {
 /// test-only failure seam can hand `create_inner` a class that was never
 /// registered.
 const HIDDEN_CLASS_NAME: &str = "WSLWebAuthnBridgeHidden";
+
+/// Class name of the Windows Hello / Windows Security credential dialog.
+///
+/// Matched **class-only**: the window title ("Windows Security" and friends) is
+/// localized, so matching it would silently stop working on non-English
+/// installs. Chromium made the same switch in M142.
+const CREDENTIAL_DIALOG_CLASS: &str = "Credential Dialog Xaml Host";
 
 fn window_name() -> *const u16 {
     static NAME: OnceLock<Vec<u16>> = OnceLock::new();
@@ -702,6 +775,307 @@ fn pump_thread(tx: mpsc::Sender<HwndSend>, class: Vec<u16>, register_class: bool
 }
 
 // ---------------------------------------------------------------------------
+// Focus watcher (best-effort foregrounding of the Windows Hello dialog)
+// ---------------------------------------------------------------------------
+
+/// RAII keep-alive for the focus watcher. It is armed around a blocking
+/// ceremony; dropping it signals the watcher thread to stop and returns
+/// immediately.
+///
+/// The thread is deliberately **not** joined: the process is short-lived and
+/// the watcher may be wedged inside `AttachThreadInput`, so joining it could
+/// hang the bridge. This follows the same precedent as
+/// [`HiddenWindow::create`].
+struct FocusWatcher {
+    /// Flip to `true` to ask the thread to return promptly.
+    stop: Arc<AtomicBool>,
+    // The `JoinHandle` is intentionally dropped: see the struct doc.
+}
+
+/// The owner HWND the Hello dialog is expected to be parented to (the window
+/// passed to the WebAuthn API), plus the out-parameter for a completed search.
+struct DialogSearch {
+    /// Expected owner; only windows owned by it are considered.
+    owner: Hwnd,
+    /// Set to the found dialog handle, or left null.
+    found: Hwnd,
+}
+
+// SAFETY: the handles are opaque values only read/compared on the watcher
+// thread (and used as read-only arguments to Win32). Nothing here dereferences
+// them in Rust.
+unsafe impl Send for DialogSearch {}
+
+impl FocusWatcher {
+    /// Arm a watcher for the duration of the current blocking Win32 call.
+    ///
+    /// `owner` is the HWND handed to the WebAuthn API (the dialog's expected
+    /// owner); only windows owned by it are considered.
+    fn arm(owner: Hwnd) -> FocusWatcher {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        // Wrap the owner before spawning so the closure captures `DialogSearch`
+        // (Send) rather than a bare raw pointer.
+        let search = DialogSearch {
+            owner,
+            found: ptr::null_mut(),
+        };
+        let spawned = thread::Builder::new()
+            .name("hello-focus-watcher".to_string())
+            .spawn(move || watcher_thread(thread_stop, search));
+        if spawned.is_err() {
+            // Best-effort: without the thread the ceremony still runs; it just
+            // cannot raise the dialog. Use a non-panicking write so a broken
+            // stderr cannot abort the bridge.
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "wsl-webauthn-bridge: focus watcher thread could not start"
+            );
+        }
+        FocusWatcher { stop }
+    }
+}
+
+impl Drop for FocusWatcher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        // No join — a possibly-stuck attaching thread must not hang the bridge.
+    }
+}
+
+/// Write one progress line, ignoring a broken stderr.
+///
+/// The watcher runs on a detached thread and must never panic: `eprintln!`
+/// panics if the write fails (e.g. the Linux runner already exited and closed
+/// the pipe), so use a best-effort `writeln!`.
+fn emit_progress(phase: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "{PROGRESS_LINE_PREFIX}{phase}");
+}
+
+/// `EnumWindows` callback: record the first visible `Credential Dialog Xaml
+/// Host` top-level window owned by `search.owner`, then stop enumerating.
+///
+/// The class match alone is spoofable (any process can register that class
+/// name), so an owner match is required: the dialog is created as an owned
+/// window of the HWND we passed to the WebAuthn API.
+unsafe extern "system" fn find_dialog_proc(hwnd: Hwnd, lparam: isize) -> i32 {
+    let search = unsafe { &mut *(lparam as *mut DialogSearch) };
+    if unsafe { IsWindowVisible(hwnd) } == 0 {
+        return 1; // continue
+    }
+    if unsafe { GetWindow(hwnd, GW_OWNER) } != search.owner {
+        return 1; // continue
+    }
+    let mut buf = [0u16; 64];
+    let n = unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+    if n <= 0 {
+        return 1;
+    }
+    if String::from_utf16_lossy(&buf[..n as usize]) == CREDENTIAL_DIALOG_CLASS {
+        search.found = hwnd;
+        0 // stop
+    } else {
+        1
+    }
+}
+
+/// Find the credential dialog owned by `owner`.
+///
+/// Enumerates top-level windows and matches class **and** owner, so a foreign
+/// process cannot spoof the class name to steal focus. Returns null when no
+/// owned, visible dialog exists.
+fn find_owned_dialog(owner: Hwnd) -> Hwnd {
+    let mut search = DialogSearch {
+        owner,
+        found: ptr::null_mut(),
+    };
+    unsafe {
+        EnumWindows(
+            Some(find_dialog_proc),
+            &mut search as *mut DialogSearch as isize,
+        );
+    }
+    search.found
+}
+
+/// Poll for the credential dialog and try to foreground it.
+///
+/// Cadence mirrors Chromium's `HelloDialogForegrounder`: a fast poll (~100 ms)
+/// for the first ~40 iterations, then a slow poll (~500 ms) so a PIN-retry
+/// dialog that reappears is caught too. It returns promptly once `stop` is set.
+///
+/// Each distinct dialog handle is escalated **once** (direct request, then the
+/// input-queue attach, then a taskbar flash); subsequent polls only re-check
+/// whether it reached the foreground, so the attach rung cannot spin and risk
+/// an input-queue deadlock for the whole ceremony.
+fn watcher_thread(stop: Arc<AtomicBool>, search: DialogSearch) {
+    let owner = search.owner;
+    // Prime this thread's message queue. `AttachThreadInput` can only attach a
+    // thread that has a message queue, and a thread gets one on its first call
+    // to a message function; `PM_NOREMOVE` leaves anything found in place. The
+    // filter is a private `WM_USER` range so no unrelated posted message is
+    // consumed.
+    let mut msg: Msg = unsafe { mem::zeroed() };
+    unsafe {
+        PeekMessageW(&mut msg, ptr::null_mut(), WM_USER, WM_USER, PM_NOREMOVE);
+    }
+
+    let mut iteration: u32 = 0;
+    let mut seen: Hwnd = ptr::null_mut();
+    let mut escalated = false;
+
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let dialog = find_owned_dialog(owner);
+        if dialog.is_null() {
+            if !seen.is_null() {
+                emit_progress("prompt_closed");
+                seen = ptr::null_mut();
+                escalated = false;
+            }
+        } else {
+            if !seen.is_null() && dialog != seen {
+                // The old dialog disappeared and a new one took its place
+                // between polls (the save → PIN transition can swap handles
+                // without an intervening null). Keep the stream paired so the
+                // Linux side sees the step change, and reset escalation for the
+                // new handle.
+                emit_progress("prompt_closed");
+                escalated = false;
+            }
+            if dialog != seen {
+                emit_progress("prompt_open");
+                seen = dialog;
+            }
+            if !escalated {
+                // Rung 1 (direct) and rung 2 (attach) are attempted once per
+                // handle; the flash timer is left running until it is
+                // foregrounded or the handle disappears.
+                try_foreground(dialog);
+                escalated = true;
+            } else if unsafe { GetForegroundWindow() } != dialog {
+                // Still behind after the one-shot escalation: keep the taskbar
+                // button flashing without re-attaching input queues.
+                flash(dialog);
+            }
+        }
+
+        iteration += 1;
+        let delay = if iteration <= 40 {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_millis(500)
+        };
+        thread::sleep(delay);
+    }
+
+    // The ceremony ended while a dialog was still known to be up; report the
+    // close so the Linux side does not keep waiting on a prompt that is gone.
+    if !seen.is_null() {
+        emit_progress("prompt_closed");
+    }
+}
+
+/// Attempt to raise `dialog`, cheapest rung first. Called **once per dialog**.
+///
+/// Success is decided by **observing** `GetForegroundWindow()`, never by the
+/// `SetForegroundWindow` return value, which is documented as unreliable and
+/// partly asynchronous.
+fn try_foreground(dialog: Hwnd) {
+    if unsafe { GetForegroundWindow() } == dialog {
+        return;
+    }
+
+    // Rung 1: the cheap direct request. Usually denied for a WSL-interop child,
+    // but free when it is not.
+    unsafe {
+        SetForegroundWindow(dialog);
+    }
+    if unsafe { GetForegroundWindow() } == dialog {
+        return;
+    }
+
+    // Rung 2: share this thread's input queue with the foreground thread for
+    // the duration of the raise. Skipped when there is no distinct foreground
+    // thread (or its id is unknown).
+    let fg = unsafe { GetForegroundWindow() };
+    if !fg.is_null() {
+        let my_tid = unsafe { GetCurrentThreadId() };
+        let fg_tid = unsafe { GetWindowThreadProcessId(fg, ptr::null_mut()) };
+        if fg_tid != 0 && my_tid != 0 && fg_tid != my_tid {
+            if unsafe { IsIconic(dialog) } != 0 {
+                unsafe {
+                    ShowWindow(dialog, SW_RESTORE);
+                }
+            }
+            // The guard detaches even if a call below panics or returns early.
+            let attached = AttachedInput::attach(my_tid, fg_tid);
+            unsafe {
+                SetForegroundWindow(dialog);
+                BringWindowToTop(dialog);
+                SetFocus(dialog);
+            }
+            drop(attached);
+            if unsafe { GetForegroundWindow() } == dialog {
+                return;
+            }
+        }
+    }
+
+    // Rung 3: non-intrusive taskbar flash. Windows itself does this when it
+    // denies `SetForegroundWindow`.
+    flash(dialog);
+}
+
+/// Start/continue a taskbar flash that stops once `dialog` is foregrounded.
+fn flash(dialog: Hwnd) {
+    let mut info = FlashWInfo {
+        cb_size: mem::size_of::<FlashWInfo>() as u32,
+        hwnd: dialog,
+        dw_flags: FLASHW_ALL | FLASHW_TIMERNOFG,
+        u_count: 0,
+        dw_timeout: 0,
+    };
+    unsafe {
+        FlashWindowEx(&mut info);
+    }
+}
+
+/// RAII guard for `AttachThreadInput(..., TRUE)`.
+///
+/// The input queues are detached in `Drop` on every path, so the watcher thread
+/// can never leave itself attached to the foreground thread. The `attached`
+/// flag records whether the attach actually succeeded, so a failed attach is
+/// not paired with a spurious detach.
+struct AttachedInput {
+    attached: bool,
+    from: u32,
+    to: u32,
+}
+
+impl AttachedInput {
+    fn attach(from: u32, to: u32) -> AttachedInput {
+        let attached = unsafe { AttachThreadInput(from, to, ATTACH_TRUE) } != 0;
+        AttachedInput { attached, from, to }
+    }
+}
+
+impl Drop for AttachedInput {
+    fn drop(&mut self) {
+        if self.attached {
+            unsafe {
+                AttachThreadInput(self.from, self.to, ATTACH_FALSE);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DLL handle + function table
 // ---------------------------------------------------------------------------
 
@@ -864,28 +1238,37 @@ impl Win32Api {
         })
     }
 
-    /// The HWND handed to the ceremony: the hidden window when available,
-    /// otherwise the foreground window, then the top-level window, then the
-    /// desktop window.
+    /// The HWND handed to the ceremony: the current **foreground** window when
+    /// it is a foreign window, otherwise the hidden window, then the
+    /// top-level window, then the desktop window.
     ///
-    /// The fallback chain mirrors libfido2's `winhello.c`
-    /// (`GetForegroundWindow` → `GetTopWindow(NULL)`); `GetDesktopWindow` is a
-    /// last resort so the parameter is never NULL. The WebAuthN API only
-    /// requires *a* window handle — it is not used as an owner/parent for a
-    /// child window, so cross-thread use of a foreign top-level HWND is sound.
+    /// The WebAuthN `hWnd` is the *owner* of the Hello dialog. Passing the
+    /// window the user is looking at makes Windows create the dialog in front
+    /// of it, whereas passing our hidden `WS_POPUP` window owns the dialog to a
+    /// background window, placing it behind the terminal. This matches
+    /// libfido2's `winhello.c`, which passes `GetForegroundWindow()`; our own
+    /// hidden window is excluded so the fallback chain
+    /// (`GetTopWindow(NULL)`, then `GetDesktopWindow()` as a last resort so the
+    /// parameter is never NULL) still applies. The API only requires *a* window
+    /// handle — it is not used as a parent for a child window — so cross-thread
+    /// use of a foreign top-level HWND is sound.
     fn hwnd(&self) -> Hwnd {
-        if let Some(w) = &self.window {
-            return w.hwnd;
-        }
-        let fg = unsafe { GetForegroundWindow() };
-        if !fg.is_null() {
-            return fg;
-        }
+        let fg_raw = unsafe { GetForegroundWindow() };
+        // Only trust a *visible* foreground window; a hidden/minimized one is no
+        // better an owner than our own hidden window.
+        let fg = if !fg_raw.is_null() && unsafe { IsWindowVisible(fg_raw) } != 0 {
+            fg_raw
+        } else {
+            ptr::null_mut()
+        };
+        let own_hidden = self
+            .window
+            .as_ref()
+            .map(|w| w.hwnd)
+            .unwrap_or(ptr::null_mut());
         let top = unsafe { GetTopWindow(ptr::null_mut()) };
-        if !top.is_null() {
-            return top;
-        }
-        unsafe { GetDesktopWindow() }
+        let desktop = unsafe { GetDesktopWindow() };
+        crate::api::choose_owner(fg, own_hidden, top, desktop)
     }
 
     fn api_version(&self) -> u32 {
@@ -994,16 +1377,16 @@ impl WebAuthnApi for Win32Api {
         // non-resident credential and discovery via the assertion allow-list).
 
         let mut out: *mut CredentialAttestationRaw = ptr::null_mut();
+        // Resolve the owner **before** arming the watcher, so the watcher's own
+        // best-effort foreground attempts cannot change which window the dialog
+        // is parented to.
+        let owner = self.hwnd();
+        // Best-effort focus watcher for the duration of the blocking call; it
+        // never affects `hr` and is dropped (stop-signalled, not joined) as soon
+        // as the ceremony returns.
+        let _focus = FocusWatcher::arm(owner);
         let hr = unsafe {
-            (self.dll.make_credential)(
-                self.hwnd(),
-                &rp,
-                &user,
-                &cose_params,
-                &cd,
-                &options,
-                &mut out,
-            )
+            (self.dll.make_credential)(owner, &rp, &user, &cose_params, &cd, &options, &mut out)
         };
 
         if hr != S_OK {
@@ -1080,9 +1463,13 @@ impl WebAuthnApi for Win32Api {
         options.p_allow_credential_list = &mut allow_list;
 
         let mut out: *mut AssertionRaw = ptr::null_mut();
-        let hr = unsafe {
-            (self.dll.get_assertion)(self.hwnd(), rp_id.as_ptr(), &cd, &options, &mut out)
-        };
+        // Resolve the owner before arming the watcher (see `make_credential`).
+        let owner = self.hwnd();
+        // Best-effort focus watcher for the duration of the blocking call; see
+        // `make_credential`.
+        let _focus = FocusWatcher::arm(owner);
+        let hr =
+            unsafe { (self.dll.get_assertion)(owner, rp_id.as_ptr(), &cd, &options, &mut out) };
 
         if hr != S_OK {
             self.log_error("WebAuthNAuthenticatorGetAssertion", hr);
@@ -1230,6 +1617,52 @@ mod tests {
             "failed create took {:?}",
             start.elapsed()
         );
+    }
+
+    /// Arming and dropping the focus watcher must return promptly even when no
+    /// credential dialog exists: the drop only sets a stop flag and never joins
+    /// the (possibly stuck) watcher thread. Mirrors
+    /// `hidden_window_create_and_drop_returns_promptly`.
+    #[cfg(windows)]
+    #[test]
+    fn focus_watcher_arm_and_drop_returns_promptly() {
+        let start = Instant::now();
+        let guard = FocusWatcher::arm(ptr::null_mut());
+        drop(guard);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "arm+drop took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// `try_foreground` on a non-existent handle must return promptly (the
+    /// Win32 calls fail fast, and nothing blocks).
+    #[cfg(windows)]
+    #[test]
+    fn try_foreground_on_bogus_handle_returns_promptly() {
+        let start = Instant::now();
+        try_foreground(0xdead_beefusize as Hwnd);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "try_foreground took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// `FLASHWINFO` layout guard: `#[repr(C)]` on x86_64 gives
+    /// `cbSize` (4) + pad (4) + `hwnd` (8) + `dwFlags` (4) + `uCount` (4) +
+    /// `dwTimeout` (4) + tail pad (4) = 32 bytes. This is the buffer
+    /// `FlashWindowEx` reads, so an under-allocation would be a real bug.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn flashwinfo_layout_matches_public_header() {
+        assert_eq!(mem::size_of::<FlashWInfo>(), 32);
+        assert_eq!(mem::offset_of!(FlashWInfo, cb_size), 0);
+        assert_eq!(mem::offset_of!(FlashWInfo, hwnd), 8);
+        assert_eq!(mem::offset_of!(FlashWInfo, dw_flags), 16);
+        assert_eq!(mem::offset_of!(FlashWInfo, u_count), 20);
+        assert_eq!(mem::offset_of!(FlashWInfo, dw_timeout), 24);
     }
 
     #[cfg(target_pointer_width = "64")]

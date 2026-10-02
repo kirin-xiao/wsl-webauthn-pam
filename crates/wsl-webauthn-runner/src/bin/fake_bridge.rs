@@ -37,6 +37,10 @@
 //! * `empty=1` — exit 0 with no output at all.
 //! * `trailing=1` — write a valid frame followed by extra bytes, then exit 0.
 //! * `noisy=1` — emit extra stderr chatter after the PID line.
+//! * `progress=1` — emit `PROGRESS prompt_open` then `PROGRESS prompt_closed` on stderr
+//!   before answering, so the runner's live progress scanner can be exercised.
+//! * `progress_sleep=<ms>` — sleep between the two progress lines (with `progress=1`),
+//!   widening the window in which the runner sees `prompt_open` while blocked.
 //! * `payload=<n>` — number of filler bytes in a valid enroll/assert success response.
 
 use std::io::Write;
@@ -68,6 +72,8 @@ struct Opts {
     abort: bool,
     postclose_sleep: Option<u64>,
     payload: usize,
+    progress: bool,
+    progress_sleep_ms: u64,
 }
 
 impl Default for Opts {
@@ -93,6 +99,8 @@ impl Default for Opts {
             abort: false,
             postclose_sleep: None,
             payload: 0,
+            progress: false,
+            progress_sleep_ms: 0,
         }
     }
 }
@@ -126,6 +134,8 @@ fn parse_args() -> Opts {
             "abort" => opts.abort = value == "1",
             "postclose_sleep" => opts.postclose_sleep = value.parse().ok(),
             "payload" => opts.payload = value.parse().unwrap_or(0),
+            "progress" => opts.progress = value == "1",
+            "progress_sleep" => opts.progress_sleep_ms = value.parse().unwrap_or(0),
             _ => {}
         }
     }
@@ -195,6 +205,13 @@ fn main() -> ExitCode {
         // Mimic the real bridge's Windows-side diagnostic (ffi::log_error):
         // `<context>: hr=0x… <name>`.
         eprintln!("WebAuthNGetAssertion: hr={hr} FakeErrorName");
+    }
+    if opts.progress {
+        // Mimic the bridge's out-of-band ceremony progress lines.
+        eprintln!("PROGRESS prompt_open");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        std::thread::sleep(Duration::from_millis(opts.progress_sleep_ms));
+        eprintln!("PROGRESS prompt_closed");
     }
 
     if let Some(n) = opts.stderr_flood {

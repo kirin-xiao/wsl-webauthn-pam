@@ -75,7 +75,7 @@ use anyhow::{Context as _, anyhow, bail};
 use sha2::{Digest as _, Sha256};
 
 use wsl_webauthn_protocol::{BRIDGE_ENROLL_TIMEOUT_MS, ClientDataKind, RP_ID, build_client_data};
-use wsl_webauthn_runner::{EnrollParams, InteropCommand, Runner, RunnerResponse};
+use wsl_webauthn_runner::{CeremonyProgress, EnrollParams, InteropCommand, Runner, RunnerResponse};
 use wsl_webauthn_store::{
     AttestationRecord, CredentialRecord, MODE_STRICT, MODE_UNATTESTED_OPT_IN, SCHEMA_VERSION,
     Store, StoreError, WindowsIdentity,
@@ -105,23 +105,34 @@ const CHALLENGE_BYTES: usize = 32;
 /// Default COSE algorithm allow-list presented to Windows at enrollment.
 const ENROLL_ALGS: [i32; 2] = [-7, -257];
 
-/// Advisory printed immediately before the enrollment ceremony.
+/// Short notice printed once immediately before the enrollment ceremony.
 ///
-/// The Windows Hello dialog can open behind the terminal and the save-then-PIN flow
-/// happens inside one `makeCredential` call, so the CLI cannot otherwise signal progress.
-const ENROLL_ADVISORY: &[&str] = &[
-    "About to open the Windows Hello dialog. If it does not come to the front,",
-    "check the taskbar; the save dialog may be followed by a PIN prompt.",
-    "Do not type the PIN into this terminal.",
-];
+/// The Windows Hello dialog can briefly open behind the terminal, and the save→PIN flow
+/// happens inside one `makeCredential` call, so a single line up front tells the user
+/// what to expect.
+const ENROLL_ADVISORY: &str =
+    "Waiting for the Windows Hello prompt — save your passkey, then enter your PIN.";
 
 /// Print [`ENROLL_ADVISORY`], surrounded by blank lines.
 fn print_enroll_advisory() {
     println!();
-    for line in ENROLL_ADVISORY {
-        println!("{line}");
-    }
+    println!("{ENROLL_ADVISORY}");
     println!();
+}
+
+/// Render one ceremony-phase transition as a human line, or `None` when there is nothing
+/// worth printing.
+///
+/// Only the **second** dialog (the PIN prompt after the save dialog) is announced: the
+/// pre-ceremony [`ENROLL_ADVISORY`] already covers the first, and the runner's
+/// start/finish boundaries are silent.
+fn ceremony_progress_line(event: CeremonyProgress, step: Option<(usize, usize)>) -> Option<String> {
+    match event {
+        CeremonyProgress::PromptOpen if matches!(step, Some((n, _)) if n >= 2) => {
+            Some("Enter your PIN in the Windows dialog.".to_string())
+        }
+        _ => None,
+    }
 }
 
 /// `--help` text.
@@ -1035,7 +1046,31 @@ fn cmd_enroll(
     } else {
         AttestationPolicy::Strict
     };
-    let outcome = enroll_checked(&store, &runner, &target, &policy, allow_unattested, replace)?;
+    let outcome = {
+        // The bridge reports progress out-of-band; render the PIN phase as the
+        // user-visible step so the second dialog does not pass unnoticed.
+        let step = std::cell::Cell::new(0usize);
+        let progress = |event: CeremonyProgress| {
+            match event {
+                // A fresh ceremony (including the double-enroll retry) resets the step.
+                CeremonyProgress::Starting => step.set(0),
+                CeremonyProgress::PromptOpen => step.set((step.get() + 1).min(2)),
+                _ => {}
+            }
+            if let Some(line) = ceremony_progress_line(event, Some((step.get().max(1), 2))) {
+                println!("{line}");
+            }
+        };
+        enroll_checked(
+            &store,
+            &runner,
+            &target,
+            &policy,
+            allow_unattested,
+            replace,
+            Some(&progress),
+        )?
+    };
 
     // 4. Build and persist the record.
     let enrolled_at = format_rfc3339(SystemTime::now());
@@ -1092,6 +1127,20 @@ trait EnrollCeremony {
         params: EnrollParams,
         deadline: Duration,
     ) -> Result<RunnerResponse, wsl_webauthn_runner::RunnerError>;
+
+    /// Like [`EnrollCeremony::run_ceremony`], but reporting [`CeremonyProgress`] events
+    /// from the bridge as they arrive.
+    ///
+    /// The default ignores `progress` so scripted doubles need only implement the plain
+    /// method; [`Runner`] overrides it to forward the sink to the bridge.
+    fn run_ceremony_with_progress(
+        &self,
+        params: EnrollParams,
+        deadline: Duration,
+        _progress: Option<&wsl_webauthn_runner::ProgressSink<'_>>,
+    ) -> Result<RunnerResponse, wsl_webauthn_runner::RunnerError> {
+        self.run_ceremony(params, deadline)
+    }
 }
 
 impl EnrollCeremony for Runner {
@@ -1101,6 +1150,15 @@ impl EnrollCeremony for Runner {
         deadline: Duration,
     ) -> Result<RunnerResponse, wsl_webauthn_runner::RunnerError> {
         self.enroll(params, deadline)
+    }
+
+    fn run_ceremony_with_progress(
+        &self,
+        params: EnrollParams,
+        deadline: Duration,
+        progress: Option<&wsl_webauthn_runner::ProgressSink<'_>>,
+    ) -> Result<RunnerResponse, wsl_webauthn_runner::RunnerError> {
+        self.enroll_with_progress(params, deadline, progress)
     }
 }
 
@@ -1130,8 +1188,16 @@ fn enroll_with_double_enroll(
     target: &UserInfo,
     policy: &AttestationPolicy,
     allow_unattested: bool,
+    progress: Option<&wsl_webauthn_runner::ProgressSink<'_>>,
 ) -> anyhow::Result<EnrollOutcome> {
-    enroll_with_verifier(runner, target, policy, allow_unattested, verify_ceremony)
+    enroll_with_verifier(
+        runner,
+        target,
+        policy,
+        allow_unattested,
+        verify_ceremony,
+        progress,
+    )
 }
 
 /// Enforce the `--replace` policy against the target record *before* any ceremony.
@@ -1165,6 +1231,7 @@ fn enroll_checked(
     policy: &AttestationPolicy,
     allow_unattested: bool,
     replace: bool,
+    progress: Option<&wsl_webauthn_runner::ProgressSink<'_>>,
 ) -> anyhow::Result<EnrollOutcome> {
     if let Err(error) = store.preflight_write() {
         let context = if matches!(error, StoreError::NotFound { .. }) {
@@ -1202,7 +1269,7 @@ fn enroll_checked(
             }
         }
     }
-    enroll_with_double_enroll(runner, target, policy, allow_unattested)
+    enroll_with_double_enroll(runner, target, policy, allow_unattested, progress)
 }
 
 /// Implementation of [`enroll_with_double_enroll`] parameterized by the verifier.
@@ -1215,10 +1282,11 @@ fn enroll_with_verifier(
     policy: &AttestationPolicy,
     allow_unattested: bool,
     verify: VerifyCeremony,
+    progress: Option<&wsl_webauthn_runner::ProgressSink<'_>>,
 ) -> anyhow::Result<EnrollOutcome> {
     // Ceremony #1. `first` is scoped to this function and is explicitly dropped before
     // the retry: nothing derived from it can be returned or recorded.
-    let first = run_ceremony(runner, target)?;
+    let first = run_ceremony(runner, target, progress)?;
     match verify(&first, policy) {
         Ok(outcome) => return Ok(outcome),
         Err(error) if is_unattested_rejection(&error) => {
@@ -1242,7 +1310,7 @@ fn enroll_with_verifier(
     );
     // Exactly one retry: there is no loop, and a transport/ceremony failure here
     // propagates immediately via `?`.
-    let second = run_ceremony(runner, target)?;
+    let second = run_ceremony(runner, target, progress)?;
     match verify(&second, policy) {
         Ok(outcome) => Ok(outcome),
         Err(error) if is_unattested_rejection(&error) => bail!(
@@ -1255,7 +1323,15 @@ fn enroll_with_verifier(
 }
 
 /// One enrollment ceremony: mint a challenge, build clientDataJSON, run the bridge.
-fn run_ceremony(runner: &dyn EnrollCeremony, target: &UserInfo) -> anyhow::Result<CeremonyOutcome> {
+///
+/// `progress` receives [`CeremonyProgress`] events. The save→PIN transition happens
+/// inside the single blocking bridge call, so these events are the only signal that a
+/// second dialog is waiting.
+fn run_ceremony(
+    runner: &dyn EnrollCeremony,
+    target: &UserInfo,
+    progress: Option<&wsl_webauthn_runner::ProgressSink<'_>>,
+) -> anyhow::Result<CeremonyOutcome> {
     let challenge = random_bytes(CHALLENGE_BYTES);
     let client_data = build_client_data(ClientDataKind::Create, &challenge)
         .context("building enrollment clientDataJSON")?;
@@ -1273,7 +1349,7 @@ fn run_ceremony(runner: &dyn EnrollCeremony, target: &UserInfo) -> anyhow::Resul
     .with_timeout_ms(BRIDGE_ENROLL_TIMEOUT_MS);
 
     let response = runner
-        .run_ceremony(params, ENROLL_DEADLINE)
+        .run_ceremony_with_progress(params, ENROLL_DEADLINE, progress)
         .map_err(|error| {
             anyhow!(
                 "enrollment transport error: {}",
@@ -2594,6 +2670,7 @@ mod tests {
             &test_target(),
             &AttestationPolicy::AllowUnattested,
             true,
+            None,
         )
         .unwrap();
         assert_eq!(outcome.attestation.format, "none");
@@ -2604,9 +2681,14 @@ mod tests {
     #[test]
     fn double_enroll_retries_exactly_once_then_fails_under_strict() {
         let ceremony = ScriptedCeremony::none_attestation();
-        let error =
-            enroll_with_double_enroll(&ceremony, &test_target(), &AttestationPolicy::Strict, false)
-                .unwrap_err();
+        let error = enroll_with_double_enroll(
+            &ceremony,
+            &test_target(),
+            &AttestationPolicy::Strict,
+            false,
+            None,
+        )
+        .unwrap_err();
         assert!(
             error.to_string().contains("--allow-unattested"),
             "the failure must point at --allow-unattested: {error}"
@@ -2617,9 +2699,14 @@ mod tests {
     #[test]
     fn double_enroll_transport_error_propagates_without_retry() {
         let ceremony = ScriptedCeremony::transport_failure();
-        let error =
-            enroll_with_double_enroll(&ceremony, &test_target(), &AttestationPolicy::Strict, false)
-                .unwrap_err();
+        let error = enroll_with_double_enroll(
+            &ceremony,
+            &test_target(),
+            &AttestationPolicy::Strict,
+            false,
+            None,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("transport"));
         assert_eq!(ceremony.calls.get(), 1, "transport errors are not retried");
     }
@@ -2667,6 +2754,7 @@ mod tests {
             &AttestationPolicy::Strict,
             false,
             scripted_verify,
+            None,
         )
         .unwrap();
 
@@ -2721,23 +2809,123 @@ mod tests {
             calls: std::cell::Cell::new(0),
             key: p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng),
         };
-        let error =
-            enroll_with_double_enroll(&ceremony, &test_target(), &AttestationPolicy::Strict, false)
-                .unwrap_err();
+        let error = enroll_with_double_enroll(
+            &ceremony,
+            &test_target(),
+            &AttestationPolicy::Strict,
+            false,
+            None,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("transport"), "{error}");
         assert_eq!(ceremony.calls.get(), 2, "exactly one retry, never a loop");
     }
 
     // ---- enroll pre-check (no orphaned credential) ----
 
-    /// The pre-ceremony advisory must name the actual risks (background window, PIN into
-    /// the terminal) so the pause is not mistaken for a hang.
+    /// The pre-ceremony advisory must set expectations: the passkey save and the PIN.
     #[test]
-    fn enroll_advisory_names_taskbar_and_pin() {
-        let text = ENROLL_ADVISORY.join("\n").to_lowercase();
-        assert!(text.contains("taskbar"), "{text}");
+    fn enroll_advisory_names_passkey_and_pin() {
+        let text = ENROLL_ADVISORY.to_lowercase();
+        assert!(text.contains("passkey"), "{text}");
         assert!(text.contains("pin"), "{text}");
-        assert!(text.contains("terminal"), "{text}");
+    }
+
+    /// Only the second (PIN) dialog is announced, and every other transition is silent.
+    #[test]
+    fn ceremony_progress_announces_only_the_pin_step() {
+        assert_eq!(
+            ceremony_progress_line(CeremonyProgress::PromptOpen, Some((1, 2))),
+            None,
+            "the save dialog is already covered by the pre-ceremony advisory"
+        );
+        let pin = ceremony_progress_line(CeremonyProgress::PromptOpen, Some((2, 2))).unwrap();
+        assert!(pin.to_lowercase().contains("pin"), "{pin}");
+        // Closes and runner boundaries produce no user-facing line.
+        assert!(ceremony_progress_line(CeremonyProgress::PromptClosed, Some((2, 2))).is_none());
+        assert!(ceremony_progress_line(CeremonyProgress::Starting, Some((1, 2))).is_none());
+        assert!(ceremony_progress_line(CeremonyProgress::Finishing, Some((1, 2))).is_none());
+    }
+
+    /// The CLI closure must reset the step at each ceremony boundary, so the PIN line is
+    /// only emitted on the second open within a ceremony (and a retry starts clean).
+    #[test]
+    fn progress_step_resets_per_ceremony() {
+        let step = std::cell::Cell::new(0usize);
+        let line = |event: CeremonyProgress| {
+            match event {
+                CeremonyProgress::Starting => step.set(0),
+                CeremonyProgress::PromptOpen => step.set((step.get() + 1).min(2)),
+                _ => {}
+            }
+            ceremony_progress_line(event, Some((step.get().max(1), 2))).unwrap_or_default()
+        };
+        // Ceremony 1: save (silent) then PIN (announced).
+        assert!(line(CeremonyProgress::Starting).is_empty());
+        assert!(
+            line(CeremonyProgress::PromptOpen).is_empty(),
+            "[1/2] is silent"
+        );
+        assert!(line(CeremonyProgress::PromptClosed).is_empty());
+        assert!(line(CeremonyProgress::PromptOpen).contains("PIN"));
+        assert!(line(CeremonyProgress::Finishing).is_empty());
+        // Ceremony 2 (retry) must not inherit the PIN step.
+        assert!(line(CeremonyProgress::Starting).is_empty());
+        assert!(
+            line(CeremonyProgress::PromptOpen).is_empty(),
+            "retry starts at [1/2]"
+        );
+    }
+
+    /// A scripted ceremony that emits progress proves the CLI wiring runs the sink during
+    /// the ceremony (ordering: the event arrives before the ceremony returns).
+    #[test]
+    fn enroll_checked_forwards_progress_events() {
+        struct ProgressCeremony;
+        impl EnrollCeremony for ProgressCeremony {
+            fn run_ceremony(
+                &self,
+                _params: EnrollParams,
+                _deadline: Duration,
+            ) -> Result<RunnerResponse, wsl_webauthn_runner::RunnerError> {
+                unreachable!("run_ceremony_with_progress is overridden")
+            }
+            fn run_ceremony_with_progress(
+                &self,
+                _params: EnrollParams,
+                _deadline: Duration,
+                progress: Option<&wsl_webauthn_runner::ProgressSink<'_>>,
+            ) -> Result<RunnerResponse, wsl_webauthn_runner::RunnerError> {
+                if let Some(sink) = progress {
+                    sink(CeremonyProgress::PromptOpen);
+                    sink(CeremonyProgress::PromptClosed);
+                }
+                // Return a malformed response; we only care that the sink ran.
+                Ok(RunnerResponse::Error(
+                    wsl_webauthn_protocol::BridgeError::UserCancelled,
+                ))
+            }
+        }
+
+        let (_dir, store) = tempdir_store();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let sink = |event: CeremonyProgress| seen.borrow_mut().push(event);
+        let error = enroll_checked(
+            &store,
+            &ProgressCeremony,
+            &test_target(),
+            &AttestationPolicy::Strict,
+            false,
+            false,
+            Some(&sink),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("failed"), "{error}");
+        assert_eq!(
+            *seen.borrow(),
+            vec![CeremonyProgress::PromptOpen, CeremonyProgress::PromptClosed],
+            "the CLI must forward both phase events"
+        );
     }
 
     /// With an existing record and no `--replace`, the ceremony must not run at all:
@@ -2762,6 +2950,7 @@ mod tests {
                 &policy,
                 allow_unattested,
                 false,
+                None,
             )
             .unwrap_err();
             assert!(
@@ -2800,6 +2989,7 @@ mod tests {
             &AttestationPolicy::Strict,
             false,
             false,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -2833,6 +3023,7 @@ mod tests {
             &AttestationPolicy::AllowUnattested,
             true,
             true,
+            None,
         )
         .unwrap();
         assert_eq!(ceremony.calls.get(), 1);
@@ -2859,6 +3050,7 @@ mod tests {
                 &AttestationPolicy::Strict,
                 false,
                 replace,
+                None,
             )
             .unwrap_err();
             assert!(

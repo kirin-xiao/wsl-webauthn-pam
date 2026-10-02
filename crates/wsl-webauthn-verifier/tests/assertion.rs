@@ -477,7 +477,9 @@ fn negative_credential_key_bad_x_length() {
 fn negative_client_data_challenge_not_base64url() {
     let key = es256();
     let mut a = build_assertion(&key);
-    a.client_data_json = br#"{"type":"webauthn.get","challenge":"!!!not-base64!!!","origin":"io.github.kirin-xiao.wsl-webauthn-pam"}"#.to_vec();
+    a.client_data_json =
+        br#"{"type":"webauthn.get","challenge":"!!!not-base64!!!","origin":"wsl-webauthn-pam"}"#
+            .to_vec();
     a.signature = key
         .signer
         .sign(&signed_message(&a.auth_data, &a.client_data_json));

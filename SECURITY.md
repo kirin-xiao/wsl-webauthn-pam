@@ -63,7 +63,7 @@ Consent phishing — making the user approve a ceremony they did not intend — 
 
 | Anchor | Value / rule | Where |
 |---|---|---|
-| RP ID | `io.github.kirin-xiao.wsl-webauthn-pam` (compile-time constant) | `crates/wsl-webauthn-protocol/src/lib.rs` (`RP_ID`) |
+| RP ID | `wsl-webauthn-pam` (compile-time constant) | `crates/wsl-webauthn-protocol/src/lib.rs` (`RP_ID`) |
 | Origin | pinned equal to the RP ID (native client, no browser origin) | `crates/wsl-webauthn-protocol/src/lib.rs` (`ORIGIN`) |
 | Attestation root | **Microsoft TPM Root Certificate Authority 2014**, SHA-256 `87:0C:7A:35:CE:AB:3D:59:97:9F:2C:6A:52:40:42:D4:04:CB:71:51:80:04:35:09:25:FB:2C:ED:79:A9:99:DA` | `crates/wsl-webauthn-verifier/src/lib.rs` (`MS_TPM_ROOT_2014_SHA256`) |
 <!-- INVARIANT: CHAIN-PINNED-ROOT -->
@@ -150,7 +150,7 @@ The user-facing wording is in the [README](README.md#limits-and-accepted-residua
 
 - **Compromised Windows session.** Ceremony initiation is possible (subject to user verification) and the bridge can be replaced, but attestation + UV + Linux-side verification mean this does **not** yield silent root and does **not** let a replaced bridge forge an assertion; it does allow **consent phishing**.
 - **Compromised Linux root.** Out of scope by definition.
-- **Consent blinding is mitigated, not eliminated.** Neither WebAuthn nor a custom pre-prompt can make the OS prove *which process* raised the ceremony.
+- **Consent blinding is mitigated, not eliminated.** Neither WebAuthn nor a custom PAM notice can make the OS prove *which process* raised the ceremony.
 - **Not a roaming authenticator.** Machine loss/reset ⇒ re-enrollment by design. Windows cannot enumerate/delete non-resident platform credentials, so old keys from `--replace`/re-enrollment are orphaned (inert without their credential ID, which only the Linux store holds).
 - **No hardware side-channel defense.** TPM/platform behavior is trusted as-is.
 

@@ -5,6 +5,10 @@
 //! * `debug` — emit `LOG_DEBUG` detail (never secrets) to syslog.
 //! * `timeout=<secs>` — whole-child authentication deadline, in
 //!   `1..=`[`MAX_TIMEOUT_SECS`]; overrides the config value and the 60 s default.
+//! * `quiet` — never emit the consent/action-cue `PAM_TEXT_INFO` notice, even on an
+//!   interactive terminal. Otherwise the notice is emitted despite `PAM_SILENT` when a
+//!   controlling terminal is present, so an interactive user learns that a Windows
+//!   Hello prompt may be waiting behind the terminal.
 //!
 //! There is deliberately **no `noverifypin` argument**: disabling the
 //! bridge-executable SHA-256 pin from `/etc/pam.d` would silently turn root
@@ -38,6 +42,8 @@ pub struct ModuleArgs {
     pub debug: bool,
     /// `timeout=<secs>`, when supplied and valid.
     pub timeout_secs: Option<u64>,
+    /// `quiet`: suppress the consent/action-cue notice unconditionally.
+    pub quiet: bool,
 }
 
 /// Parse module arguments.
@@ -49,6 +55,7 @@ pub fn parse(raw: &[String]) -> ModuleArgs {
     for arg in raw {
         match arg.as_str() {
             "debug" => args.debug = true,
+            "quiet" => args.quiet = true,
             other => {
                 if let Some((key, value)) = other.split_once('=') {
                     if key == "timeout" {
@@ -161,6 +168,14 @@ mod tests {
         // `noverifypin` is not an argument; it must not silently do anything.
         assert_eq!(parse(&s(&["noverifypin"])), ModuleArgs::default());
         assert_eq!(parse(&s(&["no_verify_pin"])), ModuleArgs::default());
+    }
+
+    #[test]
+    fn quiet_parses() {
+        let a = parse(&s(&["quiet"]));
+        assert!(a.quiet);
+        assert!(!a.debug);
+        assert_eq!(a.timeout_secs, None);
     }
 
     #[test]

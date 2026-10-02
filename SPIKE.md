@@ -31,7 +31,13 @@ host always provides the echo.
 
 ## RP ID acceptance
 
-`rp_id = io.github.kirin-xiao.wsl-webauthn-pam`, with `origin` pinned equal to the RP ID.
+> **Superseded:** the pinned RP ID was later shortened to `wsl-webauthn-pam` (the
+> `kirin-xiao` segment was dropped from the displayed name). The measurements below were
+> taken with the original string and are kept as the record of the platform-acceptance
+> experiment; the same acceptance was re-checked for the new value.
+
+`rp_id = io.github.kirin-xiao.wsl-webauthn-pam` (original), with `origin` pinned equal to
+the RP ID.
 
 Enrollment returned `ok:true`. In `authenticatorData`:
 
@@ -178,7 +184,7 @@ Windows Security dialog during `assert` (screenshot not committed):
 │  Sign in with a passkey                                    │
 │                                                            │
 │  ●─  <user_name>                              ○───○         │
-│      Passkey for io.github.kirin-xiao.wsl-webauthn-pam     │
+│      Passkey for wsl-webauthn-pam                          │
 │                                                            │
 │              ⋮⋮⋮ ⋮⋮⋮ ⋮⋮⋮                                   │
 │              Enter your PIN                                │
@@ -222,6 +228,42 @@ t<1.0s, t>14.9s  (no such window)
 If the prompt must come to the front, the bridge may need to call `SetForegroundWindow` on
 its own HWND (or flash) after the ceremony starts. Focus was being actively used (a browser
 in front), the worst case for foreground stealing; a quiet session may be milder.
+
+**Implemented.** The bridge (a) passes the current visible
+`GetForegroundWindow()` as the WebAuthn `hWnd` (libfido2 does the same) so the dialog is
+owned by the window the user is looking at, and (b) runs a bounded focus watcher thread
+around each blocking ceremony: it polls for a **visible** top-level window whose class is
+`Credential Dialog Xaml Host` **and** whose owner is the HWND we passed (matched by class,
+never the localized title; the owner match blocks a look-alike from stealing focus), then
+tries `SetForegroundWindow`, then `AttachThreadInput` + `SetForegroundWindow`/
+`BringWindowToTop`/`SetFocus` (RAII-detached, attempted once per dialog), then
+`FlashWindowEx(FLASHW_ALL | FLASHW_TIMERNOFG)`. It also writes `PROGRESS prompt_open` /
+`PROGRESS prompt_closed` to stderr, which the CLI surfaces as a PIN line and the PAM
+module logs at debug level; the runner additionally emits explicit start/finish
+boundaries so the CLI's step counter is unaffected if the bridge's trailing
+`prompt_closed` is lost to the pipe close. All of this is best-effort: denial degrades
+to a taskbar flash and never changes the ceremony result. The owner/ladder choice still
+needs confirmation on a real host, and non-English Windows is specifically why the
+class-only match is used.
+
+## Bridge version resource
+
+The Windows WebAuthn prompt can surface a "Requested by <name> (<publisher>)" line
+sourced from the **calling executable's version resource** (documented in
+`microsoft/webauthn`'s `webauthn.h`, and used by the DEF CON "Passkeys Pwned" work).
+`WSLWebAuthnBridge.exe` originally carried no resource, so the prompt could not name its
+requester.
+
+`crates/wsl-webauthn-bridge/build.rs` now compiles `bridge.rc` into a `VERSIONINFO`
+resource for Windows targets (`rc.exe` for MSVC; `windres` + a direct linker argument for
+the GNU cross target — a resource-only object in a `static` archive is *not* pulled in, so
+the object is passed to the linker directly). The build is best-effort: if no resource
+compiler is found, the bridge is produced unchanged. The cross-built exe was checked to
+contain a `.rsrc` section and the UTF-16 `FileDescription`/`ProductName` strings.
+
+This is UX-only and carries no trust: the Linux side pins the whole `.exe` by SHA-256, so
+the resource cannot influence verification. Whether this Windows build renders the line,
+and exactly how, still needs confirmation on a real host.
 
 ## Not exercised on this host
 

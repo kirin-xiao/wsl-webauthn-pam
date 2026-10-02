@@ -90,7 +90,7 @@
 //!     b"0123456789abcdef", // expected challenge
 //!     b"credential-id",
 //!     &[],                 // COSE key (empty → rejected on this path)
-//!     br#"{"type":"webauthn.get","challenge":"MDEyMzQ1Njc4OWFiY2RlZg","origin":"io.github.kirin-xiao.wsl-webauthn-pam"}"#,
+//!     br#"{"type":"webauthn.get","challenge":"MDEyMzQ1Njc4OWFiY2RlZg","origin":"wsl-webauthn-pam"}"#,
 //!     &[],
 //!     &[],
 //! );

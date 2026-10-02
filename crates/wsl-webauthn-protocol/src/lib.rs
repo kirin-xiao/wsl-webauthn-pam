@@ -58,7 +58,12 @@ pub use client::{
 ///
 /// This value is hashed into `rpIdHash` inside `authenticatorData` and is part of the
 /// WebAuthn ceremony. It must never be transmitted on the wire.
-pub const RP_ID: &str = "io.github.kirin-xiao.wsl-webauthn-pam";
+///
+/// It is also the string the Windows Hello dialog shows as `Passkey for <RP_ID>`. The
+/// native platform API does not validate it as a domain (only browser clients do), so a
+/// single label is accepted; the value is hashed verbatim, so changing it forces
+/// re-enrollment.
+pub const RP_ID: &str = "wsl-webauthn-pam";
 
 /// Human-readable Relying Party name shown by the platform UI during enrollment.
 pub const RP_NAME: &str = "sudo on WSL (wsl-webauthn-pam)";
@@ -75,6 +80,17 @@ pub const MAX_REQUEST_BYTES: usize = 8 * 1024;
 
 /// Maximum accepted framed response size (64 KiB).
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Prefix of the out-of-band progress lines the Windows bridge writes to its stderr,
+/// one per ceremony-phase transition (e.g. `PROGRESS prompt_open`).
+///
+/// These are **diagnostics only**: the ceremony result always arrives on the framed
+/// stdout response, and a missing/progress-less bridge simply means no phase lines were
+/// emitted. The Linux side scans the child's stderr for them incrementally as it drains
+/// the stream; anything that is not a well-formed `PROGRESS <phase>` line is ignored. The
+/// trailing space is part of the prefix so `PROGRESS` alone cannot be mistaken for a
+/// phase name.
+pub const PROGRESS_LINE_PREFIX: &str = "PROGRESS ";
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -787,7 +803,7 @@ mod tests {
     #[test]
     fn origin_pinned_to_rp_id() {
         assert_eq!(ORIGIN, RP_ID);
-        assert_eq!(RP_ID, "io.github.kirin-xiao.wsl-webauthn-pam");
+        assert_eq!(RP_ID, "wsl-webauthn-pam");
     }
 
     #[test]

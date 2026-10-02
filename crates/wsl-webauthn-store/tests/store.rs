@@ -19,7 +19,7 @@ use wsl_webauthn_store::{
 /// Byte-for-byte golden encoding of [`sample_record("alice")`] (schema version 1).
 ///
 /// The on-disk JSON is an API, so this literal pins the format.
-const GOLDEN_STRICT_JSON: &str = r#"{"schema_version":1,"rp_id":"io.github.kirin-xiao.wsl-webauthn-pam","origin":"io.github.kirin-xiao.wsl-webauthn-pam","linux_user":"alice","linux_uid":1000,"credential_id":"Zm9vYmFy","cose_public_key":"AAECAw","alg":-7,"aaguid":"08987058-cadc-4b81-b6e1-30de50dcbe96","attestation":{"format":"packed","mode":"strict","verified":true,"leaf_sha256":"abababababababababababababababababababababababababababababababab"},"windows_identity":{"account":"HOST\\alice","sid":"S-1-5-21-1-2-3"},"enrolled_at":"2026-10-01T12:34:56Z","sign_count":0,"bridge_path":"/mnt/c/Users/alice/WSLWebAuthnBridge.exe","bridge_sha256":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}"#;
+const GOLDEN_STRICT_JSON: &str = r#"{"schema_version":1,"rp_id":"wsl-webauthn-pam","origin":"wsl-webauthn-pam","linux_user":"alice","linux_uid":1000,"credential_id":"Zm9vYmFy","cose_public_key":"AAECAw","alg":-7,"aaguid":"08987058-cadc-4b81-b6e1-30de50dcbe96","attestation":{"format":"packed","mode":"strict","verified":true,"leaf_sha256":"abababababababababababababababababababababababababababababababab"},"windows_identity":{"account":"HOST\\alice","sid":"S-1-5-21-1-2-3"},"enrolled_at":"2026-10-01T12:34:56Z","sign_count":0,"bridge_path":"/mnt/c/Users/alice/WSLWebAuthnBridge.exe","bridge_sha256":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}"#;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -40,8 +40,8 @@ fn fresh() -> (TempDir, Store) {
 fn sample_record(user: &str) -> CredentialRecord {
     CredentialRecord {
         schema_version: 1,
-        rp_id: "io.github.kirin-xiao.wsl-webauthn-pam".into(),
-        origin: "io.github.kirin-xiao.wsl-webauthn-pam".into(),
+        rp_id: "wsl-webauthn-pam".into(),
+        origin: "wsl-webauthn-pam".into(),
         linux_user: user.into(),
         linux_uid: 1000,
         credential_id: "Zm9vYmFy".into(),

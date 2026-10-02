@@ -1561,8 +1561,8 @@ fn sample_record_json(user: &str, uid: u32) -> String {
     format!(
         r#"{{
             "schema_version": 1,
-            "rp_id": "io.github.kirin-xiao.wsl-webauthn-pam",
-            "origin": "io.github.kirin-xiao.wsl-webauthn-pam",
+            "rp_id": "wsl-webauthn-pam",
+            "origin": "wsl-webauthn-pam",
             "linux_user": "{user}",
             "linux_uid": {uid},
             "credential_id": "AAAA",

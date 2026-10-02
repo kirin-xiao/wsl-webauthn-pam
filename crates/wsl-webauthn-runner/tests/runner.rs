@@ -789,3 +789,113 @@ fn concurrent_probes_are_independent() {
         handle.join().expect("thread panicked");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Ceremony progress (PROGRESS lines on the bridge's stderr)
+// ---------------------------------------------------------------------------
+
+/// The progress sink must receive `prompt_open` then `prompt_closed`, in that order,
+/// while the enroll response is still returned normally, so the CLI/module can announce
+/// the save-then-PIN flow.
+#[test]
+fn enroll_reports_progress_events_in_order() {
+    use std::sync::Mutex;
+    use wsl_webauthn_runner::CeremonyProgress;
+
+    let dir = cwd_dir();
+    let r = build_runner(dir.path(), &["ok", "progress=1", "progress_sleep=50"]);
+    let seen: Mutex<Vec<CeremonyProgress>> = Mutex::new(Vec::new());
+    let sink = |event: CeremonyProgress| {
+        seen.lock().unwrap().push(event);
+    };
+    let resp = r
+        .enroll_with_progress(enroll_params(), Duration::from_secs(5), Some(&sink))
+        .expect("enroll");
+    assert!(matches!(resp, RunnerResponse::Enroll { .. }), "{resp:?}");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            CeremonyProgress::Starting,
+            CeremonyProgress::PromptOpen,
+            CeremonyProgress::PromptClosed,
+            CeremonyProgress::Finishing,
+        ],
+        "the save-then-PIN gap must be observable between the runner boundaries"
+    );
+}
+
+/// `prompt_open` is delivered *before* the bridge has finished: with the fake pausing
+/// between the two lines, the sink must observe `prompt_open` while the exchange is still
+/// in flight, not only after exit. A recording sink that captures the elapsed time at
+/// `PromptOpen` proves the event was emitted live.
+#[test]
+fn progress_prompt_open_is_emitted_live_not_buffered() {
+    use std::sync::Mutex;
+    use wsl_webauthn_runner::CeremonyProgress;
+
+    let dir = cwd_dir();
+    let r = build_runner(dir.path(), &["ok", "progress=1", "progress_sleep=1000"]);
+    let start = Instant::now();
+    let open_at: Mutex<Option<Duration>> = Mutex::new(None);
+    let sink = |event: CeremonyProgress| {
+        if event == CeremonyProgress::PromptOpen {
+            *open_at.lock().unwrap() = Some(start.elapsed());
+        }
+    };
+    let resp = r
+        .authenticate_with_progress(assert_params(), Duration::from_secs(5), Some(&sink))
+        .expect("assert");
+    assert!(matches!(resp, RunnerResponse::Assert { .. }), "{resp:?}");
+    let open_at = open_at.lock().unwrap().expect("prompt_open observed");
+    assert!(
+        open_at < Duration::from_millis(500),
+        "prompt_open must arrive before the 1 s pause ends, saw {open_at:?}"
+    );
+}
+
+/// A bridge that emits no progress lines yields no callbacks and still succeeds.
+#[test]
+fn no_progress_lines_yields_no_events() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wsl_webauthn_runner::CeremonyProgress;
+    let dir = cwd_dir();
+    let r = build_runner(dir.path(), &["ok"]);
+    let count = AtomicUsize::new(0);
+    let sink = |_event: CeremonyProgress| {
+        count.fetch_add(1, Ordering::SeqCst);
+    };
+    let resp = r
+        .enroll_with_progress(enroll_params(), Duration::from_secs(5), Some(&sink))
+        .expect("enroll");
+    assert!(matches!(resp, RunnerResponse::Enroll { .. }), "{resp:?}");
+    // No bridge PROGRESS lines, but the runner still emits its two boundaries.
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+}
+
+/// Non-progress stderr (the `PID <n>` line, HRESULT diagnostics, noise) must never be
+/// mistaken for a phase event.
+#[test]
+fn unrelated_stderr_is_not_reported_as_progress() {
+    use wsl_webauthn_runner::{CeremonyProgress, parse_progress};
+    let stderr = b"PID 4242\nWebAuthNGetAssertion: hr=0x80090036 FakeName\nsome log line\n";
+    assert_eq!(parse_progress(stderr), Vec::<CeremonyProgress>::new());
+    // A `PROGRESS` line with an unknown phase is dropped.
+    assert_eq!(parse_progress(b"PROGRESS nonsense\n").len(), 0);
+    // Known phases parse, and matching is exact to the prefix.
+    assert_eq!(
+        parse_progress(b"PROGRESS prompt_open\n"),
+        vec![CeremonyProgress::PromptOpen]
+    );
+}
+
+/// The default `enroll`/`authenticate` helpers (no sink) still work against a bridge that
+/// emits progress lines.
+#[test]
+fn default_entry_points_ignore_progress_lines() {
+    let dir = cwd_dir();
+    let r = build_runner(dir.path(), &["ok", "progress=1"]);
+    let resp = r
+        .enroll(enroll_params(), Duration::from_secs(5))
+        .expect("enroll");
+    assert!(matches!(resp, RunnerResponse::Enroll { .. }), "{resp:?}");
+}

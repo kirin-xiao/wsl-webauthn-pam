@@ -17,7 +17,7 @@
 //!    the record; a mismatch refuses to launch. There is no way to skip
 //!    this check from the argument surface.
 //! 4. Mint a 32-byte challenge, build the exact `clientDataJSON`, optionally emit a
-//!    `pam_conv` consent pre-prompt (skipped under `PAM_SILENT`), and run the bridge.
+//!    `pam_conv` action-cue/prompt notice (see below), and run the bridge.
 //! 5. Verify the response with `wsl-webauthn-verifier` (echo consistency, credential
 //!    id, then the full cryptographic assertion with the stored sign counter).
 //!
@@ -87,7 +87,10 @@
 //! # Wire facts that shape this module
 //!
 //! * The Windows Hello prompt shows the **RP ID**, not `RP_NAME`; the `pam_conv`
-//!   pre-prompt above is therefore the primary consent-naming mechanism.
+//!   action-cue notice above is therefore the primary consent-naming mechanism. It is
+//!   emitted despite `PAM_SILENT` when a controlling terminal is present (the Windows
+//!   dialog can open behind the terminal), and suppressed without one or with the
+//!   `quiet` argument.
 //! * The runner's deadline includes a 5 s `taskkill` budget, so total wall time can
 //!   reach `deadline + 5 s`; the default 60 s deadline leaves the bridge's 55 s
 //!   advisory timeout a 5 s margin.

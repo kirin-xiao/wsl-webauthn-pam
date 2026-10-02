@@ -248,9 +248,45 @@ pub struct AssertionResult {
 }
 
 // ---------------------------------------------------------------------------
-// The API abstraction
+// Owner-window selection (shared, platform-independent policy)
 // ---------------------------------------------------------------------------
 
+/// Win32 `HWND` as an opaque pointer-sized value.
+///
+/// This mirrors the aliases in `crate::ffi`; it lives here so the owner-selection
+/// policy is unit-testable on Linux, where the FFI module is not compiled.
+pub type RawHwnd = *mut std::ffi::c_void;
+
+/// Choose the HWND to hand to the WebAuthn API as the dialog's owner.
+///
+/// Order: a *foreign* visible foreground window (so the dialog is owned by the
+/// window the user is looking at — this is what libfido2's `winhello.c` does),
+/// else our own hidden window, else the top-level window, else the desktop
+/// window so the parameter is never NULL. Our own hidden window is excluded
+/// from the foreground slot: it is not a foreign window, and owning the
+/// dialog to it places the dialog behind the terminal.
+#[must_use]
+pub fn choose_owner(
+    foreground: RawHwnd,
+    own_hidden: RawHwnd,
+    top: RawHwnd,
+    desktop: RawHwnd,
+) -> RawHwnd {
+    if !foreground.is_null() && foreground != own_hidden {
+        return foreground;
+    }
+    if !own_hidden.is_null() {
+        return own_hidden;
+    }
+    if !top.is_null() {
+        return top;
+    }
+    desktop
+}
+
+// ---------------------------------------------------------------------------
+// The API abstraction
+// ---------------------------------------------------------------------------
 /// The subset of `webauthn.dll` the bridge drives.
 ///
 /// Implementations must be cheap to share across threads: the ceremony layer
@@ -335,5 +371,40 @@ mod tests {
             format!("{id:?}"),
             "CancellationId(abababababababababababababababab)"
         );
+    }
+
+    // ---- owner-window selection ----------------------------------------
+
+    #[test]
+    fn choose_owner_prefers_foreign_foreground() {
+        let fg = 0x1usize as RawHwnd;
+        let hidden = 0x2usize as RawHwnd;
+        let top = 0x3usize as RawHwnd;
+        let desktop = 0x4usize as RawHwnd;
+        // A foreign foreground window is the owner (libfido2 behavior).
+        assert_eq!(choose_owner(fg, hidden, top, desktop), fg);
+    }
+
+    #[test]
+    fn choose_owner_excludes_our_own_hidden_window() {
+        let hidden = 0x2usize as RawHwnd;
+        let top = 0x3usize as RawHwnd;
+        let desktop = 0x4usize as RawHwnd;
+        // Foreground == our hidden window must not be passed as a *foreign*
+        // owner; fall through to the hidden/top/desktop chain.
+        assert_eq!(choose_owner(hidden, hidden, top, desktop), hidden);
+    }
+
+    #[test]
+    fn choose_owner_falls_back_when_foreground_absent() {
+        let hidden = 0x2usize as RawHwnd;
+        let top = 0x3usize as RawHwnd;
+        let desktop = 0x4usize as RawHwnd;
+        let null = std::ptr::null_mut();
+        // No foreground and no own hidden window -> top, then desktop.
+        assert_eq!(choose_owner(null, null, top, desktop), top);
+        assert_eq!(choose_owner(null, hidden, top, desktop), hidden);
+        // Never returns NULL when a desktop fallback exists.
+        assert_eq!(choose_owner(null, null, null, desktop), desktop);
     }
 }

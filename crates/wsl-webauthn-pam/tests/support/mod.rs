@@ -115,6 +115,8 @@ pub struct FakeSeam {
     pub service: Option<String>,
     /// What `conv_available` reports.
     pub conv_available: bool,
+    /// What `has_tty` reports (`PAM_TTY` present and non-empty).
+    pub tty: bool,
     /// What `conv_text` returns.
     pub conv_result: Result<(), SeamError>,
     /// Recorded `pam_fail_delay` requests, in order.
@@ -130,6 +132,7 @@ impl FakeSeam {
             user: Ok(user.to_string()),
             service: Some("sudo".to_string()),
             conv_available: false,
+            tty: false,
             conv_result: Ok(()),
             fail_delays: Vec::new(),
             messages: Vec::new(),
@@ -139,6 +142,12 @@ impl FakeSeam {
     /// Enable a working conversation that records messages.
     pub fn with_conv(mut self) -> FakeSeam {
         self.conv_available = true;
+        self
+    }
+
+    /// Report a controlling terminal (`PAM_TTY` present).
+    pub fn with_tty(mut self) -> FakeSeam {
+        self.tty = true;
         self
     }
 }
@@ -152,6 +161,9 @@ impl PamSeam for FakeSeam {
     }
     fn conv_available(&mut self) -> bool {
         self.conv_available
+    }
+    fn has_tty(&mut self) -> bool {
+        self.tty
     }
     fn conv_text(&mut self, style: i32, text: &str) -> Result<(), SeamError> {
         self.messages.push((style, text.to_string()));

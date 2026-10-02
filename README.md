@@ -44,15 +44,15 @@ anchor.
 short: enrollment verifies `tpm`/`packed` attestation to the pinned Microsoft
 TPM Root CA 2014 with a Windows Hello AAGUID (unattested keys require
 `--allow-unattested`); the RP ID and origin are compile-time constants
-(`io.github.kirin-xiao.wsl-webauthn-pam`), asserted byte-for-byte on the Linux
+(`wsl-webauthn-pam`), asserted byte-for-byte on the Linux
 side and never carried on the wire; and the module refuses to launch a bridge
 whose SHA-256 differs from the digest pinned at enrollment. One root-owned
 credential record is kept per Linux user; the signature counter is compared
 (advisory on Windows Hello, which reports a constant counter), with challenge
 freshness as the main gate. Windows shows `Passkey for
-io.github.kirin-xiao.wsl-webauthn-pam` (the RP ID, not a friendly name); the
-Linux-side `pam_conv` pre-prompt names the service and user and is suppressed
-under `PAM_SILENT`.
+wsl-webauthn-pam` (the RP ID, not a friendly name); the
+Linux-side `pam_conv` notice names the service and user — emitted even under
+`PAM_SILENT` when a terminal is attached, silenceable with the `quiet` argument.
 
 ### Limits and accepted residual risk
 
@@ -159,10 +159,10 @@ sudo pam-auth-update                  # select "WSL WebAuthn authentication"
 sudo pam-auth-update --enable wsl-webauthn
 ```
 
-`enroll` prints a short notice before the ceremony: the Windows Hello dialog can
-open behind the terminal, and the save dialog may be followed by a PIN prompt. If
-the dialog does not come to the front, check the taskbar. Type the PIN into the
-dialog, not the terminal.
+`enroll` prints a short notice before the ceremony and a line when the second dialog
+appears. The Windows Hello dialog can open behind the terminal, and the save dialog may
+be followed by a PIN prompt; the bridge makes a best-effort attempt to raise it (or
+flash its taskbar button). See Troubleshooting.
 
 ### Manual installation (no installer)
 
@@ -301,16 +301,23 @@ build-provenance attestation: verify with
 ## Troubleshooting
 
 **The module never seems to trigger, and `sudo` just asks for a password.**
-The module honours `PAM_SILENT` and never writes to stdout, so it is quiet by
-design. Check the authentication log: `journalctl -t pam_wsl_webauthn` or your
-distro's `auth.log` (syslog facility `authpriv`). Add the `debug` module argument
-for `LOG_DEBUG` detail (never secrets).
+The module writes nothing to stdout; its only user-visible output is a one-line action
+cue sent through the PAM conversation. Under `PAM_SILENT` (as `sudo` sets) the cue
+requires a controlling terminal, and the `quiet` module argument suppresses it
+everywhere. Check the authentication log: `journalctl -t pam_wsl_webauthn` or your
+distro's `auth.log` (syslog facility `authpriv`). Add the `debug` module argument for
+`LOG_DEBUG` detail (never secrets).
 
 **The Windows Hello prompt appears in the background.**
-The bridge owns a hidden top-level window and the dialog is parented to it, but
-WSL focus handling means the dialog is not forced to the foreground. Watch the
-taskbar for the Windows Security icon and click it. This is worst when another
-app (e.g. a browser) is actively in front.
+The bridge passes the current foreground window as the prompt's owner and makes a
+best-effort attempt to raise the dialog when it appears (falling back to flashing its
+taskbar button). WSL focus handling can still leave it behind, especially when another
+app (e.g. a browser) is actively in front; watch the taskbar for the Windows Security
+icon and click it.
+The CLI announces the second (PIN) dialog and the module names the service, so you know
+a prompt is expected; type the PIN into the **dialog**, never the terminal. Because
+`sudo` authenticates in silent mode, the module emits its cue only when a terminal is
+attached; add the `quiet` module argument to silence it entirely.
 
 **Interop is unavailable.**
 WSL interop needs the `binfmt_misc` `WSLInterop` registration to be `enabled`.

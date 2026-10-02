@@ -6,7 +6,8 @@ third-party binary vectors are committed.
 ## What is committed
 
 * `crates/wsl-webauthn-verifier/tests/independent.rs` — a committed, sanitized independent
-  vector, produced off-line with `python3`, `cryptography`, and a minimal CBOR encoder. It
+  vector, produced off-line with `python3`, `cryptography`, and a minimal CBOR encoder (the
+  generator is committed at `tests/vectors/generate_independent_vector.py`). It
   calls none of the in-repo builders, so it is a second implementation of the
   signed-message/certificate construction, and it pins the signed-message definition to an
   off-line SHA-256 literal. It also runs a mutation oracle: every single-byte corruption of

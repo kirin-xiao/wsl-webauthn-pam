@@ -11,7 +11,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-TEST_RP_ID="${1:-io.github.kirin-xiao.wsl-webauthn-pam-test}"
+TEST_RP_ID="${1:-wsl-webauthn-pam-test}"
 LIB="$REPO_ROOT/crates/wsl-webauthn-protocol/src/lib.rs"
 OUT="$REPO_ROOT/spike/WSLWebAuthnBridge-testrp.exe"
 BACKUP="$(mktemp)"

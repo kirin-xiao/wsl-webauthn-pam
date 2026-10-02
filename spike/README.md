@@ -56,9 +56,9 @@ subcommand without `--merge` needs `--credential-id`.
 different RP ID, and restores the source:
 
 ```sh
-spike/build_testrp.sh io.github.kirin-xiao.wsl-webauthn-pam-test
+spike/build_testrp.sh wsl-webauthn-pam-test
 python3 spike/harness.py --exe spike/WSLWebAuthnBridge-testrp.exe \
-    --rp-id io.github.kirin-xiao.wsl-webauthn-pam-test --deadline 90 \
+    --rp-id wsl-webauthn-pam-test --deadline 90 \
     enroll --user-name spike-testrp --out /tmp/opencode/testrp.json
 ```
 
@@ -70,3 +70,7 @@ been built with the same constant.
 `tests/vectors/local/` is git-ignored: it contains machine identifiers (attestation
 material, credential IDs, account-linked keys). Nothing captured there is committed;
 only the `.gitignore` entry is.
+
+A captured vector embeds the RP ID it was made with, so it must be regenerated after
+any change to the pinned `RP_ID`; a stale local vector's `rpIdHash`/origin will not
+match and `spike/harness.py verify` will reject it.

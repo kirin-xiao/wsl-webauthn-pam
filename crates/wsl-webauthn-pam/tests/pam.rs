@@ -620,10 +620,52 @@ fn conv_message_sent_when_not_silent() {
     assert!(text.contains("alice"), "{text}");
 }
 
+/// An action cue is emitted even under `PAM_SILENT` (as `sudo` passes) **when** the
+/// transaction has a controlling terminal, so an interactive user learns the Windows
+/// prompt is waiting.
 #[test]
-fn conv_message_suppressed_under_pam_silent() {
+fn conv_message_sent_under_pam_silent_with_tty() {
     let (_f, mut seam, deps) = happy();
     seam.conv_available = true;
+    seam.tty = true;
+    assert_eq!(run_basic(&mut seam, &deps, PAM_SILENT, &[]), PAM_SUCCESS);
+    assert_eq!(seam.messages.len(), 1);
+    assert_eq!(seam.messages[0].0, PAM_TEXT_INFO);
+}
+
+/// Without a terminal (scripted/cron `sudo`), `PAM_SILENT` is honored and nothing is
+/// emitted.
+#[test]
+fn conv_message_suppressed_under_pam_silent_without_tty() {
+    let (_f, mut seam, deps) = happy();
+    seam.conv_available = true;
+    assert_eq!(run_basic(&mut seam, &deps, PAM_SILENT, &[]), PAM_SUCCESS);
+    assert!(seam.messages.is_empty());
+}
+
+/// The `quiet` module argument forces silence everywhere, including an interactive
+/// terminal without `PAM_SILENT`.
+#[test]
+fn conv_message_suppressed_by_quiet_argument() {
+    let (_f, mut seam, deps) = happy();
+    seam.conv_available = true;
+    seam.tty = true;
+    assert_eq!(run_basic(&mut seam, &deps, 0, &["quiet"]), PAM_SUCCESS);
+    assert!(seam.messages.is_empty());
+    assert_eq!(
+        run_basic(&mut seam, &deps, PAM_SILENT, &["quiet"]),
+        PAM_SUCCESS
+    );
+    assert!(seam.messages.is_empty());
+}
+
+/// A conversation is only emitted when the application installed one, regardless of
+/// `PAM_SILENT`/tty.
+#[test]
+fn conv_message_needs_a_conversation() {
+    let (_f, mut seam, deps) = happy();
+    seam.conv_available = false;
+    seam.tty = true;
     assert_eq!(run_basic(&mut seam, &deps, PAM_SILENT, &[]), PAM_SUCCESS);
     assert!(seam.messages.is_empty());
 }

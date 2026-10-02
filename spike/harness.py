@@ -38,7 +38,7 @@ from pathlib import Path
 # Pinned constants (mirror crates/wsl-webauthn-protocol/src/lib.rs)
 # --------------------------------------------------------------------------
 
-RP_ID = "io.github.kirin-xiao.wsl-webauthn-pam"
+RP_ID = "wsl-webauthn-pam"
 RP_NAME = "sudo on WSL (wsl-webauthn-pam)"
 ORIGIN = RP_ID  # origin pinned equal to RP ID
 MIN_CHALLENGE_BYTES = 16

@@ -92,6 +92,24 @@ pub trait Deps {
         params: AssertParams,
         deadline: Duration,
     ) -> Result<RunnerResponse, RunnerError>;
+
+    /// Like [`Deps::authenticate`], forwarding [`CeremonyProgress`] events from the bridge.
+    ///
+    /// The default ignores `progress` so test doubles need only implement
+    /// [`Deps::authenticate`]; [`SystemDeps`] overrides it so the production path reports
+    /// when the Windows dialog opens/closes (used for audit diagnostics, not a decision).
+    ///
+    /// [`CeremonyProgress`]: wsl_webauthn_runner::CeremonyProgress
+    fn authenticate_with_progress(
+        &self,
+        bridge: &Path,
+        win_mnt: &Path,
+        params: AssertParams,
+        deadline: Duration,
+        _progress: Option<&wsl_webauthn_runner::ProgressSink<'_>>,
+    ) -> Result<RunnerResponse, RunnerError> {
+        self.authenticate(bridge, win_mnt, params, deadline)
+    }
     /// Test-only panic injection point.
     ///
     /// The default is a no-op and no production `Deps` implementation overrides it, so no
@@ -140,8 +158,18 @@ impl Deps for SystemDeps {
         params: AssertParams,
         deadline: Duration,
     ) -> Result<RunnerResponse, RunnerError> {
+        self.authenticate_with_progress(bridge, win_mnt, params, deadline, None)
+    }
+    fn authenticate_with_progress(
+        &self,
+        bridge: &Path,
+        win_mnt: &Path,
+        params: AssertParams,
+        deadline: Duration,
+        progress: Option<&wsl_webauthn_runner::ProgressSink<'_>>,
+    ) -> Result<RunnerResponse, RunnerError> {
         let exchange = wsl_webauthn_runner::Runner::new(bridge, win_mnt)
-            .authenticate_with_diagnostics(params, deadline)?;
+            .authenticate_with_diagnostics_and_progress(params, deadline, progress)?;
         // A ceremony failure arrives on a healthy transport, so the HRESULT/error line the
         // bridge writes to stderr is the only fine-grained diagnostic. Log it (bounded and
         // already escaped by the runner) under debug; the taxonomy itself is logged
@@ -496,15 +524,22 @@ pub fn authenticate<S: PamSeam, D: Deps>(
         }
     };
 
-    // --- 6. Optional consent pre-prompt ----------------------------------
-    // Windows Hello shows the RP ID, not RP_NAME; this conversation message is the
-    // primary consent-naming mechanism. It is best-effort: a missing or failing
-    // conversation never blocks authentication.
-    if !silent && seam.conv_available() {
+    // --- 6. Optional consent / action-cue pre-prompt ---------------------
+    // Windows Hello shows the RP ID, not RP_NAME, and its dialog can open behind the
+    // terminal, so this conversation message is the primary cue that a prompt is
+    // waiting. It is best-effort: a missing or failing conversation never blocks
+    // authentication.
+    //
+    // `sudo` authenticates with `PAM_SILENT`, whose literal reading ("generate no
+    // messages") would suppress this cue entirely. The cue is therefore keyed on
+    // evidence of an interactive user: emitted when the transaction has a controlling
+    // terminal, suppressed for a scripted or cron caller (no tty), and forced off by
+    // the `quiet` argument.
+    if !args.quiet && seam.conv_available() && (!silent || seam.has_tty()) {
         let service = seam.get_service().unwrap_or_else(|| "?".to_string());
         let text = format!(
             "Windows Hello: authenticating '{service}' for Linux user {username} \
-             \u{2014} check the Windows prompt"
+             \u{2014} a Windows passkey prompt is waiting; check the taskbar and do not type here"
         );
         if let Err(e) = seam.conv_text(PAM_TEXT_INFO, &text) {
             logger::debug(&format!("conversation info message not delivered: {e:?}"));
@@ -520,7 +555,19 @@ pub fn authenticate<S: PamSeam, D: Deps>(
     logger::debug(&format!(
         "running assertion for user {username} via {bridge_path:?} (deadline {deadline:?})"
     ));
-    let response = match deps.authenticate(bridge_path, &config.win_mnt, params, deadline) {
+    // Progress lines from the bridge are diagnostics only: the PAM conversation cannot
+    // prompt mid-ceremony, so log the phase at LOG_DEBUG (visible with the `debug` module
+    // argument). The decision is unaffected.
+    let progress = |event: wsl_webauthn_runner::CeremonyProgress| {
+        logger::debug(&format!("ceremony progress: {event:?}"));
+    };
+    let response = match deps.authenticate_with_progress(
+        bridge_path,
+        &config.win_mnt,
+        params,
+        deadline,
+        Some(&progress),
+    ) {
         Ok(r) => r,
         Err(e) => {
             return fail(
