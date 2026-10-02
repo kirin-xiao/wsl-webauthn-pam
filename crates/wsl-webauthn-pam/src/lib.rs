@@ -142,7 +142,7 @@ use std::ffi::{c_char, c_int};
 use crate::bindings::{LOG_CRIT, PAM_ABORT, PAM_IGNORE, PAM_SUCCESS, pam_handle_t};
 
 /// Wrap a PAM entry point so a panic becomes `PAM_ABORT` instead of unwinding across
-/// the FFI boundary (undefined behaviour) or aborting the process.
+/// the FFI boundary (undefined behavior) or aborting the process.
 fn guarded<F>(what: &str, body: F) -> c_int
 where
     F: FnOnce() -> c_int,

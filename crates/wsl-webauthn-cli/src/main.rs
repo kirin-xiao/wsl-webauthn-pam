@@ -350,7 +350,7 @@ enum Parsed {
     Run(Command),
 }
 
-/// Every flag the parser recognises, independent of which subcommand consumes it.
+/// Every flag the parser recognizes, independent of which subcommand consumes it.
 ///
 /// The per-subcommand allow-list ([`allowed_flags`]) is the single source of truth for
 /// the CLI contract: a flag that is not listed for the chosen subcommand is a usage
@@ -447,11 +447,11 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
 
 /// Parse one subcommand's flags.
 ///
-/// Every recognised flag is recorded as it is parsed and then checked against
+/// Every recognized flag is recorded as it is parsed and then checked against
 /// [`allowed_flags`] once the argument vector is exhausted, so a flag the subcommand does
 /// not consume is rejected with a usage error (exit `2`) rather than being silently
 /// dropped or surfacing later as a confusing root-check failure. Deferring the check
-/// keeps `-h`/`--help` reachable in any position: it is honoured even when a misplaced
+/// keeps `-h`/`--help` reachable in any position: it is honored even when a misplaced
 /// flag appears before it, exactly as before the table existed. Unknown arguments still
 /// fail immediately.
 fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
@@ -478,7 +478,7 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
     let mut win_mnt: Option<PathBuf> = None;
     let mut module_dir: Option<PathBuf> = None;
     let mut artifact_dir: Option<PathBuf> = None;
-    // Recognised flags in the order seen; checked against the allow-list after the loop.
+    // Recognized flags in the order seen; checked against the allow-list after the loop.
     // Rejecting only after the whole argument vector is parsed keeps `-h`/`--help`
     // reachable in any position (a later help wins over an earlier misplaced flag),
     // matching the pre-table parser.
@@ -583,7 +583,7 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
 
     // Enforce the allow-list once the whole vector parsed, so `--help` anywhere still wins.
     // This is the single source of truth for "does subcommand X accept flag Y": every
-    // recognised flag is recorded in `seen` as it is parsed (both the spaced and the
+    // recognized flag is recorded in `seen` as it is parsed (both the spaced and the
     // `--flag=value` forms) and checked here, so a misplaced flag is a usage error
     // (exit `2`) for *every* subcommand and *every* flag, matching the `EXIT CODES` help.
     for &flag in &seen {
@@ -1078,7 +1078,7 @@ impl EnrollCeremony for Runner {
 /// A per-ceremony verification function (the production value is [`verify_ceremony`]).
 ///
 /// This is a function pointer rather than a hard call so the double-enroll state
-/// machine's *discard* behaviour can be exercised with a scripted verifier in tests.
+/// machine's *discard* behavior can be exercised with a scripted verifier in tests.
 type VerifyCeremony =
     fn(&CeremonyOutcome, &AttestationPolicy) -> Result<EnrollOutcome, VerifyError>;
 
@@ -2184,7 +2184,7 @@ mod tests {
         assert!(parse(&args(&["status", "--nope", "--help"])).is_err());
     }
 
-    /// The allow-list contract: for *every* subcommand and *every* recognised flag, the
+    /// The allow-list contract: for *every* subcommand and *every* recognized flag, the
     /// flag is accepted iff the subcommand consumes it. The expected table is written
     /// out independently here so a drift in production's [`allowed_flags`] fails.
     #[test]

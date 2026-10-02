@@ -5,7 +5,7 @@
 //! bounded, non-blocking read loop. It performs **no trust decisions** — all assertion
 //! and attestation verification is the caller's job.
 //!
-//! # Key behaviours
+//! # Key behaviors
 //!
 //! * **No shell, ever.** The bridge is spawned with [`std::process::Command`] and an
 //!   argument array (currently zero arguments; the request travels on stdin).
