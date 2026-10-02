@@ -144,6 +144,14 @@ jobs:
       - name: test
         run: cargo test --workspace --locked
 
+      # Regression guard: a default WSL/systemd host has a soft RLIMIT_NOFILE of
+      # 1024. The held-fd bridge spawn used to call `F_DUPFD(fd, 1024)`, which fails
+      # with EINVAL at that limit and would make every authentication fail on a
+      # correctly configured install. Run the runner suite under that limit so a
+      # regression is caught in CI, not just by the in-test setrlimit.
+      - name: test (runner, default nofile limit, locked)
+        run: bash -c 'ulimit -n 1024; cargo test -p wsl-webauthn-runner --locked'
+
   windows:
     name: windows (bridge, msvc)
     runs-on: windows-latest

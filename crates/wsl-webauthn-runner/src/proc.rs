@@ -28,20 +28,22 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The lowest descriptor number used for the inheritable bridge fd handed to the child.
-///
-/// `F_DUPFD` never returns a descriptor below this, so it cannot collide with the
-/// runner's own stdio/pipes.
-const INHERIT_FD_MIN: RawFd = 1024;
-
 /// A bridge executable opened once and held, so hash→spawn cannot be raced.
 ///
 /// The bridge path is opened `O_RDONLY|O_NOFOLLOW|O_CLOEXEC`; the path itself is never
-/// executed. Instead the descriptor is `F_DUPFD`'d to an inheritable descriptor and the
-/// child is spawned via `/proc/self/fd/N`, so the kernel executes exactly the inode that
-/// was opened (and can be `fstat`ed) — a later swap of the path cannot change the image.
+/// executed. Instead the descriptor is `F_DUPFD_CLOEXEC`'d to the lowest free descriptor
+/// at/above `3` (skipping the runner's stdio), `FD_CLOEXEC` is cleared on the duplicate,
+/// and the child is spawned via `/proc/self/fd/N`, so the kernel executes exactly the
+/// inode that was opened (and can be `fstat`ed) — a later swap of the path cannot change
+/// the image.
 ///
-/// `O_CLOEXEC` is deliberately *not* set on the inherited descriptor: the WSL binfmt
+/// `F_DUPFD_CLOEXEC` (rather than `F_DUPFD`) is used because `F_DUPFD` fails with
+/// `EINVAL` whenever its minimum is at/above the *soft* `RLIMIT_NOFILE`; that limit is
+/// 1024 on a default WSL/systemd host, so a fixed high minimum such as 1024 would make
+/// every spawn fail before it starts. A low minimum also avoids colliding with an
+/// existing high-numbered descriptor in a long-lived host process.
+///
+/// `FD_CLOEXEC` is deliberately *not* set on the inherited descriptor: the WSL binfmt
 /// handler (`WSLInterop`, flags `PF`) needs the descriptor to survive into the child
 /// `/init` interpreter, and a `CLOEXEC` descriptor makes the interop exec fail with
 /// `EINVAL`. The descriptor is closed when this value drops.
@@ -74,15 +76,39 @@ impl TrustedFile {
         let file = unsafe { File::from_raw_fd(fd) };
         let (dev, ino) = stat_identity(file.as_raw_fd())?;
 
-        // `F_DUPFD` returns an inheritable (no `FD_CLOEXEC`) duplicate at/above
-        // `INHERIT_FD_MIN`; the original stays `CLOEXEC` and is closed when `file` drops.
-        // SAFETY: `F_DUPFD` takes the fd and a minimum; it returns a new owned fd or -1.
-        let dup = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, INHERIT_FD_MIN) };
+        // `F_DUPFD_CLOEXEC` returns the lowest free descriptor at/above 3 and, unlike
+        // `F_DUPFD`, does not fail when its minimum is at/above a low soft
+        // `RLIMIT_NOFILE` (1024 on a default WSL/systemd host). `FD_CLOEXEC` is then
+        // cleared so the descriptor survives `exec` into the WSL binfmt interpreter; the
+        // original stays `CLOEXEC` and closes when `file` drops.
+        // SAFETY: `F_DUPFD_CLOEXEC` takes the fd and a minimum; it returns a new owned
+        // fd or -1.
+        let dup = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
         if dup < 0 {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: `dup` is a fresh owned descriptor returned by `fcntl`.
         let inherit = unsafe { OwnedFd::from_raw_fd(dup) };
+        // Clear `FD_CLOEXEC` on the duplicate: it must be inherited by the child's
+        // interpreter (see the `TrustedFile` docs). The original descriptor is
+        // unaffected and remains `CLOEXEC`.
+        // SAFETY: F_GETFD/F_SETFD take an owned fd and an int; both always succeed for a
+        // valid descriptor and only read/modify the close-on-exec flag.
+        let flags = unsafe { libc::fcntl(inherit.as_raw_fd(), libc::F_GETFD) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: as above.
+        let rc = unsafe {
+            libc::fcntl(
+                inherit.as_raw_fd(),
+                libc::F_SETFD,
+                flags & !libc::FD_CLOEXEC,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
         let fd_path = PathBuf::from(format!("/proc/self/fd/{}", inherit.as_raw_fd()));
         Ok(TrustedFile {
             inherit,
@@ -303,16 +329,71 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     }
 
+    /// Lower this process's soft `RLIMIT_NOFILE` to at most `limit`.
+    ///
+    /// A default WSL/systemd host ships a soft limit of 1024, which is exactly the value
+    /// that made the old `F_DUPFD(fd, 1024)` held-fd spawn fail with `EINVAL` before the
+    /// fix. Reproducing that limit here keeps the regression meaningful on CI hosts with
+    /// a huge ambient limit. Only the soft limit is lowered (always permitted without
+    /// privilege); the hard limit is untouched, and restoring is unnecessary because the
+    /// lower value is what production sees.
+    fn lower_soft_nofile_to_at_most(limit: u64) {
+        // SAFETY: `getrlimit`/`setrlimit` read/write a local `rlimit`; lowering only the
+        // soft limit is always allowed for the calling process.
+        unsafe {
+            let mut rl: libc::rlimit = std::mem::zeroed();
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 {
+                panic!(
+                    "getrlimit(RLIMIT_NOFILE) failed: {}",
+                    io::Error::last_os_error()
+                );
+            }
+            if rl.rlim_cur > limit {
+                rl.rlim_cur = limit;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) != 0 {
+                    panic!(
+                        "setrlimit(RLIMIT_NOFILE, {limit}) failed: {}",
+                        io::Error::last_os_error()
+                    );
+                }
+            }
+        }
+    }
+
     /// L2-2: once the bridge is opened, replacing its path must not change the executed
     /// image — the held descriptor still points at the originally opened inode.
+    ///
+    /// The soft `RLIMIT_NOFILE` is lowered first so this exercises the default
+    /// WSL/systemd host limit under which the old `F_DUPFD(fd, 1024)` spawn failed.
     #[test]
     fn held_fd_exec_is_not_affected_by_path_replacement() {
+        lower_soft_nofile_to_at_most(1024);
         let dir = tempfile::TempDir::new().expect("tempdir");
         let path = dir.path().join("tool");
         write_exe(&path, "echo original");
 
         let trusted = TrustedFile::open(&path).expect("open bridge");
         let (dev, ino) = trusted.identity();
+
+        // The inherited duplicate must be a low, non-CLOEXEC descriptor so it survives
+        // into the WSL binfmt interpreter and cannot collide with a high fd in the host.
+        let inherit_fd = trusted.inherit_fd();
+        assert!(
+            (3..1024).contains(&inherit_fd),
+            "held fd {inherit_fd} must be a low inheritable descriptor"
+        );
+        // SAFETY: F_GETFD only reads the descriptor flags of a live owned fd.
+        let fd_flags = unsafe { libc::fcntl(inherit_fd, libc::F_GETFD) };
+        assert!(
+            fd_flags >= 0,
+            "F_GETFD failed: {}",
+            io::Error::last_os_error()
+        );
+        assert_eq!(
+            fd_flags & libc::FD_CLOEXEC,
+            0,
+            "the inherited descriptor must not be CLOEXEC (it must survive exec)"
+        );
 
         // Swap a different executable over the path after the open.
         let replacement = dir.path().join("replacement");
