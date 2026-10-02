@@ -48,9 +48,6 @@ pub const RP_NAME: &str = "sudo on WSL (wsl-webauthn-pam)";
 /// byte on the Linux side.
 pub const ORIGIN: &str = RP_ID;
 
-/// Wire/client-data protocol version, mirrored from the crate version.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
 /// Default Linux hard deadline for the whole authentication child process.
 pub const DEFAULT_AUTH_TIMEOUT_SECS: u64 = 60;
 
