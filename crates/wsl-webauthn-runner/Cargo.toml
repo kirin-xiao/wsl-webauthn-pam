@@ -13,12 +13,20 @@ name = "fake-bridge"
 path = "src/bin/fake_bridge.rs"
 test = false
 bench = false
+required-features = ["test-support"]
 
 [[bin]]
 name = "sigpipe-probe"
 path = "src/bin/sigpipe_probe.rs"
 test = false
 bench = false
+required-features = ["test-support"]
+
+[features]
+# Non-default seam exposing test-only constructors, knobs, and raw decoders
+# (without_interop_check, args, taskkill_program, parse_pid, decode_probe, and the
+# four decode_* helpers) so production callers cannot bypass the interop check.
+test-support = []
 
 [dependencies]
 wsl-webauthn-protocol = { path = "../wsl-webauthn-protocol" }
@@ -28,4 +36,6 @@ thiserror = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+# Self-dependency enabling the seams for this crate's unit and integration tests only.
+wsl-webauthn-runner = { path = ".", features = ["test-support"] }
 tempfile = "3"

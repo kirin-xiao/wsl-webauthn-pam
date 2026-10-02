@@ -392,9 +392,10 @@ impl RunnerResponse {
 
 /// A configured bridge invoker.
 ///
-/// Construct with [`Runner::new`] (or [`Runner::with_interop_path`] /
-/// [`Runner::without_interop_check`] for tests) and call [`Runner::probe`],
-/// [`Runner::enroll`], or [`Runner::authenticate`].
+/// Construct with [`Runner::new`] (or [`Runner::with_interop_path`]); call
+/// [`Runner::probe`], [`Runner::enroll`], or [`Runner::authenticate`]. The
+/// `without_interop_check`/`args`/`taskkill_program` seams are test support behind the
+/// non-default `test-support` feature.
 #[derive(Debug, Clone)]
 pub struct Runner {
     bridge: PathBuf,
@@ -435,6 +436,8 @@ impl Runner {
     /// Like [`Runner::new`] but skips the interop check entirely.
     ///
     /// **Test/harness only** — production callers must use the checked constructors.
+    /// Available only with the non-default `test-support` feature.
+    #[cfg(feature = "test-support")]
     pub fn without_interop_check(bridge: impl AsRef<Path>, win_mnt: impl AsRef<Path>) -> Runner {
         let mut runner = Runner::new(bridge, win_mnt);
         runner.check_interop = false;
@@ -442,6 +445,9 @@ impl Runner {
     }
 
     /// Enable or disable the interop pre-flight (builder form).
+    ///
+    /// Test support only: production callers must keep the pre-flight enabled.
+    #[cfg(feature = "test-support")]
     pub fn interop_check(mut self, enabled: bool) -> Self {
         self.check_interop = enabled;
         self
@@ -454,7 +460,9 @@ impl Runner {
     }
 
     /// Set the argument array passed to the bridge (test support; production bridges take
-    /// no arguments and receive their request on stdin).
+    /// no arguments and receive their request on stdin). Available only with the
+    /// non-default `test-support` feature.
+    #[cfg(feature = "test-support")]
     pub fn args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -469,7 +477,8 @@ impl Runner {
     ///
     /// Exposed so tests never invoke the real `taskkill.exe` found on WSL hosts; using
     /// an absolute Linux path (e.g. `/bin/false`) makes the escalation deterministic and
-    /// side-effect free.
+    /// side-effect free. Available only with the non-default `test-support` feature.
+    #[cfg(feature = "test-support")]
     pub fn taskkill_program(mut self, program: impl Into<std::ffi::OsString>) -> Self {
         self.taskkill_program = program.into();
         self
@@ -1334,13 +1343,18 @@ fn parse_pid_line(stderr: &[u8]) -> Option<u32> {
     rest.trim().parse::<u32>().ok().filter(|&pid| pid != 0)
 }
 
-/// Public wrapper over the bridge PID-line parser: returns the Windows PID if the first
-/// stderr line matched `PID <n>`.
+/// Test-support wrapper over the bridge PID-line parser: returns the Windows PID if the
+/// first stderr line matched `PID <n>`. Available only with the non-default
+/// `test-support` feature.
+#[cfg(feature = "test-support")]
 pub fn parse_pid(stderr: &[u8]) -> Option<u32> {
     parse_pid_line(stderr)
 }
 
 /// If `response` is a probe reply, return `(uv_platform_available, api_version)`.
+///
+/// Test support only (available with the non-default `test-support` feature).
+#[cfg(feature = "test-support")]
 pub fn decode_probe(response: &RunnerResponse) -> Option<(bool, u32)> {
     match response {
         RunnerResponse::Probe {
@@ -1467,6 +1481,8 @@ impl InteropCommand {
 ///
 /// Exposed (`#[doc(hidden)]`) so the `sigpipe-probe` helper binary can verify that a
 /// closed read end never delivers `SIGPIPE` to a `SIGPIPE=SIG_DFL` host process.
+/// Available only with the non-default `test-support` feature.
+#[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub fn test_write_fd(fd: std::os::fd::RawFd, bytes: &[u8]) -> std::io::Result<usize> {
     proc::write(fd, bytes)
