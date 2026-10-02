@@ -86,7 +86,10 @@ use wsl_webauthn_verifier::{
 };
 
 /// Default Windows mount root when neither the config nor `--win-mnt` supplies one.
-const DEFAULT_WIN_MNT: &str = "/mnt/c";
+///
+/// L7-5 = L16-9: re-exported from the store so the default has a single definition
+/// (`wsl_webauthn_store::Config::DEFAULT_WIN_MNT`); the CLI must not carry its own copy.
+const DEFAULT_WIN_MNT: &str = wsl_webauthn_store::Config::DEFAULT_WIN_MNT;
 /// Hard Linux deadline for a whole enrollment child process (plan §3).
 const ENROLL_DEADLINE: Duration = Duration::from_secs(180);
 
@@ -867,7 +870,7 @@ fn cmd_enroll(
 
     // Pin the bridge before the ceremony so the recorded hash corresponds to the exe
     // that will actually be launched.
-    let bridge_sha256 = sha256_hex_file(&config.bridge)
+    let bridge_sha256 = fsutil::sha256_hex_file(&config.bridge)
         .with_context(|| format!("hashing bridge {}", config.bridge.display()))?;
 
     let runner = Runner::new(&config.bridge, &config.win_mnt);
@@ -1230,7 +1233,7 @@ fn build_record(
             format: outcome.attestation.format.clone(),
             mode: mode.to_string(),
             verified,
-            leaf_sha256: outcome.attestation.leaf_sha256.map(|h| hex(&h)),
+            leaf_sha256: outcome.attestation.leaf_sha256.map(|h| fsutil::hex(&h)),
         },
         windows_identity,
         enrolled_at: enrolled_at.to_string(),
@@ -1316,15 +1319,15 @@ fn cmd_probe(bridge: Option<PathBuf>, win_mnt: Option<PathBuf>) -> anyhow::Resul
     if let Ok(user) = resolve_target_user(None)
         && let Ok(record) = Store::system().load(&user.name)
     {
-        match sha256_hex_file(&config.bridge) {
+        match fsutil::sha256_hex_file(&config.bridge) {
             Ok(actual) if actual == record.bridge_sha256 => {
                 println!("pin:     OK (matches the enrolled bridge)");
             }
             Ok(actual) => {
                 println!(
                     "pin:     MISMATCH — enrolled {}, on-disk {}",
-                    short_hash(&record.bridge_sha256),
-                    short_hash(&actual)
+                    fsutil::short_hash(&record.bridge_sha256),
+                    fsutil::short_hash(&actual)
                 );
                 ok = false;
             }
@@ -1474,7 +1477,10 @@ fn cmd_status_one(store: &Store, name: &str) -> anyhow::Result<i32> {
                 short_credential_id_b64(&record.credential_id)
             );
             println!("  bridge_path: {}", record.bridge_path);
-            println!("  bridge_sha256: {}", short_hash(&record.bridge_sha256));
+            println!(
+                "  bridge_sha256: {}",
+                fsutil::short_hash(&record.bridge_sha256)
+            );
             match &record.windows_identity {
                 Some(identity) if !identity.account.is_empty() => {
                     // Never print the SID: it is machine/user-identifying forensic data.
@@ -1796,21 +1802,6 @@ fn random_bytes(len: usize) -> Vec<u8> {
     buf
 }
 
-/// Lowercase hex encoding.
-fn hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
-
-/// SHA-256 of a file as lowercase hex.
-fn sha256_hex_file(path: &Path) -> anyhow::Result<String> {
-    let bytes = std::fs::read(path)?;
-    Ok(hex(&Sha256::digest(&bytes)))
-}
-
 /// A short, non-reversible preview of a credential id.
 fn short_credential_id(bytes: &[u8]) -> String {
     short_credential_id_b64(&wsl_webauthn_protocol::b64u_encode(bytes))
@@ -1820,16 +1811,6 @@ fn short_credential_id(bytes: &[u8]) -> String {
 fn short_credential_id_b64(b64: &str) -> String {
     let preview: String = b64.chars().take(12).collect();
     if b64.len() > 12 {
-        format!("{preview}…")
-    } else {
-        preview
-    }
-}
-
-/// A short preview of a hex digest (first 12 chars).
-fn short_hash(hex: &str) -> String {
-    let preview: String = hex.chars().take(12).collect();
-    if hex.len() > 12 {
         format!("{preview}…")
     } else {
         preview
@@ -2299,8 +2280,6 @@ mod tests {
     fn short_previews_are_bounded() {
         assert_eq!(short_credential_id_b64("abcdefghijklmnop"), "abcdefghijkl…");
         assert_eq!(short_credential_id_b64("short"), "short");
-        assert_eq!(short_hash("0123456789abcdef"), "0123456789ab…");
-        assert_eq!(short_hash("abc"), "abc");
     }
 
     // ---- UUID / timestamp helpers ----
