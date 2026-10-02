@@ -1119,6 +1119,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "wsl-webauthn-protocol",
+ "wsl-webauthn-runner",
 ]
 
 [[package]]

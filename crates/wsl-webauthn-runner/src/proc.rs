@@ -20,8 +20,126 @@
 
 #![allow(unsafe_code)]
 
+use std::fs::File;
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// The lowest descriptor number used for the inheritable bridge fd handed to the child.
+///
+/// `F_DUPFD` never returns a descriptor below this, so it cannot collide with the
+/// runner's own stdio/pipes.
+const INHERIT_FD_MIN: RawFd = 1024;
+
+/// A bridge executable opened once and held, so hash→spawn cannot be raced.
+///
+/// The bridge path is opened `O_RDONLY|O_NOFOLLOW|O_CLOEXEC`; the path itself is never
+/// executed. Instead the descriptor is `F_DUPFD`'d to an inheritable descriptor and the
+/// child is spawned via `/proc/self/fd/N`, so the kernel executes exactly the inode that
+/// was opened (and can be `fstat`ed) — a later swap of the path cannot change the image.
+///
+/// `O_CLOEXEC` is deliberately *not* set on the inherited descriptor: the WSL binfmt
+/// handler (`WSLInterop`, flags `PF`) needs the descriptor to survive into the child
+/// `/init` interpreter, and a `CLOEXEC` descriptor makes the interop exec fail with
+/// `EINVAL`. The descriptor is closed when this value drops.
+pub(crate) struct TrustedFile {
+    /// Inheritable duplicate referenced by `fd_path` and inherited by the child. Keeps
+    /// the opened inode alive and is the object of the identity recheck.
+    inherit: OwnedFd,
+    fd_path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl TrustedFile {
+    /// Open `path` read-only, refusing symbolic links.
+    pub(crate) fn open(path: &Path) -> io::Result<TrustedFile> {
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+        // SAFETY: `cpath` is a valid NUL-terminated C string and the flags are constants.
+        // `open` takes no ownership of the string.
+        let fd = unsafe {
+            libc::open(
+                cpath.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is a fresh owned descriptor from `open`, so `File` may own it.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let (dev, ino) = stat_identity(file.as_raw_fd())?;
+
+        // `F_DUPFD` returns an inheritable (no `FD_CLOEXEC`) duplicate at/above
+        // `INHERIT_FD_MIN`; the original stays `CLOEXEC` and is closed when `file` drops.
+        // SAFETY: `F_DUPFD` takes the fd and a minimum; it returns a new owned fd or -1.
+        let dup = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, INHERIT_FD_MIN) };
+        if dup < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `dup` is a fresh owned descriptor returned by `fcntl`.
+        let inherit = unsafe { OwnedFd::from_raw_fd(dup) };
+        let fd_path = PathBuf::from(format!("/proc/self/fd/{}", inherit.as_raw_fd()));
+        Ok(TrustedFile {
+            inherit,
+            fd_path,
+            dev,
+            ino,
+        })
+    }
+
+    /// `(st_dev, st_ino)` of the held descriptor.
+    pub(crate) fn identity(&self) -> (u64, u64) {
+        (self.dev, self.ino)
+    }
+
+    /// Path to the held descriptor, suitable for `Command::new` (`/proc/self/fd/N`).
+    pub(crate) fn fd_path(&self) -> &Path {
+        &self.fd_path
+    }
+
+    /// The inheritable descriptor that the child will execute.
+    fn inherit_fd(&self) -> RawFd {
+        self.inherit.as_raw_fd()
+    }
+}
+
+/// `fstat(fd)` → `(st_dev, st_ino)`, async-signal-safe.
+fn stat_identity(fd: RawFd) -> io::Result<(u64, u64)> {
+    // SAFETY: `fstat` writes into our local `stat` and only reads the fd.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstat(fd, &mut st) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((st.st_dev as u64, st.st_ino as u64))
+}
+
+/// Install a `pre_exec` guard that re-checks the held bridge descriptor immediately
+/// before `execve`.
+///
+/// This is belt-and-braces on top of the held-fd spawn: the executed object is already
+/// the opened descriptor, so the only race left is another thread reusing the descriptor
+/// number. The guard stats the inherited fd in the forked child and fails the exec with
+/// `ESTALE` if either the descriptor is gone or its `(dev, ino)` no longer matches what
+/// was opened.
+pub(crate) fn set_spawn_guard(command: &mut Command, trusted: &TrustedFile) {
+    let fd = trusted.inherit_fd();
+    let (dev, ino) = trusted.identity();
+    // SAFETY: `pre_exec` runs in the forked child between `fork` and `execve`. The closure
+    // calls only `fstat` (async-signal-safe) and produces a `Repr::Os` `io::Error` (no
+    // allocation), so it is safe in that context.
+    unsafe {
+        command.pre_exec(move || match stat_identity(fd) {
+            Ok(got) if got == (dev, ino) => Ok(()),
+            _ => Err(io::Error::from_raw_os_error(libc::ESTALE)),
+        });
+    }
+}
 
 /// Set `O_NONBLOCK` on `fd`.
 pub(crate) fn set_nonblocking(fd: RawFd) -> io::Result<()> {
@@ -172,5 +290,68 @@ pub(crate) fn thread_cpu_time() -> std::time::Duration {
             return std::time::Duration::ZERO;
         }
         std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn write_exe(path: &Path, body: &str) {
+        std::fs::write(path, format!("#!/bin/sh\n{body}\n")).expect("write helper");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    /// L2-2: once the bridge is opened, replacing its path must not change the executed
+    /// image — the held descriptor still points at the originally opened inode.
+    #[test]
+    fn held_fd_exec_is_not_affected_by_path_replacement() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("tool");
+        write_exe(&path, "echo original");
+
+        let trusted = TrustedFile::open(&path).expect("open bridge");
+        let (dev, ino) = trusted.identity();
+
+        // Swap a different executable over the path after the open.
+        let replacement = dir.path().join("replacement");
+        write_exe(&replacement, "echo replacement");
+        std::fs::rename(&replacement, &path).expect("replace path");
+
+        // The held fd still reads the original bytes, and the identity is unchanged.
+        assert_eq!(
+            std::fs::read(trusted.fd_path()).expect("read held fd"),
+            b"#!/bin/sh\necho original\n"
+        );
+        assert_eq!(
+            stat_identity(trusted.inherit_fd()).expect("fstat held fd"),
+            (dev, ino),
+            "held descriptor identity drifted"
+        );
+
+        // Executing the held descriptor runs the *original* program, not the replacement.
+        let mut command = Command::new(trusted.fd_path());
+        set_spawn_guard(&mut command, &trusted);
+        let out = command.output().expect("exec held fd");
+        assert!(out.status.success(), "held-fd exec failed: {out:?}");
+        assert_eq!(
+            out.stdout, b"original\n",
+            "held fd must execute the originally opened inode, not the path replacement"
+        );
+
+        // Belt-and-braces: the pre_exec guard fails closed if the fd is gone.
+        // SAFETY: closing an owned descriptor that we are about to abandon.
+        unsafe {
+            libc::close(trusted.inherit_fd());
+        }
+        let mut command = Command::new("/bin/true");
+        set_spawn_guard(&mut command, &trusted);
+        let err = command
+            .spawn()
+            .expect_err("guard must fail when the held descriptor is gone");
+        assert_eq!(err.raw_os_error(), Some(libc::ESTALE), "{err:?}");
+        // Avoid a double-close of the same fd when `trusted` drops.
+        std::mem::forget(trusted);
     }
 }
