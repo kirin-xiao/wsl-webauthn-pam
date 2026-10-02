@@ -5,8 +5,10 @@
 //! `rename(2)`d over the destination, so a crash leaves either the old or the new
 //! file, never a truncated one.
 //!
-//! Everything here is implemented with safe `std` APIs (this crate is
-//! `#![deny(unsafe_code)]`):
+//! Everything here is implemented with safe `std` APIs except a tiny, audited `raw`
+//! submodule (the crate is `#![deny(unsafe_code)]`): [`std`] has no `openat`/`renameat`,
+//! which are required to bind the destination's parent directory by descriptor and close
+//! the parent-swap TOCTOU window in [`atomic_write`] (L12-11).
 //!
 //! * [`lstat_opt`] uses [`std::fs::symlink_metadata`] — the safe `lstat(2)`.
 //! * `O_NOFOLLOW`/`O_CLOEXEC` are applied through
@@ -16,14 +18,88 @@
 //!
 //! Deliberately **no shell**: this module only performs direct syscalls.
 
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs::{File, Metadata, OpenOptions, Permissions};
 use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest as _, Sha256};
+
+/// Raw `*at(2)` syscalls bound to a held parent directory descriptor.
+///
+/// This is the **only** `unsafe` in the module: `std` exposes no `openat`/`renameat`, which
+/// [`atomic_write`] needs to create the temp file and rename it relative to a
+/// dev/ino-verified parent directory (L12-11). The wrappers are small and each documents
+/// the ownership invariant it discharges, mirroring `wsl-webauthn-store`'s `sys` module so
+/// callers never write `unsafe`.
+mod raw {
+    #![allow(unsafe_code)]
+
+    use std::ffi::{CString, OsStr};
+    use std::fs::File;
+    use std::io;
+    use std::os::fd::{FromRawFd as _, RawFd};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    /// Convert a single path component to a NUL-terminated C string.
+    fn cstr(name: &OsStr) -> io::Result<CString> {
+        CString::new(name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains NUL byte"))
+    }
+
+    /// `openat(dirfd, name, O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC, mode)`.
+    ///
+    /// `name` must be a single component (no `/`); the temp file is created exactly beside
+    /// the destination, relative to the already-verified parent descriptor.
+    pub(super) fn create_at(dirfd: RawFd, name: &OsStr, mode: u32) -> io::Result<File> {
+        let c = cstr(name)?;
+        let flags =
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: `dirfd` is an owned directory descriptor; `c` is a valid NUL-terminated
+        // single component; `mode` is applied through umask and pinned afterwards by
+        // `fchmod`. `openat` returns an owned descriptor or -1.
+        let fd = unsafe { libc::openat(dirfd, c.as_ptr(), flags, mode as libc::mode_t) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is a fresh descriptor this call owns exclusively; nothing else
+        // observes it, so handing ownership to `File` cannot double-close.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    /// `renameat(olddirfd, old, newdirfd, new)`.
+    pub(super) fn rename_at(
+        olddirfd: RawFd,
+        old: &OsStr,
+        newdirfd: RawFd,
+        new: &OsStr,
+    ) -> io::Result<()> {
+        let old_c = cstr(old)?;
+        let new_c = cstr(new)?;
+        // SAFETY: both are valid NUL-terminated single components; the directory
+        // descriptors are owned and held for the duration of the call.
+        let rc = unsafe { libc::renameat(olddirfd, old_c.as_ptr(), newdirfd, new_c.as_ptr()) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// `unlinkat(dirfd, name, 0)`: remove a single component relative to a held directory.
+    pub(super) fn unlink_at(dirfd: RawFd, name: &OsStr) -> io::Result<()> {
+        let c = cstr(name)?;
+        // SAFETY: as in `rename_at`; `unlinkat` never follows a final symlink.
+        let rc = unsafe { libc::unlinkat(dirfd, c.as_ptr(), 0) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
 
 /// Monotonic suffix for temporary files, so concurrent installers never collide.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -104,23 +180,19 @@ fn temp_path(dir: &Path) -> PathBuf {
     dir.join(format!("{TEMP_MARKER}.{}.{n}", std::process::id()))
 }
 
-/// Atomically replace `path` with `bytes`, pinned to `mode`.
+/// Open `parent` as a directory bound to a descriptor, re-verifying its identity.
 ///
-/// Refuses a symlinked destination (or a symlinked parent), writes a temp file in the
-/// same directory, `fchmod`s it exactly, `fsync`s it, then `rename(2)`s it into place
-/// and `fsync`s the directory. The temp file is removed on every error path.
-pub(crate) fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("path has no parent directory: {}", path.display()),
-        )
-    })?;
-    let pmd = lstat(parent)?;
-    if pmd.file_type().is_symlink() {
+/// `before` is the metadata from the caller's `lstat`. An explicit `O_NOFOLLOW` flag makes
+/// the kernel refuse a symlinked parent (`ELOOP`) rather than silently follow it, and the
+/// opened descriptor is `fstat`ed and compared `(dev, ino)` with `before`, so a directory
+/// swapped in between the caller's `lstat` and this open is rejected (L12-11). The returned
+/// `File` owns the descriptor and must stay alive while the temp file is created and
+/// renamed relative to it.
+fn open_checked_dir(parent: &Path, before: &Metadata) -> io::Result<File> {
+    if before.file_type().is_symlink() {
         return Err(symlink_error(parent, "destination directory"));
     }
-    if !pmd.is_dir() {
+    if !before.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
@@ -129,6 +201,50 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> io::Result<(
             ),
         ));
     }
+    let dir = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOCTTY)
+        .open(parent)
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("opening destination directory {}: {e}", parent.display()),
+            )
+        })?;
+    let after = dir.metadata()?;
+    if after.dev() != before.dev() || after.ino() != before.ino() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path changed during open: {}", parent.display()),
+        ));
+    }
+    Ok(dir)
+}
+
+/// Atomically replace `path` with `bytes`, pinned to `mode`.
+///
+/// Refuses a symlinked destination or a symlinked parent, and binds the parent directory by
+/// descriptor (see [`open_checked_dir`]): the temp file is created and renamed via
+/// `openat`/`renameat` relative to the held, `(dev, ino)`-verified parent descriptor, so a
+/// parent directory swapped between the `lstat` and the rename is rejected instead of being
+/// written into (L12-11, mirroring the store's `open_checked_dir`).
+///
+/// The temp file is `fchmod`ed exactly, `fsync`ed, then `renameat`ed into place, and the
+/// directory is `fsync`ed on success; it is removed on every error path.
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path has no parent directory: {}", path.display()),
+        )
+    })?;
+    let dest_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path has no file name: {}", path.display()),
+        )
+    })?;
+    let pmd = lstat(parent)?;
     if let Some(md) = lstat_opt(path)? {
         if md.file_type().is_symlink() {
             return Err(symlink_error(path, "destination"));
@@ -141,29 +257,37 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> io::Result<(
         }
     }
 
+    // Bind the parent by descriptor so the checks above cannot be invalidated by a
+    // directory swapped in before the create/rename below.
+    let dir = open_checked_dir(parent, &pmd)?;
+    let dir_fd = dir.as_raw_fd();
+
     let temp = temp_path(parent);
+    let temp_name: OsString = temp
+        .file_name()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("temporary path has no file name: {}", temp.display()),
+            )
+        })?
+        .to_os_string();
     let result = (|| -> io::Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(mode)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOCTTY)
-            .open(&temp)?;
+        let mut file = raw::create_at(dir_fd, &temp_name, mode)?;
         file.write_all(bytes)?;
         // `mode` at creation is filtered through umask; pin it exactly.
         file.set_permissions(Permissions::from_mode(mode))?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&temp, path)?;
+        raw::rename_at(dir_fd, &temp_name, dir_fd, dest_name)?;
         // Persist the directory entry (best effort: some filesystems reject fsync on a
         // directory, which is not fatal for correctness of the rename itself).
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
-        }
+        let _ = dir.sync_all();
         Ok(())
     })();
     if result.is_err() {
-        let _ = std::fs::remove_file(&temp);
+        // Best effort, relative to the held descriptor so it cannot be redirected.
+        let _ = raw::unlink_at(dir_fd, &temp_name);
     }
     result
 }
@@ -365,6 +489,66 @@ mod tests {
         // The real file must be untouched and the link must still be a link.
         assert_eq!(std::fs::read(&target).unwrap(), b"original");
         assert!(lstat(&link).unwrap().file_type().is_symlink());
+    }
+
+    /// L12-11: `atomic_write` must bind the parent directory by descriptor.
+    ///
+    /// `open_checked_dir` is the only place the parent `(dev, ino)` is re-verified, so a
+    /// direct unit test of it against a swapped-in directory is the deterministic check of
+    /// the new behaviour (a race from a single test thread cannot hit the window reliably).
+    #[test]
+    fn atomic_write_rejects_swapped_parent_dir() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("dir");
+        std::fs::create_dir(&dir).unwrap();
+        // `before` models the parent captured by `atomic_write`'s pre-open `lstat`.
+        let before = lstat(&dir).unwrap();
+
+        // Replace the directory at the same path with a different inode, as an attacker
+        // would between the lstat and the open. Renaming the original away (rather than
+        // `remove_dir`) keeps its inode alive, so the filesystem cannot hand the new
+        // `create_dir` the same (dev, ino) and make this assertion non-deterministic.
+        std::fs::rename(&dir, tmp.path().join("original")).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        assert_ne!(
+            (lstat(&dir).unwrap().dev(), lstat(&dir).unwrap().ino()),
+            (before.dev(), before.ino()),
+            "the swap must produce a different inode"
+        );
+
+        let err = open_checked_dir(&dir, &before).unwrap_err();
+        assert!(err.to_string().contains("changed during open"), "{err}");
+
+        // The same directory (unswapped) passes the check and can be written through.
+        let after = open_checked_dir(&dir, &lstat(&dir).unwrap());
+        assert!(after.is_ok(), "an unswapped parent must be accepted");
+    }
+
+    #[test]
+    fn atomic_write_refuses_symlinked_parent_dir() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        symlink(&real, &link).unwrap();
+
+        // `link/f` would follow the parent symlink without the O_NOFOLLOW binding.
+        let err = atomic_write(&link.join("f"), b"x", 0o600).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(!real.join("f").exists());
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_without_leaking_temp() {
+        // The descriptor-relative create/rename must still leave exactly one file and no
+        // `.wsl-webauthn-tmp` siblings (regression guard for the `openat`/`renameat` path).
+        let dir = TempDir::new().unwrap();
+        let dst = dir.path().join("f");
+        atomic_write(&dst, b"one", 0o600).unwrap();
+        atomic_write(&dst, b"two", 0o600).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"two");
+        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(entries.len(), 1, "a temp file leaked");
     }
 
     #[test]
