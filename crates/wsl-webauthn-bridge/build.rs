@@ -1,12 +1,9 @@
 //! Embed a Windows `VERSIONINFO` resource into `WSLWebAuthnBridge.exe`.
 //!
-//! The Windows WebAuthn prompt can surface a "Requested by <name> (<publisher>)"
-//! line sourced from the calling executable's version resource; without one the
-//! dialog shows only the credential identity. This is a UX-only concern: the
-//! resource is never a trust input (the Linux side pins the whole `.exe` by
-//! SHA-256), so resource compilation is deliberately **best-effort** and never
-//! fails the build. If no resource compiler is found, the bridge is built without
-//! one.
+//! File metadata for the executable (Explorer → Properties → Details); it does not
+//! affect the Windows Hello prompt and carries no trust — the Linux side pins the whole
+//! `.exe` by SHA-256. Compilation is best-effort: if no resource compiler is found, the
+//! bridge is built without one.
 //!
 //! Gated to Windows targets. A native MSVC build uses `rc.exe`; a GNU
 //! (`*-pc-windows-gnu`) cross-build from Linux uses the matching

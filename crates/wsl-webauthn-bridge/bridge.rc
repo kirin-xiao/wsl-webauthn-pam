@@ -1,9 +1,7 @@
 // Version resource for WSLWebAuthnBridge.exe.
 //
-// The Windows WebAuthn prompt's "Requested by <name> (<publisher>)" line is sourced
-// from the calling executable's version resource (documented in microsoft/webauthn's
-// `webauthn.h`, and relied on by the DEF CON "Passkeys Pwned" analysis). Embedding one
-// gives the prompt a human-readable source instead of a bare path.
+// File metadata for the executable (Explorer -> Properties -> Details); it does not
+// affect the Windows Hello prompt.
 //
 // `__VERSION__` / `__VERSION_COMMAS__` are substituted by build.rs from the crate
 // version. This file is LF-only (the repo forbids CR in tracked text files).

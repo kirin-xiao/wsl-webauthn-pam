@@ -248,22 +248,16 @@ class-only match is used.
 
 ## Bridge version resource
 
-The Windows WebAuthn prompt can surface a "Requested by <name> (<publisher>)" line
-sourced from the **calling executable's version resource** (documented in
-`microsoft/webauthn`'s `webauthn.h`, and used by the DEF CON "Passkeys Pwned" work).
-`WSLWebAuthnBridge.exe` originally carried no resource, so the prompt could not name its
-requester.
+The Windows WebAuthn (platform) prompt does **not** surface a "Requested by <name>
+(<publisher>)" line on this host, with **or** without an embedded executable resource;
+the displayed text remains only the credential identity (`Passkey for <RP_ID>`).
 
-`crates/wsl-webauthn-bridge/build.rs` now compiles `bridge.rc` into a `VERSIONINFO`
-resource for Windows targets (`rc.exe` for MSVC; `windres` + a direct linker argument for
-the GNU cross target — a resource-only object in a `static` archive is *not* pulled in, so
-the object is passed to the linker directly). The build is best-effort: if no resource
-compiler is found, the bridge is produced unchanged. The cross-built exe was checked to
-contain a `.rsrc` section and the UTF-16 `FileDescription`/`ProductName` strings.
-
-This is UX-only and carries no trust: the Linux side pins the whole `.exe` by SHA-256, so
-the resource cannot influence verification. Whether this Windows build renders the line,
-and exactly how, still needs confirmation on a real host.
+`crates/wsl-webauthn-bridge/build.rs` compiles `bridge.rc` into a `VERSIONINFO` resource
+for Windows targets: file metadata for the `.exe` (Explorer → Properties → Details), with
+no effect on the Windows Hello prompt. The build is best-effort: if no resource compiler is
+found, the bridge is produced without one. It carries no trust — the Linux side pins the
+whole `.exe` by SHA-256 — and changing the `.exe` bytes means an in-place upgrade requires
+re-enrollment (which re-pins the digest).
 
 ## Not exercised on this host
 

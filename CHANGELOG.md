@@ -27,8 +27,7 @@ Linux side.
 - WSL interop runner with bounded IO, a deadline, `SIGKILL` +
   best-effort `taskkill.exe` escalation, and a fast-fail interop pre-flight.
 - `WSLWebAuthnBridge.exe`: the Windows ceremony driver over dynamic
-  `webauthn.dll` FFI, carrying a `VERSIONINFO` resource so the WebAuthn prompt can
-  name its requester.
+  `webauthn.dll` FFI, carrying a `VERSIONINFO` resource (file metadata).
 - Packaging and CI: `pam-auth-update` profile (`Default: no`), `install.sh`
   shim, `Makefile`, and a release workflow producing per-architecture tarballs
   plus `SHA256SUMS`.
