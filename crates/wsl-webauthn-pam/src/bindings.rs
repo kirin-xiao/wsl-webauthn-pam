@@ -15,6 +15,13 @@
 
 #![allow(non_camel_case_types)]
 #![allow(unsafe_code)]
+// This module deliberately mirrors the full slice of `<security/pam_*.h>` the
+// module *could* use, not only the entries the current source calls: a constant
+// such as `PAM_ERROR_MSG` documents the ABI even when only a cfg(test) layout
+// check touches it. Now that the module is `pub(crate)` (L6-7) those entries are
+// no longer externally reachable, so silence the resulting dead-code warnings
+// rather than deleting the ABI mirror.
+#![allow(dead_code)]
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 

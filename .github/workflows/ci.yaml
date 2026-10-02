@@ -9,7 +9,12 @@ name: CI
 #   lint        linux: rustfmt + clippy(--all-targets -D warnings)
 #   msrv        linux: cargo check --all-targets on the declared 1.88.0 floor
 #   build       linux: cargo build --workspace --locked (links the pam cdylib)
-#   test        linux: cargo test --workspace --locked (dlopen/pam_start/vectors)
+#   test        linux: cargo test --workspace --locked (dlopen/pam_start/vectors);
+#                      WSL_WEBAUTHN_REQUIRE_LIBPAM=1 makes the libpam/ABI tiers
+#                      FAIL (not skip) if the .so or libpam is missing (L14-6)
+#   pam-ffi     linux: C host (dlopen + real pam_start) with a provisioned store
+#                      in a user+mount namespace; success, deny, and concurrent
+#                      paths (L9-9/L14-6)
 #   windows     windows-latest (msvc): bridge clippy + unit tests
 #   windows-gnu ubuntu: cross-build WSLWebAuthnBridge.exe for x86_64-pc-windows-gnu
 #   aarch64     ubuntu-24.04-arm: native release build (really links the cdylib)
@@ -142,7 +147,14 @@ jobs:
       - name: Cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      # L14-6: this gate makes the libpam (`pam_start`) and ABI (`dlopen`) tiers
+      # FAIL rather than silently skip when the built `.so` (or libpam itself) is
+      # absent. Without it a locate-library regression would leave CI green while
+      # never loading the module. On a dev box the variable is unset, so the same
+      # tests keep skipping.
       - name: test
+        env:
+          WSL_WEBAUTHN_REQUIRE_LIBPAM: "1"
         run: cargo test --workspace --locked
 
       # Regression guard: a default WSL/systemd host has a soft RLIMIT_NOFILE of
@@ -152,6 +164,51 @@ jobs:
       # regression is caught in CI, not just by the in-test setrlimit.
       - name: test (runner, default nofile limit, locked)
         run: bash -c 'ulimit -n 1024; cargo test -p wsl-webauthn-runner --locked'
+
+  # L9-9/L14-6: a *non-Rust* host for the module. It compiles
+  # `crates/wsl-webauthn-pam/tests/c_host/pam_host.c`, dlopen(3)s the built cdylib
+  # and calls the entry points, then drives the real libpam
+  # (`pam_start_confdir` + `pam_authenticate`) with SIGPIPE reset to SIG_DFL —
+  # the exact host disposition under which the audit's two availability defects
+  # (L9-1, L9-2) would surface. The provisioned tier gives the module a tempdir
+  # store and a dynamic fake bridge inside a mount namespace (private /etc), so
+  # the success path, the conversation prompt, and concurrent calls with distinct
+  # `debug` arguments are all exercised without touching the host /etc.
+  pam-ffi:
+    name: linux (c host, real pam_start)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # libpam0g-dev supplies the headers and `-lpam` the C host links against.
+      # (The WSLInterop registration the module's runner pre-flight reads is
+      # planted inside the test's mount namespace, not the runner's.)
+      - name: Install libpam0g-dev
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+
+      - name: Cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # Ubuntu 24.04 (`ubuntu-latest`) restricts unprivileged user namespaces via
+      # AppArmor, which blocks `unshare -rm`. Lift it for this disposable runner;
+      # the harness still falls back to passwordless `sudo unshare -m` if the
+      # sysctl is absent or a no-op, so this is an optimisation, not a hard
+      # requirement.
+      - name: Allow unprivileged user namespaces (ubuntu-24.04 workaround)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      # `--all-targets` builds the C-host test, the dynamic fake-bridge example,
+      # and the cdylib it dlopens. The gate makes the run fail closed.
+      - name: build targets (incl. the dynamic bridge example)
+        run: cargo build -p wsl-webauthn-pam --locked --all-targets
+
+      - name: real-libpam + C-host tier
+        env:
+          WSL_WEBAUTHN_REQUIRE_LIBPAM: "1"
+        run: cargo test -p wsl-webauthn-pam --locked --test c_host -- --nocapture
 
   windows:
     name: windows (bridge, msvc)

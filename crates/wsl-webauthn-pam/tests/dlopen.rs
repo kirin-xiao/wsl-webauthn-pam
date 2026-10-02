@@ -10,11 +10,15 @@
 //!   case for a normal `cargo test`, locally or in CI);
 //! * **skips with a clear, printed reason** only when the artifact is genuinely absent
 //!   (e.g. a filtered build that never compiled the cdylib), so a stale checkout does
-//!   not produce a spurious failure.
+//!   not produce a spurious failure — *unless* `WSL_WEBAUTHN_REQUIRE_LIBPAM=1` is set
+//!   (CI does), in which case a missing artifact is a hard failure (L14-6).
 //!
-//! The check does not depend on `CI`; in CI it runs and must pass.
+//! The check does not depend on `CI`; in CI it runs and must pass. A richer,
+//! non-Rust `dlopen` that also *calls* the entry points lives in `tests/c_host.rs`.
 
 #![cfg(target_os = "linux")]
+
+mod gate;
 
 use std::ffi::{CString, c_void};
 use std::path::PathBuf;
@@ -78,11 +82,11 @@ fn locate_library() -> Option<PathBuf> {
 fn cdylib_exports_all_six_pam_symbols() {
     let Some(lib) = locate_library() else {
         // Genuinely absent (e.g. a filtered build that never compiled the cdylib).
-        // Skip with a printed reason rather than failing; a normal `cargo test` builds
-        // the cdylib, so this path is not taken locally or in CI.
-        let msg = "libpam_wsl_webauthn.so not found; run `cargo build -p wsl-webauthn-pam` \
-                   (or `make test`) to exercise this ABI check";
-        eprintln!("skipping dlopen test: {msg}");
+        // Skip with a printed reason, or fail under the CI gate.
+        gate::enforce(
+            "libpam_wsl_webauthn.so not found; run `cargo build -p wsl-webauthn-pam` \
+             (or `make test`) to exercise this ABI check",
+        );
         return;
     };
 
