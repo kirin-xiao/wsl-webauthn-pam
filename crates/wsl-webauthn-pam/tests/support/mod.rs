@@ -187,6 +187,8 @@ pub enum RecordReply {
     Ok(Box<CredentialRecord>),
     /// Return [`StoreError::NotFound`].
     NotFound,
+    /// Return [`StoreError::Corrupt`] for a path carrying a username leaf.
+    Corrupt(PathBuf),
     /// Return a generic [`StoreError::Io`].
     Other(String),
 }
@@ -212,6 +214,10 @@ impl RecordReply {
             RecordReply::Ok(r) => Ok((**r).clone()),
             RecordReply::NotFound => Err(StoreError::NotFound {
                 path: PathBuf::from("/etc/wsl_webauthn/credentials/user.json"),
+            }),
+            RecordReply::Corrupt(path) => Err(StoreError::Corrupt {
+                path: path.clone(),
+                message: "synthetic corrupt record".to_string(),
             }),
             RecordReply::Other(m) => Err(StoreError::Io {
                 path: PathBuf::from("/etc/wsl_webauthn/credentials/user.json"),

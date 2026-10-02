@@ -255,6 +255,35 @@ pub enum StoreError {
     },
 }
 
+impl StoreError {
+    /// A stable, non-identifying token for the error's *kind*.
+    ///
+    /// Unlike [`Display`](std::fmt::Display), this never embeds an absolute path or a
+    /// username. It exists for the PAM module, whose audit records go to `authpriv`
+    /// syslog: logging the full `Display` would disclose the record path — and therefore
+    /// the username — on every failure (L8-9). The CLI keeps using `Display` for operator
+    /// diagnostics. The spelling of each token is part of this API and must not change.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            StoreError::InvalidUsername => "invalid_username",
+            StoreError::SymlinkedPath { .. } => "symlink",
+            StoreError::NotRegularFile { .. } => "not_regular_file",
+            StoreError::BadOwnership { .. } => "bad_ownership",
+            StoreError::InsecureBase { .. } => "insecure_base",
+            StoreError::NotFound { .. } => "not_found",
+            StoreError::AlreadyExists { .. } => "already_exists",
+            StoreError::Corrupt { .. } => "record_corrupt",
+            StoreError::TooLarge { .. } => "too_large",
+            StoreError::PathChanged { .. } => "path_changed",
+            StoreError::RecordUserMismatch { .. } => "record_user_mismatch",
+            StoreError::ConfigMissing { .. } => "config_missing",
+            StoreError::Config { .. } => "config_invalid",
+            StoreError::Encode { .. } => "encode",
+            StoreError::Io { .. } => "io",
+        }
+    }
+}
+
 /// A credential store rooted at an arbitrary base directory.
 ///
 /// In production use [`Store::system`], which is rooted at [`SYSTEM_BASE`] and expects

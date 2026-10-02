@@ -168,6 +168,36 @@ fn store_error_is_authinfo_unavail() {
     assert_eq!(run_basic(&mut seam, &deps, 0, &[]), PAM_AUTHINFO_UNAVAIL);
 }
 
+/// L8-9: a store failure is logged by its stable *kind*, never the full `Display`. The
+/// record path embeds the username, so the audit reason must not leak the leaf or the
+/// `/etc/wsl_webauthn/...` layout into `authpriv`.
+#[test]
+fn corrupt_store_reason_is_kind_only_and_has_no_username_or_path() {
+    let (_f, mut seam, mut deps) = happy();
+    deps.store = None;
+    deps.config = ConfigReply::Ok(dummy_config());
+    deps.record = RecordReply::Corrupt(std::path::PathBuf::from(
+        "/etc/wsl_webauthn/credentials/alice.json",
+    ));
+    let outcome = authenticate(&mut seam, &deps, 0, &ModuleArgs::default());
+    match outcome {
+        AuthOutcome::Failure { code, reason } => {
+            assert_eq!(code, PAM_AUTHINFO_UNAVAIL);
+            assert!(
+                reason.contains("record_corrupt"),
+                "the stable kind must be present: {reason}"
+            );
+            assert!(!reason.contains("alice"), "username leaked: {reason}");
+            assert!(!reason.contains(".json"), "path leaf leaked: {reason}");
+            assert!(
+                !reason.contains("/etc/wsl_webauthn"),
+                "store layout leaked: {reason}"
+            );
+        }
+        AuthOutcome::Success => panic!("a corrupt store must not authenticate"),
+    }
+}
+
 #[test]
 fn record_rp_id_mismatch_is_authinfo_unavail() {
     let fixture = Fixture::new();

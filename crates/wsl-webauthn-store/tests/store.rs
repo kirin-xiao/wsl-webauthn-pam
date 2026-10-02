@@ -992,6 +992,102 @@ fn system_store_uses_production_paths() {
 }
 
 #[test]
+fn kind_str_is_stable_distinct_and_non_identifying() {
+    // L8-9: the PAM module logs `kind_str`, never `Display`, so no token may embed the
+    // record path (the username leaf) and every variant needs a distinct stable token.
+    let path = PathBuf::from("/etc/wsl_webauthn/credentials/alice.json");
+    let cases: Vec<(StoreError, &str)> = vec![
+        (StoreError::InvalidUsername, "invalid_username"),
+        (StoreError::SymlinkedPath { path: path.clone() }, "symlink"),
+        (
+            StoreError::NotRegularFile { path: path.clone() },
+            "not_regular_file",
+        ),
+        (
+            StoreError::BadOwnership {
+                path: path.clone(),
+                expected_uid: 0,
+                actual_uid: 1,
+                expected_mode: FILE_MODE,
+                actual_mode: 0o644,
+            },
+            "bad_ownership",
+        ),
+        (
+            StoreError::InsecureBase {
+                path: path.clone(),
+                expected_uid: 0,
+                actual_uid: 1,
+                actual_mode: 0o777,
+            },
+            "insecure_base",
+        ),
+        (StoreError::NotFound { path: path.clone() }, "not_found"),
+        (
+            StoreError::AlreadyExists { path: path.clone() },
+            "already_exists",
+        ),
+        (
+            StoreError::Corrupt {
+                path: path.clone(),
+                message: "bad".into(),
+            },
+            "record_corrupt",
+        ),
+        (
+            StoreError::TooLarge {
+                path: path.clone(),
+                cap: 1,
+            },
+            "too_large",
+        ),
+        (
+            StoreError::PathChanged { path: path.clone() },
+            "path_changed",
+        ),
+        (
+            StoreError::RecordUserMismatch {
+                record_user: "alice".into(),
+                argument_user: "bob".into(),
+            },
+            "record_user_mismatch",
+        ),
+        (
+            StoreError::ConfigMissing { path: path.clone() },
+            "config_missing",
+        ),
+        (
+            StoreError::Config {
+                path: path.clone(),
+                message: "bad".into(),
+            },
+            "config_invalid",
+        ),
+        (
+            StoreError::Encode {
+                message: "bad".into(),
+            },
+            "encode",
+        ),
+        (
+            StoreError::Io {
+                path: path.clone(),
+                source: std::io::Error::other("bad"),
+            },
+            "io",
+        ),
+    ];
+    for (err, expected) in &cases {
+        assert_eq!(err.kind_str(), *expected, "{err:?}");
+        assert!(!err.kind_str().contains("alice"), "{err:?}");
+        assert!(!err.kind_str().contains('/'), "{err:?}");
+    }
+    let distinct: std::collections::BTreeSet<&str> =
+        cases.iter().map(|(e, _)| e.kind_str()).collect();
+    assert_eq!(distinct.len(), cases.len(), "tokens must be distinct");
+}
+
+#[test]
 fn config_file_mode_constant_matches_plan() {
     assert_eq!(CONFIG_MODE, 0o600);
     assert_eq!(DIR_MODE, 0o700);
