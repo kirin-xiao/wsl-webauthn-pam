@@ -102,30 +102,68 @@ machines you control.
 
 ## Installation
 
-### Guided install
-
-From a **release tarball**, `install.sh` sits next to the CLI:
+### One command
 
 ```sh
-tar xzf wsl-webauthn-pam-<version>-<arch>.tar.gz && cd wsl-webauthn-pam-<version>-<arch>
-sudo ./install.sh                      # thin shim: exec sudo ./wsl-webauthn-pam install
+curl -fsSL https://github.com/kirin-xiao/wsl-webauthn-pam/releases/latest/download/bootstrap.sh | sudo bash
 ```
 
-From a **source checkout**, build first:
+This downloads the latest release, verifies the tarball against `SHA256SUMS`, and
+best-effort verifies the signed build-provenance attestation when `gh` is
+installed (a tooling failure there warns but does not abort — the checksum is the
+hard gate). It then installs everything, runs the Windows Hello enrollment
+ceremony, and enables the profile. On success it reports:
+
+```
+Done. `sudo` now uses Windows Hello.
+  Test it:  sudo -k; sudo true
+```
+
+`bootstrap.sh` hands the installer the controlling terminal (when one exists), so
+the Windows Hello dialog and the installer's prompts work even though the script
+arrived on stdin. Pass installer flags after `-s --`, and pin a release with
+`--version`:
+
+```sh
+curl -fsSL .../bootstrap.sh | sudo bash -s -- --allow-unattested
+curl -fsSL .../bootstrap.sh | sudo bash -s -- --version v0.1.0
+```
+
+Prefer to read before you run? Download `bootstrap.sh`, inspect it, then run it
+(optionally verify its build provenance first, if you have `gh`):
+
+```sh
+curl -fsSLO https://github.com/kirin-xiao/wsl-webauthn-pam/releases/latest/download/bootstrap.sh
+gh attestation verify bootstrap.sh -R kirin-xiao/wsl-webauthn-pam
+less bootstrap.sh
+sudo bash bootstrap.sh
+```
+
+### Two commands (pre-provision)
+
+To install without enrolling (for example, provisioning many machines and
+enrolling per user later), split the two phases:
+
+```sh
+sudo wsl-webauthn-pam install --skip-enroll   # provision; profile left disabled
+sudo wsl-webauthn-pam enroll                  # enroll; enables the profile on success
+```
+
+`enroll` requires `install` to have run first.
+
+### From source
 
 ```sh
 git clone https://github.com/kirin-xiao/wsl-webauthn-pam
 cd wsl-webauthn-pam
 make release                            # or: cargo build --release --locked
 tar xzf build/wsl-webauthn-pam-<version>-<arch>.tar.gz -C build
-sudo ./build/wsl-webauthn-pam-<version>-<arch>/install.sh
+sudo build/wsl-webauthn-pam-<version>-<arch>/wsl-webauthn-pam install
 ```
 
-The shim runs the CLI from its own directory, so invoke it from inside the
-unpacked/staged directory. `install` copies the CLI to
-`/usr/local/bin/wsl-webauthn-pam`, so afterwards the short command works from any
-directory and survives deleting the unpacked tree. If `/usr/local/bin` is not on
-your `PATH`, use the absolute path or add it.
+Any of these copies the CLI to `/usr/local/bin/wsl-webauthn-pam`, so afterwards
+the short command works from any directory and survives deleting the unpacked
+tree. If `/usr/local/bin` is not on your `PATH`, use the absolute path or add it.
 
 `install` (running as root) will:
 
@@ -134,30 +172,26 @@ your `PATH`, use the absolute path or add it.
    bridge there, and record its SHA-256 pin.
 2. Install `pam_wsl_webauthn.so` into the module directory (detected via
    `pam_unix.so`, or set with `--module-dir`; the `.so` and bridge are found in
-   the release layout, `target/`, or the current directory, overridable with
+   the release layout, `target/`, or `build/`, overridable with
    `--artifact-dir <DIR>` or `$WSL_WEBAUTHN_ARTIFACTS`).
 3. Write `/etc/wsl_webauthn/config` (`0600` root), create
    `/etc/wsl_webauthn/credentials/` (`0700` root), and install the
    `pam-auth-update` profile to `/usr/share/pam-configs/wsl-webauthn`
-   (`Default: no` — never silently enabled).
+   (`Default: no` — `install`/`enroll` enable it only after a credential is
+   verified).
 4. Install the CLI itself to `/usr/local/bin/wsl-webauthn-pam` (`0755` root).
 5. Offer to remove the legacy `wsl-hello` profile and rewrite stale
    `pam_wsl_hello` references in `/etc/pam.d/*` (with confirmation and backup),
    never importing the legacy PEM.
-6. Offer to enable the profile now (default no), print the lockout warning, and
-   offer to enroll the invoking user. `--skip-enroll` stops before enrollment;
-   `--yes` answers yes to every prompt; `--dry-run` previews without writing;
-   `--non-interactive` never reads stdin.
+6. Offer to set up Windows Hello as a **single** action (default yes): enroll the
+   invoking user and, only on success, run
+   `pam-auth-update --enable wsl-webauthn`. A failure leaves the profile
+   disabled and prints the exact recovery commands. `--skip-enroll` stops before
+   enrollment; `--yes` answers yes to every prompt; `--dry-run` previews without
+   writing; `--non-interactive` never reads stdin.
 
 If `pam-auth-update` is missing (non-Debian), `install` prints manual
-`/etc/pam.d` instructions. Then enroll once and enable the profile:
-
-```sh
-sudo wsl-webauthn-pam enroll          # run as the user you want to enroll
-sudo pam-auth-update                  # select "WSL WebAuthn authentication"
-# or non-interactively:
-sudo pam-auth-update --enable wsl-webauthn
-```
+`/etc/pam.d` instructions instead, and cannot enable the profile for you.
 
 `enroll` prints a short notice before the ceremony and a line when the second dialog
 appears. The Windows Hello dialog can open behind the terminal, and the save dialog may
@@ -179,7 +213,8 @@ flash its taskbar button). See Troubleshooting.
    ```
 
 4. `sudo install -d -m 0700 -o root -g root /etc/wsl_webauthn/credentials`
-5. Enroll: `sudo wsl-webauthn-pam enroll`
+5. Enroll: `sudo wsl-webauthn-pam enroll --no-enable` (the profile is added by
+   hand in the next step rather than via `pam-auth-update`)
 6. Add a line to the relevant service (e.g. `/etc/pam.d/sudo`):
 
    ```
@@ -223,7 +258,7 @@ serial/SSH) and remove the module line.
 
 | Command | Purpose | Options |
 |---|---|---|
-| `enroll` | Enroll a Windows Hello credential (root) | `--replace`; `--allow-unattested`; `--user <NAME>` (default `SUDO_USER` or current); `--bridge <PATH>`; `--win-mnt <PATH>` |
+| `enroll` | Enroll a Windows Hello credential (root); enables the profile on success | `--replace`; `--allow-unattested`; `--no-enable`; `--user <NAME>` (default `SUDO_USER` or current); `--bridge <PATH>`; `--win-mnt <PATH>` |
 | `unregister` | Remove one user's credential record (root, per-user only) | `--user <NAME>`; `--yes`, `-y` |
 | `probe` | Report interop / Hello availability and the bridge pin | `--bridge <PATH>`; `--win-mnt <PATH>` |
 | `status` | List enrolled users and the config summary | `--user <NAME>` for one full record; config and records need root |
@@ -287,9 +322,10 @@ the GNU cross target.
 
 Tagging `v*` triggers the release workflow: one tarball per architecture
 containing `pam_wsl_webauthn.so`, the `wsl-webauthn-pam` CLI,
-`WSLWebAuthnBridge.exe`, `install.sh`, `pam-config`, and `README.md`, plus a
-top-level `SHA256SUMS` covering all tarballs. `make release` reproduces the
-layout locally under `build/` (build-host arch only).
+`WSLWebAuthnBridge.exe`, `bootstrap.sh`, `pam-config`, and `README.md`, plus a
+top-level `SHA256SUMS` covering all tarballs and a top-level `bootstrap.sh` (so
+the `releases/latest/download/bootstrap.sh` URL works). `make release`
+reproduces the layout locally under `build/` (build-host arch only).
 
 Published on the [releases page](https://github.com/kirin-xiao/wsl-webauthn-pam/releases);
 verify downloads against `SHA256SUMS`. CI releases also carry a signed
@@ -307,6 +343,14 @@ requires a controlling terminal, and the `quiet` module argument suppresses it
 everywhere. Check the authentication log: `journalctl -t pam_wsl_webauthn` or your
 distro's `auth.log` (syslog facility `authpriv`). Add the `debug` module argument for
 `LOG_DEBUG` detail (never secrets).
+
+**`install` finished but `sudo` still asks for a password.**
+Either the profile is not enabled, or the invoking user has no credential. Check with
+`sudo wsl-webauthn-pam status`, then enable the profile
+(`sudo pam-auth-update --enable wsl-webauthn`) and/or enroll
+(`sudo wsl-webauthn-pam enroll`). `install` and `enroll` enable the profile
+automatically only after a credential is verified; a skipped, declined, or failed
+enrollment leaves it disabled on purpose.
 
 **The Windows Hello prompt appears in the background.**
 The bridge passes the current foreground window as the prompt's owner and makes a

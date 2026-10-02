@@ -5,14 +5,14 @@
 //! * `enroll` — probe, print a pre-ceremony advisory, run a Windows Hello enrollment
 //!   ceremony, verify the attestation under the selected policy (including the
 //!   **double-enroll** retry), capture the Windows identity, and atomically persist a
-//!   credential record.
+//!   credential record. On success it enables the PAM profile unless `--no-enable`.
 //! * `unregister` — remove exactly one user's credential record.
 //! * `probe` — report interop / Hello availability and the bridge pin.
 //! * `status` — list enrolled users and the config summary.
 //! * `verify` — run the verifier against an in-process synthetic attestation+assertion
 //!   to prove the crypto stack works on this machine.
 //! * `install` — provision the bridge, config, module, profile and CLI, migrate a legacy
-//!   WSL-Hello-sudo install, and offer enrollment.
+//!   WSL-Hello-sudo install, then (as one action) enroll and enable the profile.
 //! * `uninstall` — remove one user's record or, with `--all`, every provisioned
 //!   component (never the legacy `/etc/pam_wsl_hello`).
 //!
@@ -143,9 +143,11 @@ USAGE:
     wsl-webauthn-pam <COMMAND> [OPTIONS]
 
 COMMANDS:
-    enroll       Enroll a Windows Hello credential for a Linux user (root)
+    enroll       Enroll a Windows Hello credential for a Linux user (root),
+                 then enable the PAM profile
                    --replace             overwrite an existing credential
                    --allow-unattested    admit self/`none` attestations (opt-in)
+                   --no-enable           do not enable the PAM profile afterwards
                    --user <NAME>         target user (default: SUDO_USER or current)
                    --bridge <PATH>       bridge exe path (else config, else required)
                    --win-mnt <PATH>      Windows mount root (else config, else /mnt/c)
@@ -163,7 +165,7 @@ COMMANDS:
                    --module-dir <DIR>     override the PAM security directory
                    --win-mnt <PATH>       override the Windows mount root
                    --allow-unattested     admit self/`none` attestation at enroll
-                   --skip-enroll          do not offer enrollment at the end
+                   --skip-enroll          do not enroll or enable at the end
                    --dry-run              resolve and print the plan; write nothing
                    --yes, -y              answer yes to every prompt
                    --non-interactive      never read stdin; use question defaults
@@ -336,6 +338,7 @@ enum Command {
     Enroll {
         replace: bool,
         allow_unattested: bool,
+        no_enable: bool,
         user: Option<String>,
         bridge: Option<PathBuf>,
         win_mnt: Option<PathBuf>,
@@ -389,6 +392,7 @@ enum Parsed {
 enum Flag {
     Replace,
     AllowUnattested,
+    NoEnable,
     Yes,
     All,
     SkipEnroll,
@@ -407,6 +411,7 @@ impl Flag {
         match self {
             Flag::Replace => "--replace",
             Flag::AllowUnattested => "--allow-unattested",
+            Flag::NoEnable => "--no-enable",
             Flag::Yes => "--yes",
             Flag::All => "--all",
             Flag::SkipEnroll => "--skip-enroll",
@@ -430,6 +435,7 @@ fn allowed_flags(subcommand: &str) -> Option<&'static [Flag]> {
         "enroll" => Some(&[
             Flag::Replace,
             Flag::AllowUnattested,
+            Flag::NoEnable,
             Flag::User,
             Flag::Bridge,
             Flag::WinMnt,
@@ -495,6 +501,7 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
 
     let mut replace = false;
     let mut allow_unattested = false;
+    let mut no_enable = false;
     let mut yes = false;
     let mut all = false;
     let mut skip_enroll = false;
@@ -521,6 +528,10 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
             "--allow-unattested" => {
                 seen.push(Flag::AllowUnattested);
                 allow_unattested = true;
+            }
+            "--no-enable" => {
+                seen.push(Flag::NoEnable);
+                no_enable = true;
             }
             "--yes" | "-y" => {
                 seen.push(Flag::Yes);
@@ -616,6 +627,7 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
         "enroll" => Command::Enroll {
             replace,
             allow_unattested,
+            no_enable,
             user,
             bridge,
             win_mnt,
@@ -732,10 +744,22 @@ fn run(command: Command) -> anyhow::Result<i32> {
         Command::Enroll {
             replace,
             allow_unattested,
+            no_enable,
             user,
             bridge,
             win_mnt,
-        } => cmd_enroll(replace, allow_unattested, user, bridge, win_mnt),
+        } => {
+            let code = cmd_enroll(replace, allow_unattested, user, bridge, win_mnt)?;
+            // Enabling is a separate step from the ceremony, so `cmd_enroll` never mutates
+            // PAM configuration. On success (and unless suppressed) turn the profile on.
+            if code == EXIT_OK && !no_enable {
+                let commands = installer::RealCommands;
+                let pam_auth_update =
+                    installer::CommandRunner::available(&commands, "pam-auth-update");
+                installer::enable_after_enroll(&commands, pam_auth_update)?;
+            }
+            Ok(code)
+        }
         Command::Unregister { user, yes } => cmd_unregister(user, yes),
         Command::Probe { bridge, win_mnt } => cmd_probe(bridge, win_mnt),
         Command::Status { user } => cmd_status(user),
@@ -798,6 +822,11 @@ struct UserInfo {
 /// `SUDO_USER` is used when it names a valid local account, otherwise the real uid's
 /// passwd entry. This means `sudo wsl-webauthn-pam enroll` enrolls the user who typed
 /// `sudo`, not `root`.
+///
+/// `bootstrap.sh` avoids nesting `sudo` under an outer `sudo` for exactly this reason:
+/// a second `sudo` would reset `SUDO_USER` to `root`, and the invoking user would be
+/// lost. When bootstrap is already root it runs the CLI directly, so the original
+/// `SUDO_USER` survives.
 ///
 /// The resolved name is validated against the store's username grammar
 /// ([`wsl_webauthn_store::validate_username`]) so an exotic `--user`/`SUDO_USER` value is
@@ -2155,6 +2184,7 @@ mod tests {
             Parsed::Run(Command::Enroll {
                 replace: false,
                 allow_unattested: false,
+                no_enable: false,
                 user: None,
                 bridge: None,
                 win_mnt: None,
@@ -2169,6 +2199,7 @@ mod tests {
                 "enroll",
                 "--replace",
                 "--allow-unattested",
+                "--no-enable",
                 "--user",
                 "alice"
             ]))
@@ -2176,6 +2207,7 @@ mod tests {
             Parsed::Run(Command::Enroll {
                 replace: true,
                 allow_unattested: true,
+                no_enable: true,
                 user: Some("alice".into()),
                 bridge: None,
                 win_mnt: None,
@@ -2192,6 +2224,7 @@ mod tests {
             Parsed::Run(Command::Enroll {
                 replace: false,
                 allow_unattested: false,
+                no_enable: false,
                 user: Some("bob".into()),
                 bridge: Some(PathBuf::from("/x/y.exe")),
                 win_mnt: Some(PathBuf::from("/mnt/d")),
@@ -2218,6 +2251,7 @@ mod tests {
             Parsed::Run(Command::Enroll {
                 replace: false,
                 allow_unattested: false,
+                no_enable: false,
                 user: Some("-weird".into()),
                 bridge: None,
                 win_mnt: None,
@@ -2336,6 +2370,7 @@ mod tests {
                 &[
                     "--replace",
                     "--allow-unattested",
+                    "--no-enable",
                     "--user",
                     "--bridge",
                     "--win-mnt",
@@ -2379,6 +2414,7 @@ mod tests {
         let all_flags = [
             "--replace",
             "--allow-unattested",
+            "--no-enable",
             "--yes",
             "--all",
             "--skip-enroll",
@@ -3395,6 +3431,33 @@ mod tests {
             "verify-rejected",
         ] {
             assert!(USAGE.contains(token), "usage must document token {token}");
+        }
+    }
+
+    /// Every flag the parser recognizes must be named in `--help`, so a flag cannot be
+    /// accepted while staying undocumented. If a flag is added to [`Flag`], add it here.
+    #[test]
+    fn usage_documents_every_accepted_flag() {
+        let all = [
+            "--replace",
+            "--allow-unattested",
+            "--no-enable",
+            "--yes",
+            "--all",
+            "--skip-enroll",
+            "--non-interactive",
+            "--dry-run",
+            "--user",
+            "--bridge",
+            "--win-mnt",
+            "--module-dir",
+            "--artifact-dir",
+        ];
+        for &flag in &all {
+            assert!(
+                USAGE.contains(flag),
+                "usage must document the recognized flag {flag}"
+            );
         }
     }
 

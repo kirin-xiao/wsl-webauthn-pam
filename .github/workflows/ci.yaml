@@ -73,7 +73,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       # `.gitattributes` forces LF on checkout, so a Windows clone with
-      # core.autocrlf=true cannot rewrite install.sh/pam-config to CRLF. This
+      # core.autocrlf=true cannot rewrite bootstrap.sh/pam-config to CRLF. This
       # catches a CRLF that is committed *into* a tracked text file anyway.
       # `git grep -I` skips binary files; the pattern is a literal CR.
       - name: no CRLF in tracked text files

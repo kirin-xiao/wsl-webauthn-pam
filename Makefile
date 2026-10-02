@@ -108,7 +108,7 @@ pam-profile:
 	python3 .github/scripts/check-pam-profile.py --self-test
 	python3 .github/scripts/check-pam-profile.py --profile pam-config
 
-# No tracked text file may contain CR: a CRLF committed into install.sh or
+# No tracked text file may contain CR: a CRLF committed into bootstrap.sh or
 # pam-config breaks them on Windows checkouts (autocrlf). `git grep -I` skips
 # binaries; the pattern is a literal CR built portably (dash has no $'…').
 crlf:
@@ -164,9 +164,10 @@ release: all
 	else \
 		echo ">> WSLWebAuthnBridge.exe not found; run 'make bridge' first" >&2; exit 1; \
 	fi
-	cp target/release/wsl-webauthn-pam install.sh pam-config README.md $(STAGE_DIR)/
+	cp target/release/wsl-webauthn-pam bootstrap.sh pam-config README.md $(STAGE_DIR)/
 	tar -czf $(TARBALL) -C build $(PKG_DIR)
 	cd build && sha256sum $(PKG_DIR).tar.gz > SHA256SUMS
+	cp bootstrap.sh build/bootstrap.sh
 	@echo ">> release assembled: $(TARBALL)"
 	@echo ">> checksums:          build/SHA256SUMS"
 	@tar -tzf $(TARBALL) | head -1

@@ -28,13 +28,23 @@ Linux side.
   best-effort `taskkill.exe` escalation, and a fast-fail interop pre-flight.
 - `WSLWebAuthnBridge.exe`: the Windows ceremony driver over dynamic
   `webauthn.dll` FFI, carrying a `VERSIONINFO` resource (file metadata).
-- Packaging and CI: `pam-auth-update` profile (`Default: no`), `install.sh`
-  shim, `Makefile`, and a release workflow producing per-architecture tarballs
-  plus `SHA256SUMS`.
+- Packaging and CI: `pam-auth-update` profile (`Default: no`), a `bootstrap.sh`
+  one-command installer, `Makefile`, and a release workflow producing
+  per-architecture tarballs plus `SHA256SUMS`.
 - Docs: README, `SECURITY.md`, `SPIKE.md`, `CONTRIBUTING.md`.
 
 ### Changed
 
+- Install is now one command:
+  `curl -fsSL .../releases/latest/download/bootstrap.sh | sudo bash`.
+  `bootstrap.sh` verifies the release tarball against `SHA256SUMS` (and the
+  build-provenance attestation when `gh` is present), then provisions, enrolls,
+  and enables the profile. The `install.sh` shim is gone; a release tarball's
+  CLI is run directly (`sudo ./wsl-webauthn-pam install`).
+- `install` and `enroll` now enable the `pam-auth-update` profile **after** a
+  credential is verified, instead of offering a separate, default-off enable
+  step. `enroll` gains `--no-enable`. A failed or skipped enrollment leaves the
+  profile disabled and prints the exact recovery commands.
 - The pinned RP ID is now `wsl-webauthn-pam` (the personal `io.github.kirin-xiao`
   segment is dropped from the `Passkey for …` line the Windows dialog shows).
   The `rpIdHash` therefore changes: **existing users must re-enroll**, and the old
@@ -52,3 +62,6 @@ Linux side.
   announces the PIN prompt and the module logs ceremony progress, and the bridge
   best-effort tries to foreground the dialog (falling back to a taskbar flash) so a user
   who sees the prompt is less likely to type the PIN into the shell.
+- `bootstrap.sh` runs the installer directly when it is already root, instead of nesting
+  `sudo`, so the invoking user (not `root`) is enrolled; it also no longer re-points its
+  own stdin, which silently truncated the script under `curl | bash`.

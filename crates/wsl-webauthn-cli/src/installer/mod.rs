@@ -31,8 +31,13 @@
 //! 4. Only then offer legacy cleanup: rewrite `/etc/pam.d` references *before*
 //!    removing the old `.so`, `pam-auth-update --remove wsl-hello`, remove the old
 //!    module/config dirs. The legacy PEM is **never** imported.
-//! 5. Offer `pam-auth-update --enable wsl-webauthn`, print lockout guidance, then offer
-//!    enrollment **last**.
+//! 5. Offer to set up Windows Hello as a **single** action: enroll the invoking user and,
+//!    only once a credential is verified, enable the profile
+//!    (`pam-auth-update --enable wsl-webauthn`). A failure anywhere in setup leaves the
+//!    profile **disabled** and prints the exact recovery commands; lockout guidance is
+//!    printed only on the not-enabled paths. `install` never enables before a credential
+//!    exists, and never before the fail-safe `[success=end default=ignore]` control is in
+//!    place.
 //!
 //! Any step *up to and including verification* that fails rolls back exactly what *this
 //! run* wrote: new files and directories are removed and any file this run *overwrote*
@@ -364,7 +369,7 @@ impl Prompter for StdPrompter {
 pub(crate) struct InstallOptions {
     /// Admit self/`none` attestation at enrollment (`--allow-unattested`).
     pub allow_unattested: bool,
-    /// Skip the post-install enrollment offer (`--skip-enroll`).
+    /// Skip the post-install setup: neither enroll nor enable (`--skip-enroll`).
     pub skip_enroll: bool,
     /// Override the module directory (skip detection).
     pub module_dir: Option<PathBuf>,
@@ -1471,47 +1476,54 @@ fn print_manual_enable_steps(paths: &InstallPaths) {
     }
 }
 
-/// Offer to enable the profile (default **no** — the profile is `Default: no`).
+/// Enable the profile with `pam-auth-update --enable wsl-webauthn`.
 ///
-/// When `pam-auth-update` is absent, print manual `/etc/pam.d` instructions instead of a
-/// bare warning, so `install` cannot appear to succeed while never becoming active.
-fn offer_enable(
+/// Shared by `install` (after a successful enrollment) and standalone `enroll`. This
+/// is the single code path that mutates the PAM configuration: on a host without
+/// `pam-auth-update` it only prints the manual `/etc/pam.d` instructions (there is
+/// nothing it can run), and otherwise it runs the helper and reports whether the
+/// profile is now active.
+///
+/// Returns `Ok(true)` when the profile is active, `Ok(false)` when it could not be
+/// enabled (helper absent, or a non-zero exit), so the caller can decide what to
+/// print. Enabling is only ever called after a credential has been verified, so the
+/// fail-safe `[success=end default=ignore]` control still falls through to the
+/// password line if the credential is later unusable.
+pub(crate) fn enable_profile(
     paths: &InstallPaths,
     commands: &dyn CommandRunner,
-    prompter: &dyn Prompter,
     pam_auth_update: bool,
     non_interactive: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     if !pam_auth_update {
         print_manual_enable_steps(paths);
-        return Ok(());
+        return Ok(false);
     }
-    let enable = prompter.confirm(
-        "Enable the wsl-webauthn PAM profile now (`pam-auth-update --enable wsl-webauthn`)?",
-        false,
-    )?;
-    if enable {
-        match commands.run(
-            "pam-auth-update",
-            &["--enable", PROFILE_NAME],
-            non_interactive,
-        ) {
-            Ok(status) if status.success => {
-                println!("pam-auth-update --enable wsl-webauthn: done");
-            }
-            Ok(status) => eprintln!(
-                "warning: pam-auth-update --enable wsl-webauthn exited {:?}",
-                status.code
-            ),
-            Err(e) => eprintln!("warning: {e}"),
+    match commands.run(
+        "pam-auth-update",
+        &["--enable", PROFILE_NAME],
+        non_interactive,
+    ) {
+        Ok(status) if status.success => {
+            println!("Enabled the PAM profile (`pam-auth-update --enable wsl-webauthn`).");
+            Ok(true)
         }
-    } else {
-        println!("Left the profile disabled (it is `Default: no`).");
+        Ok(status) => {
+            eprintln!(
+                "warning: pam-auth-update --enable wsl-webauthn exited {:?}; \
+                 the profile is not enabled",
+                status.code
+            );
+            Ok(false)
+        }
+        Err(e) => {
+            eprintln!("warning: {e}");
+            Ok(false)
+        }
     }
-    Ok(())
 }
 
-/// Print lockout-recovery guidance.
+/// Print lockout-recovery guidance when the profile was NOT enabled.
 ///
 /// WSL has no virtual console to fall back to, so the recovery path is a Windows-side
 /// root shell; for non-WSL Linux the classic TTY route is offered too.
@@ -1519,9 +1531,9 @@ fn print_lockout_guidance(enroll_cmd: &str) {
     println!();
     println!("Lockout safety:");
     println!("  * Keep at least one of `sudo`/`su` working with a password while you test.");
-    println!("  * The profile is not enabled automatically; run `sudo pam-auth-update` and");
+    println!("  * The profile is not enabled yet; run `sudo pam-auth-update` and");
     println!("    select \"WSL WebAuthn authentication\" when you are ready.");
-    println!("  * Enroll a credential before relying on the module: `sudo {enroll_cmd}`");
+    println!("  * Enroll a credential before relying on the module: `sudo {enroll_cmd} enroll`");
     println!("  * Manual alternative (add to /etc/pam.d/common-auth above the password line):");
     println!("        auth sufficient pam_wsl_webauthn.so");
     println!("  * If sudo/su breaks, recover WITHOUT relying on the broken login:");
@@ -1532,6 +1544,42 @@ fn print_lockout_guidance(enroll_cmd: &str) {
     println!("             #   pam-auth-update --remove wsl-webauthn)");
     println!("      Other Linux: sign in on another TTY/console (Ctrl-Alt-F2) and");
     println!("           remove that line.");
+}
+
+/// Print the one-line success message after enrollment and a successful enable.
+fn print_enable_success(enroll_cmd: &str) {
+    println!();
+    println!("Done. `sudo` now uses Windows Hello.");
+    println!("  If you decline the Hello prompt, sudo falls back to your password.");
+    println!("  Test it:  sudo -k; sudo true");
+    println!("  Add another user later:  sudo {enroll_cmd} enroll");
+}
+
+/// Enable the PAM profile after a successful standalone `enroll`.
+///
+/// The `enroll` subcommand calls this so it shares exactly one enable code path with
+/// `install`; `cmd_enroll` itself stays a pure ceremony-and-record unit that never touches
+/// PAM configuration. The system paths match the store `cmd_enroll` just wrote to.
+pub(crate) fn enable_after_enroll(
+    commands: &dyn CommandRunner,
+    pam_auth_update: bool,
+) -> anyhow::Result<()> {
+    let paths = InstallPaths::system();
+    let enabled = enable_profile(&paths, commands, pam_auth_update, false)?;
+    if enabled {
+        let enroll_cmd = paths.bin_dir.join(CLI_NAME);
+        print_enable_success(&enroll_cmd.display().to_string());
+    } else if pam_auth_update {
+        // enable_profile's helper call failed (non-zero exit or spawn error), or the
+        // profile is not registered with pam-auth-update (e.g. a manual install).
+        println!();
+        println!("The credential is enrolled, but the PAM profile is not enabled.");
+        println!("Enable it with `sudo pam-auth-update --enable wsl-webauthn`, or add");
+        println!("`auth sufficient pam_wsl_webauthn.so` to the relevant /etc/pam.d service.");
+    }
+    // When `pam-auth-update` is absent, enable_profile already printed the manual
+    // `/etc/pam.d` steps.
+    Ok(())
 }
 
 /// Print the planned mutations for `--dry-run` without touching the system.
@@ -1569,7 +1617,10 @@ fn print_dry_run(paths: &InstallPaths, module_dir: &Path, pam_auth_update: bool)
     }
 
     if pam_auth_update {
-        println!("  enable step: `pam-auth-update --enable {PROFILE_NAME}` (offered afterwards)");
+        println!(
+            "  enable step: `pam-auth-update --enable {PROFILE_NAME}` \
+             (after a successful enrollment)"
+        );
     } else {
         print_manual_enable_steps(paths);
     }
@@ -1581,22 +1632,37 @@ fn print_dry_run(paths: &InstallPaths, module_dir: &Path, pam_auth_update: bool)
 ///
 /// `enroll_cmd` is the installed CLI's absolute path, so the instruction is runnable even
 /// when `/usr/local/bin` is not on the shell's `PATH`.
-fn next_steps_lines(enroll_cmd: &str, enrolled: bool) -> Vec<String> {
+fn next_steps_lines(enroll_cmd: &str, enrolled: bool, pam_auth_update: bool) -> Vec<String> {
     if enrolled {
-        vec!["Installation complete. Test with: sudo -k; sudo true".to_string()]
+        // A credential exists but the profile is not active (enable failed or the helper
+        // is absent): point at the enable step.
+        let mut lines =
+            vec!["A credential is enrolled, but the PAM profile is not enabled.".to_string()];
+        if pam_auth_update {
+            lines.push("Enable it:  sudo pam-auth-update --enable wsl-webauthn".to_string());
+            lines.push(
+                "  (or add `auth sufficient pam_wsl_webauthn.so` to /etc/pam.d/sudo)".to_string(),
+            );
+        } else {
+            lines.push(
+                "  add `auth sufficient pam_wsl_webauthn.so` to the relevant /etc/pam.d service"
+                    .to_string(),
+            );
+        }
+        lines
     } else {
         vec![
             "Installation complete, but no credential is enrolled yet.".to_string(),
-            format!("Enroll one before relying on the module:  sudo {enroll_cmd} enroll"),
+            format!("Enroll one (this also enables it):  sudo {enroll_cmd} enroll"),
             "  (add --allow-unattested only on machines without a TPM-backed Hello)".to_string(),
         ]
     }
 }
 
 /// Print what the operator must do next.
-fn print_next_steps(enroll_cmd: &str, enrolled: bool) {
+fn print_next_steps(enroll_cmd: &str, enrolled: bool, pam_auth_update: bool) {
     println!();
-    for line in next_steps_lines(enroll_cmd, enrolled) {
+    for line in next_steps_lines(enroll_cmd, enrolled, pam_auth_update) {
         println!("{line}");
     }
 }
@@ -1706,29 +1772,27 @@ pub(crate) fn install_with(
         println!("are not migrated): run `sudo {enroll_cmd}`.");
     }
 
-    // 7. Offer to enable the profile, print lockout guidance, then offer enrollment LAST.
-    println!();
-    offer_enable(
-        paths,
-        commands,
-        prompter,
-        pam_auth_update,
-        opts.non_interactive,
-    )?;
-    print_lockout_guidance(&enroll_cmd);
-
+    // 7. Offer to set up Windows Hello (enroll + enable) as a single action.
+    //
+    // The profile is enabled only AFTER a credential is verified, in the same step. That
+    // is what makes `sudo` actually use Hello with no follow-up command, and it is
+    // fail-safe: the profile's `[success=end default=ignore]` control falls through to the
+    // password line if the credential is later unusable.
     if opts.skip_enroll {
-        print_next_steps(&enroll_cmd, false);
+        // Provision only; a later `enroll` enables the profile on success.
+        print_lockout_guidance(&enroll_cmd);
+        print_next_steps(&enroll_cmd, false, pam_auth_update);
         return Ok(EXIT_OK);
     }
 
     println!();
     let enroll_now = prompter.confirm(
-        "Enroll a Windows Hello credential NOW for the invoking user?",
+        "Set up Windows Hello for sudo now (enroll a credential and enable it)?",
         true,
     )?;
     if !enroll_now {
-        print_next_steps(&enroll_cmd, false);
+        print_lockout_guidance(&enroll_cmd);
+        print_next_steps(&enroll_cmd, false, pam_auth_update);
         return Ok(EXIT_OK);
     }
 
@@ -1736,15 +1800,30 @@ pub(crate) fn install_with(
     // what `cmd_enroll` resolves.
     println!();
     match enroller.enroll(opts.allow_unattested) {
-        Ok(code) => {
-            if code == EXIT_OK {
-                print_next_steps(&enroll_cmd, true);
+        Ok(EXIT_OK) => {
+            // Enable only now that a credential exists. If enabling fails, the profile
+            // stays off and the manual steps below are the fix.
+            let enabled = enable_profile(paths, commands, pam_auth_update, opts.non_interactive)?;
+            if enabled {
+                print_enable_success(&enroll_cmd);
+                Ok(EXIT_OK)
+            } else {
+                print_lockout_guidance(&enroll_cmd);
+                print_next_steps(&enroll_cmd, true, pam_auth_update);
+                Ok(EXIT_OK)
             }
+        }
+        Ok(code) => {
+            // Enrollment reported an operational failure (it prints its own reason).
+            eprintln!("warning: enrollment did not complete; the profile is left disabled.");
+            print_lockout_guidance(&enroll_cmd);
+            print_next_steps(&enroll_cmd, false, pam_auth_update);
             Ok(code)
         }
         Err(error) => {
             eprintln!("warning: enrollment failed: {error:#}");
-            print_next_steps(&enroll_cmd, false);
+            print_lockout_guidance(&enroll_cmd);
+            print_next_steps(&enroll_cmd, false, pam_auth_update);
             Ok(EXIT_FAIL)
         }
     }

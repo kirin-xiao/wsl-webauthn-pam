@@ -155,11 +155,16 @@ impl Prompter for ScriptedPrompter {
 struct MockEnroller {
     called: RefCell<Vec<bool>>,
     code: i32,
+    /// When set, `enroll` returns an `Err` instead of `Ok(code)`.
+    error: bool,
 }
 
 impl Enroller for MockEnroller {
     fn enroll(&self, allow_unattested: bool) -> anyhow::Result<i32> {
         self.called.borrow_mut().push(allow_unattested);
+        if self.error {
+            anyhow::bail!("mock enrollment failure");
+        }
         Ok(self.code)
     }
 }
@@ -510,10 +515,10 @@ fn install_provisions_everything() {
     let h = Harness::new();
     let commands = MockCommands::default();
     let enroller = MockEnroller::default();
-    // Decline the (optional) enable offer; skip_enroll means no other prompts.
+    // `skip_enroll` means no enrollment and no enable prompt.
     let code = h
         .run_install(
-            &ScriptedPrompter::with_answers(&[false]),
+            &ScriptedPrompter::with_answers(&[]),
             &enroller,
             &commands,
             &h.opts(),
@@ -580,15 +585,29 @@ fn install_provisions_everything() {
 /// command is runnable regardless of `PATH`.
 #[test]
 fn next_steps_lines_name_the_installed_cli() {
-    let lines = next_steps_lines("/usr/local/bin/wsl-webauthn-pam", false);
+    let lines = next_steps_lines("/usr/local/bin/wsl-webauthn-pam", false, true);
     let text = lines.join("\n");
     assert!(
         text.contains("sudo /usr/local/bin/wsl-webauthn-pam enroll"),
         "the guidance must be copy-pasteable with the installed path: {text}"
     );
-    // The enrolled variant just points at the smoke test.
-    let done = next_steps_lines("/usr/local/bin/wsl-webauthn-pam", true).join("\n");
-    assert!(done.contains("sudo -k; sudo true"), "{done}");
+    // The enrolled-but-not-enabled variant points at the enable step when the helper
+    // exists...
+    let enabled = next_steps_lines("/usr/local/bin/wsl-webauthn-pam", true, true).join("\n");
+    assert!(
+        enabled.contains("pam-auth-update --enable wsl-webauthn"),
+        "{enabled}"
+    );
+    // ...and at the manual /etc/pam.d line when it does not.
+    let manual = next_steps_lines("/usr/local/bin/wsl-webauthn-pam", true, false).join("\n");
+    assert!(
+        manual.contains("auth sufficient pam_wsl_webauthn.so"),
+        "{manual}"
+    );
+    assert!(
+        !manual.contains("pam-auth-update"),
+        "must not name pam-auth-update when it is absent: {manual}"
+    );
 }
 
 /// A failure to install the CLI must roll the whole install back (the copy happens before
@@ -678,17 +697,26 @@ fn install_offers_and_runs_enrollment_when_confirmed() {
     let h = Harness::new();
     let mut opts = h.opts();
     opts.skip_enroll = false;
-    // Answer yes to the enrollment offer (and to enabling the profile).
+    // One combined "set up Windows Hello" prompt; enrollment then succeeds and the
+    // profile is enabled (MockCommands success=true).
     let prompter = ScriptedPrompter::always(true);
+    let commands = MockCommands {
+        success: true,
+        ..MockCommands::default()
+    };
     let enroller = MockEnroller::default();
     let code = h
-        .run_install(&prompter, &enroller, &MockCommands::default(), &opts)
+        .run_install(&prompter, &enroller, &commands, &opts)
         .unwrap();
     assert_eq!(code, EXIT_OK);
     assert_eq!(enroller.called.borrow().as_slice(), &[false]);
-    // The enrollment question must be asked last.
+    // Exactly one prompt, and it is the setup question.
     let questions = prompter.questions();
-    assert!(questions.last().unwrap().contains("Enroll"));
+    assert_eq!(questions.len(), 1, "{questions:?}");
+    assert!(
+        questions[0].contains("Set up Windows Hello"),
+        "{questions:?}"
+    );
 }
 
 #[test]
@@ -696,14 +724,26 @@ fn install_does_not_enroll_when_declined() {
     let h = Harness::new();
     let mut opts = h.opts();
     opts.skip_enroll = false;
-    // Answer no to enabling the profile and no to the enrollment offer.
-    let prompter = ScriptedPrompter::with_answers(&[false, false]);
+    // Decline the single setup prompt: no enrollment, no enable.
+    let prompter = ScriptedPrompter::with_answers(&[false]);
+    let commands = MockCommands {
+        success: true,
+        ..MockCommands::default()
+    };
     let enroller = MockEnroller::default();
     let code = h
-        .run_install(&prompter, &enroller, &MockCommands::default(), &opts)
+        .run_install(&prompter, &enroller, &commands, &opts)
         .unwrap();
     assert_eq!(code, EXIT_OK);
     assert!(enroller.called.borrow().is_empty());
+    assert!(
+        commands
+            .calls
+            .borrow()
+            .iter()
+            .all(|(p, _)| p != "pam-auth-update"),
+        "a declined setup must not enable the profile"
+    );
 }
 
 #[test]
@@ -712,32 +752,112 @@ fn install_passes_allow_unattested_to_enroller() {
     let mut opts = h.opts();
     opts.skip_enroll = false;
     opts.allow_unattested = true;
-    let enroller = MockEnroller::default();
-    h.run_install(
-        &ScriptedPrompter::always(true),
-        &enroller,
-        &MockCommands::default(),
-        &opts,
-    )
-    .unwrap();
-    assert_eq!(enroller.called.borrow().as_slice(), &[true]);
-}
-
-#[test]
-fn install_enable_offer_invokes_pam_auth_update() {
-    let h = Harness::new();
     let commands = MockCommands {
         success: true,
         ..MockCommands::default()
     };
-    // Enable -> true, then skip enrollment.
-    let prompter = ScriptedPrompter::with_answers(&[true, false]);
-    h.run_install(&prompter, &MockEnroller::default(), &commands, &h.opts())
+    let enroller = MockEnroller::default();
+    h.run_install(&ScriptedPrompter::always(true), &enroller, &commands, &opts)
         .unwrap();
-    let calls = commands.calls.borrow();
-    assert!(calls.iter().any(|(p, a)| {
-        p == "pam-auth-update" && a == &["--enable".to_string(), PROFILE_NAME.to_string()]
-    }));
+    assert_eq!(enroller.called.borrow().as_slice(), &[true]);
+}
+
+#[test]
+fn install_enables_after_successful_enrollment() {
+    let h = Harness::new();
+    let mut opts = h.opts();
+    opts.skip_enroll = false;
+    let commands = MockCommands {
+        success: true,
+        ..MockCommands::default()
+    };
+    let enroller = MockEnroller::default();
+    h.run_install(&ScriptedPrompter::always(true), &enroller, &commands, &opts)
+        .unwrap();
+    assert_eq!(enroller.called.borrow().as_slice(), &[false]);
+    assert!(
+        commands.calls.borrow().iter().any(|(p, a)| {
+            p == "pam-auth-update" && a == &["--enable".to_string(), PROFILE_NAME.to_string()]
+        }),
+        "a successful enrollment must enable the profile by default"
+    );
+}
+
+#[test]
+fn install_leaves_profile_disabled_when_enrollment_fails() {
+    let h = Harness::new();
+    let mut opts = h.opts();
+    opts.skip_enroll = false;
+    let commands = MockCommands {
+        success: true,
+        ..MockCommands::default()
+    };
+    // The realistic failure: `cmd_enroll` returns `Err` (not a non-zero `Ok`).
+    let enroller = MockEnroller {
+        error: true,
+        ..MockEnroller::default()
+    };
+    let code = h
+        .run_install(&ScriptedPrompter::always(true), &enroller, &commands, &opts)
+        .unwrap();
+    assert_eq!(code, EXIT_FAIL);
+    assert!(
+        commands
+            .calls
+            .borrow()
+            .iter()
+            .all(|(p, _)| p != "pam-auth-update"),
+        "a failed enrollment must not enable the profile"
+    );
+}
+
+/// A non-zero `Ok` enrollment result (an operational failure the enroller reported
+/// rather than propagated) must also leave the profile disabled and surface that code.
+#[test]
+fn install_leaves_profile_disabled_on_nonzero_enroller_code() {
+    let h = Harness::new();
+    let mut opts = h.opts();
+    opts.skip_enroll = false;
+    let commands = MockCommands {
+        success: true,
+        ..MockCommands::default()
+    };
+    let enroller = MockEnroller {
+        code: EXIT_FAIL,
+        ..MockEnroller::default()
+    };
+    let code = h
+        .run_install(&ScriptedPrompter::always(true), &enroller, &commands, &opts)
+        .unwrap();
+    assert_eq!(code, EXIT_FAIL);
+    assert!(
+        commands
+            .calls
+            .borrow()
+            .iter()
+            .all(|(p, _)| p != "pam-auth-update"),
+        "a non-zero enrollment must not enable the profile"
+    );
+}
+
+/// `enable_after_enroll` (the standalone `enroll` path) enables via the same helper and
+/// reports success; it shares the exact code path `install` uses.
+#[test]
+fn enable_after_enroll_calls_pam_auth_update() {
+    let paths = InstallPaths::system();
+    let commands = MockCommands {
+        success: true,
+        ..MockCommands::default()
+    };
+    enable_after_enroll(&commands, true).unwrap();
+    assert!(
+        commands.calls.borrow().iter().any(|(p, a)| {
+            p == "pam-auth-update" && a == &["--enable".to_string(), PROFILE_NAME.to_string()]
+        }),
+        "standalone enroll must enable through the shared helper"
+    );
+    // The profile path used is the system one; sanity-check it is not a tempdir.
+    assert!(paths.config_path().starts_with("/etc"));
 }
 
 #[test]
@@ -790,12 +910,13 @@ fn install_non_interactive_sets_debian_frontend() {
     let h = Harness::new();
     let mut opts = h.opts();
     opts.non_interactive = true;
+    opts.skip_enroll = false;
     let commands = MockCommands {
         success: true,
         ..MockCommands::default()
     };
-    // Enable -> true.
-    let prompter = ScriptedPrompter::with_answers(&[true]);
+    // Setup -> true; enrollment succeeds, so the profile is enabled non-interactively.
+    let prompter = ScriptedPrompter::always(true);
     h.run_install(&prompter, &MockEnroller::default(), &commands, &opts)
         .unwrap();
 
@@ -860,6 +981,34 @@ fn install_without_pam_auth_update_prints_manual_steps() {
     let joined = steps.join("\n");
     assert!(joined.contains("/etc/pam.d/common-auth"), "{joined}");
     assert!(joined.contains("pam_wsl_webauthn.so"), "{joined}");
+}
+
+#[test]
+fn install_attempts_enable_but_stays_disabled_when_helper_fails() {
+    let h = Harness::new();
+    let mut opts = h.opts();
+    opts.skip_enroll = false;
+    // Enrollment succeeds, but `pam-auth-update --enable` exits non-zero.
+    let commands = MockCommands {
+        success: false,
+        ..MockCommands::default()
+    };
+    let code = h
+        .run_install(
+            &ScriptedPrompter::always(true),
+            &MockEnroller::default(),
+            &commands,
+            &opts,
+        )
+        .unwrap();
+    // The install itself still reports success; only the profile stays off.
+    assert_eq!(code, EXIT_OK);
+    assert!(
+        commands.calls.borrow().iter().any(|(p, a)| {
+            p == "pam-auth-update" && a == &["--enable".to_string(), PROFILE_NAME.to_string()]
+        }),
+        "the enable must still be attempted"
+    );
 }
 
 // ---------------------------------------------------------------------------

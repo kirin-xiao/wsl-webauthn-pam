@@ -25,13 +25,16 @@ name: Release
 #     ├── pam_wsl_webauthn.so        (Linux PAM module, renamed from lib…)
 #     ├── wsl-webauthn-pam           (CLI)
 #     ├── WSLWebAuthnBridge.exe      (Windows bridge for the same arch)
-#     ├── install.sh
+#     ├── bootstrap.sh
 #     ├── pam-config
 #     └── README.md
 #   SHA256SUMS                       (checksums for all tarballs)
+#   bootstrap.sh                     (also published top-level, so the
+#                                     `releases/latest/download/bootstrap.sh`
+#                                     URL works without a tarball)
 #
 # Both the Linux module and the matching Windows bridge ship in the same
-# tarball because install.sh copies the bridge onto the Windows side.
+# tarball because the CLI's `install` copies the bridge onto the Windows side.
 
 on:
   push:
@@ -196,7 +199,7 @@ jobs:
             cp dist/linux-${arch}/libpam_wsl_webauthn.so "dist/out/${dir}/pam_wsl_webauthn.so"
             cp dist/linux-${arch}/wsl-webauthn-pam          "dist/out/${dir}/"
             cp dist/windows-${arch}/WSLWebAuthnBridge.exe   "dist/out/${dir}/"
-            cp install.sh pam-config README.md              "dist/out/${dir}/"
+            cp bootstrap.sh pam-config README.md            "dist/out/${dir}/"
             tar -czf "dist/${dir}.tar.gz" -C dist/out "${dir}"
             # The tarball root must be exactly the one named directory, so
             # `tar xzf … && cd …` (README) works and the layout cannot silently
@@ -234,9 +237,12 @@ jobs:
           # A pre-release version may itself contain a dash, so the leading `*` spans
           # `<version>` and the trailing `*` spans `<arch>`; the glob therefore still
           # requires both components (fail-closed, not a loose prefix match).
+          # `bootstrap.sh` is attested too: it runs as root, so a downloader who
+          # inspects before running can also check its provenance.
           subject-path: |
             dist/wsl-webauthn-pam-*-*.tar.gz
             dist/SHA256SUMS
+            bootstrap.sh
 
       - name: publish GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
@@ -244,6 +250,7 @@ jobs:
           files: |
             dist/wsl-webauthn-pam-*-*.tar.gz
             dist/SHA256SUMS
+            bootstrap.sh
           generate_release_notes: true
           fail_on_unmatched_files: true
           # Tags carrying a pre-release suffix (vX.Y.Z-rc1) publish as pre-releases.
