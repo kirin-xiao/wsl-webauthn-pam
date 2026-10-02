@@ -39,8 +39,11 @@ ciborium = { workspace = true }
 # `.taskkill_program`) used by `tests/support/mod.rs`; production builds take the
 # runner without this feature, so those seams are compile-time unavailable there.
 #
-# Resolver 3 (edition 2024) does not unify dev-dependency features into normal
-# builds: `cargo build -p wsl-webauthn-pam --release` resolves the runner with
-# `features: []` and the shipped cdylib does not export these seams. Do not move
-# this edge into `[dependencies]`; a resolver downgrade would reopen the leak.
+# Why a dev-dependency keeps the feature off the shipped cdylib: a normal
+# `cargo build -p wsl-webauthn-pam --release` does not build dev-dependencies, so
+# this edge is simply absent from that graph and the runner is compiled without
+# `--cfg feature="test-support"` (verify with `cargo build -p wsl-webauthn-pam
+# --release -v`). Resolver 3 unifies features across all edges *within one
+# invocation*, so if this edge were moved into `[dependencies]` the feature would
+# be enabled for the cdylib too — do not move it.
 wsl-webauthn-runner = { path = "../wsl-webauthn-runner", features = ["test-support"] }
