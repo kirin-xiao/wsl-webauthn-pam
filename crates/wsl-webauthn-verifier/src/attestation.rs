@@ -1,6 +1,6 @@
 //! Attestation-object parsing and verification (WebAuthn §6.5).
 //!
-//! Supported formats (D3, as amended after the Windows spike):
+//! Supported formats:
 //!
 //! * `tpm` with `x5c`: full chain verification to the pinned Microsoft root plus the
 //!   TPM `certInfo`/`pubArea` checks (§8.3). Windows Hello emits this on TPM-equipped
@@ -93,13 +93,9 @@ pub(crate) fn verify(
     let prefix = parse_and_validate_prefix(auth_data)?;
     let attested = parse_attested_credential_data(auth_data)?;
 
-    // 3a. The authData AAGUID must be on the strict allow-list. The AAGUID is a
-    //     property of the authenticator, not of the attestation format, so it is
-    //     enforced here — before any policy arm or format dispatch can return an
-    //     outcome. Self-attested `packed` and `none` (admitted only under
-    //     `AllowUnattested`) are therefore held to the same allow-list as
-    //     `packed`/`tpm` with `x5c`; the allow-list cannot be bypassed by choosing a
-    //     weaker format.
+    // 3a. The authData AAGUID must be on the strict allow-list. It is enforced here,
+    //     before any policy arm or format dispatch can return an outcome, so the
+    //     allow-list cannot be bypassed by choosing a weaker format.
     if !STRICT_AAGUIDS.contains(&attested.aaguid) {
         return Err(VerifyError::AaguidNotAllowed);
     }

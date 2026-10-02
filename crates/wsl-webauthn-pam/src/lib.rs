@@ -1,5 +1,5 @@
 //! `pam_wsl_webauthn.so` — a Linux-PAM module that authenticates via the Windows
-//! WebAuthn / FIDO2 platform authenticator (plan §8).
+//! WebAuthn / FIDO2 platform authenticator.
 //!
 //! The module is a `cdylib`. Its exported surface is exactly the six `pam_sm_*`
 //! entry points plus the hand-rolled PAM bindings; all verification happens here on
@@ -14,7 +14,7 @@
 //! 3. Refuse a bridge executable whose path is not trustworthy (symlinked, or written
 //!    by group/other outside a DrvFs mount), then compare the SHA-256 of the bridge
 //!    executable (hashed from an `O_NOFOLLOW` descriptor) with the digest pinned in
-//!    the record (plan D11); a mismatch refuses to launch. There is no way to skip
+//!    the record; a mismatch refuses to launch. There is no way to skip
 //!    this check from the argument surface.
 //! 4. Mint a 32-byte challenge, build the exact `clientDataJSON`, optionally emit a
 //!    `pam_conv` consent pre-prompt (skipped under `PAM_SILENT`), and run the bridge.
@@ -37,15 +37,8 @@
 //! | `pam_sm_setcred` | `PAM_SUCCESS` |
 //! | Any other non-authentication `pam_sm_*` | `PAM_IGNORE` |
 //!
-//! Note: plan §8 collapses the bridge taxonomy into "no UV platform" →
-//! `PAM_AUTHINFO_UNAVAIL` and "user_cancelled / bad signature / challenge mismatch" →
-//! `PAM_AUTH_ERR`. This module interprets every non-cancel ceremony failure
-//! (`not_available`, `not_supported`, `timeout`, `busy`, `invalid_parameter`,
-//! `internal`) as an unavailable service, which agrees with the plan's coarse rows.
-//!
-//! Failure paths request `pam_fail_delay(pamh, 2_000_000)` (2 s) before returning,
-//! matching plan §3/CR-14. No attempt counter is persisted across processes: the PAM
-//! stack owns retry policy (plan §3).
+//! Failure paths request `pam_fail_delay(pamh, 2_000_000)` (2 s) before returning.
+//! No attempt counter is persisted across processes: the PAM stack owns retry policy.
 //!
 //! # Log severity
 //!
@@ -69,38 +62,38 @@
 //!   and the 60 s default. The runner's own 5 s `taskkill` budget may add to the wall
 //!   time.
 //!
-//! There is **no `noverifypin` argument** (removed; L2-4). Disabling the bridge pin
-//! from `/etc/pam.d` silently reduced root authentication to "run whatever executable
-//! is at the configured path"; the pin is now always enforced. Unknown arguments,
-//! including a stray `noverifypin`, and an out-of-range `timeout=` are logged at
-//! `LOG_ERR` and ignored — a near-miss flag must be visible at the default log level.
+//! There is **no `noverifypin` argument**. Disabling the bridge pin from `/etc/pam.d`
+//! would silently reduce root authentication to "run whatever executable is at the
+//! configured path"; the pin is always enforced. Unknown arguments, including a stray
+//! `noverifypin`, and an out-of-range `timeout=` are logged at `LOG_ERR` and ignored —
+//! a near-miss flag must be visible at the default log level.
 //!
-//! # Pre-prompt bridge verification cost (L10-2)
+//! # Pre-prompt bridge verification cost
 //!
 //! Hashing the bridge executable happens on **every** authentication, before the
 //! Windows Hello prompt. It streams the file (never `fs::read`s it whole) and, on a
 //! 9p/DrvFs mount, measured ~10–15 ms for the ~2 MB bridge — negligible against the
-//! 1–3 s gesture and the 50–110 ms interop spawn, and deliberate: caching the digest
-//! would reopen the TOCTOU window the pin exists to narrow. A size cap refuses to hash
-//! an absurdly large file.
+//! 1–3 s gesture and the 50–110 ms interop spawn. Caching the digest would reopen the
+//! TOCTOU window the pin exists to narrow. A size cap refuses to hash an absurdly large
+//! file.
 //!
 //! # Lockout guidance
 //!
 //! Enrolling this module makes Windows Hello a *requirement* for the services it is
 //! added to. Always keep at least one working `sudo`/`su` path (a second TTY, a root
 //! shell, or the local password) before enabling it, and test with a non-critical
-//! service first. See the installer's lockout warning (plan §10) and `SECURITY.md`.
+//! service first. See the installer's lockout warning and `SECURITY.md`.
 //!
 //! # Wire facts that shape this module
 //!
 //! * The Windows Hello prompt shows the **RP ID**, not `RP_NAME`; the `pam_conv`
-//!   pre-prompt above is therefore the primary consent-naming mechanism (plan SR-11).
+//!   pre-prompt above is therefore the primary consent-naming mechanism.
 //! * The runner's deadline includes a 5 s `taskkill` budget, so total wall time can
 //!   reach `deadline + 5 s`; the default 60 s deadline leaves the bridge's 55 s
-//!   advisory timeout a 5 s margin (plan §3).
-//! * The PAM module does **not** write the credential store. Signature-counter
-//!   persistence is deferred (the counter is advisory and Windows Hello reports zero);
-//!   the observed value is debug-logged.
+//!   advisory timeout a 5 s margin.
+//! * The PAM module does **not** write the credential store. The signature counter is
+//!   advisory and Windows Hello reports zero, so the observed value is debug-logged
+//!   rather than persisted.
 
 #![warn(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -109,17 +102,14 @@
 // `#[allow(unsafe_code)]`; everything else must stay safe.
 #![deny(unsafe_code)]
 
-// The module maps a panic in Rust code to `PAM_ABORT` via `catch_unwind`
-// (fail-closed). With `panic = "abort"` that mapping is silently lost and a
-// panic would unwind across the FFI boundary / abort the host process. Require
-// unwinding panics in every profile.
+// A panic in Rust code maps to `PAM_ABORT` via `catch_unwind` (fail-closed). With
+// `panic = "abort"` that mapping is silently lost and a panic would abort the host
+// process. Require unwinding panics in every profile.
 //
-// Dependency (L3-5): this strategy only produces a *defined* unwind/return — rather
-// than aborting — because libpam is compiled with `-fexceptions` and the six
-// `pam_sm_*` entry points are `extern "C"` frames that `guarded`/`run` always wrap in
-// `catch_unwind`. A downstream packager must therefore keep `panic = "unwind"` *and*
-// libpam built with exceptions; the compile-time guard below rejects an aborting
-// profile, and `tests/` drives a deliberate panic through the real `guarded` closure.
+// This only produces a *defined* unwind/return because libpam is compiled with
+// `-fexceptions` and the six `pam_sm_*` entry points are `extern "C"` frames that
+// `guarded`/`run` always wrap in `catch_unwind`. A downstream packager must therefore
+// keep `panic = "unwind"` *and* libpam built with exceptions.
 #[cfg(not(panic = "unwind"))]
 compile_error!(
     "wsl-webauthn-pam must be built with panic=unwind; panic=abort would disable \
@@ -127,11 +117,10 @@ compile_error!(
 );
 
 pub mod args;
-// Raw libpam FFI: an implementation detail of this cdylib. It is crate-private so
-// a downstream crate cannot reach the raw `pam_get_user`/`syslog`/… symbols or
-// accidentally grow a dependency on their exact shape (L6-7). Integration tests
-// that need to speak the C ABI declare their own minimal surface in
-// `tests/support` instead of widening this module for them.
+// Raw libpam FFI: an implementation detail of this cdylib. Crate-private so a
+// downstream crate cannot reach the raw `pam_get_user`/`syslog`/… symbols or depend
+// on their exact shape. Integration tests that need the C ABI declare their own
+// minimal surface in `tests/support`.
 pub(crate) mod bindings;
 pub mod logger;
 pub mod logic;
@@ -141,8 +130,8 @@ mod sys;
 pub use args::ModuleArgs;
 // The six exported `pam_sm_*` entry points are declared over this opaque handle,
 // so the type must remain nameable by an out-of-tree caller even though the raw
-// `pam_get_user`/`syslog`/… functions stay `pub(crate)` (L6-7). The handle has no
-// public API of its own; it is only ever passed through.
+// `pam_get_user`/`syslog`/… functions stay `pub(crate)`. The handle has no public
+// API of its own; it is only ever passed through.
 pub use bindings::pam_handle_t;
 pub use logic::{AuthOutcome, Deps, FAIL_DELAY_USEC, SystemDeps, authenticate, run};
 pub use seam::{PamSeam, RealPamSeam, SeamError};
@@ -157,8 +146,8 @@ fn guarded<F>(what: &str, body: F) -> c_int
 where
     F: FnOnce() -> c_int,
 {
-    // Root-cause fix for L8-1: replace the default stderr-printing panic hook with
-    // one that logs to syslog before `catch_unwind` can observe the panic.
+    // Replace the default stderr-printing panic hook with one that logs to syslog
+    // before `catch_unwind` can observe the panic.
     logger::install_panic_hook();
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
         Ok(code) => code,
@@ -306,8 +295,8 @@ pub extern "C" fn pam_sm_chauthtok(
 }
 
 #[cfg(test)]
-// Test-only `dup2`/`dup` to capture stderr for the L8-1 assertion below; the production
-// module surface stays `unsafe`-free (see the crate-level `deny(unsafe_code)` guard).
+// Test-only `dup2`/`dup` to capture stderr; the production module surface stays
+// `unsafe`-free (see the crate-level `deny(unsafe_code)` guard).
 #[allow(unsafe_code)]
 mod tests {
     use super::*;
@@ -352,7 +341,7 @@ mod tests {
         }
     }
 
-    /// L8-1: a panic contained by [`guarded`] must map to `PAM_ABORT` *and* leave the
+    /// A panic contained by [`guarded`] must map to `PAM_ABORT` *and* leave the
     /// invoking terminal untouched — the payload goes to syslog, never stderr.
     #[test]
     fn panic_in_guarded_logs_to_syslog_and_not_to_stderr() {
@@ -370,10 +359,10 @@ mod tests {
         );
     }
 
-    /// L3-5: the *outer* guarded closure that wraps the real `pam_sm_authenticate`
-    /// path (argument collection → `run`) must also contain a panic. A panic raised
-    /// while marshalling the PAM argument array must become `PAM_ABORT`, not unwind
-    /// across the C ABI.
+    /// The *outer* guarded closure that wraps the real `pam_sm_authenticate` path
+    /// (argument collection → `run`) must also contain a panic. A panic raised while
+    /// marshalling the PAM argument array must become `PAM_ABORT`, not unwind across
+    /// the C ABI.
     #[test]
     fn panic_in_the_outer_pam_sm_authenticate_closure_maps_to_pam_abort() {
         logger::install_panic_hook();

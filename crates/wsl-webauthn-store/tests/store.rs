@@ -1,9 +1,8 @@
-//! Store integration tests (plan §6).
+//! Store integration tests.
 //!
 //! These run as whatever uid the test process has: when run as root (CI) files are
 //! root-owned and the production `Store::system` expectations hold; when run as a normal
-//! user the store is constructed with `Store::with_owner(base, current_euid())`. This is
-//! the parameterization the plan requires so the same suite passes in both environments.
+//! user the store is constructed with `Store::with_owner(base, current_euid())`.
 
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -19,8 +18,7 @@ use wsl_webauthn_store::{
 
 /// Byte-for-byte golden encoding of [`sample_record("alice")`] (schema version 1).
 ///
-/// The on-disk JSON strings are an API: the shared-enum follow-up for `attestation.mode`
-/// (see `record.rs`) must not change them, so this literal pins the format.
+/// The on-disk JSON is an API, so this literal pins the format.
 const GOLDEN_STRICT_JSON: &str = r#"{"schema_version":1,"rp_id":"io.github.kirin-xiao.wsl-webauthn-pam","origin":"io.github.kirin-xiao.wsl-webauthn-pam","linux_user":"alice","linux_uid":1000,"credential_id":"Zm9vYmFy","cose_public_key":"AAECAw","alg":-7,"aaguid":"08987058-cadc-4b81-b6e1-30de50dcbe96","attestation":{"format":"packed","mode":"strict","verified":true,"leaf_sha256":"abababababababababababababababababababababababababababababababab"},"windows_identity":{"account":"HOST\\alice","sid":"S-1-5-21-1-2-3"},"enrolled_at":"2026-10-01T12:34:56Z","sign_count":0,"bridge_path":"/mnt/c/Users/alice/WSLWebAuthnBridge.exe","bridge_sha256":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}"#;
 
 // ---------------------------------------------------------------------------
@@ -163,8 +161,8 @@ fn save_load_list_remove_round_trip() {
 
 #[test]
 fn strict_record_json_is_byte_identical_to_golden() {
-    // The on-disk JSON strings are an API (the verifier and PAM both parse them); pin the
-    // exact bytes so the enum follow-up for `attestation.mode` cannot silently rename them.
+    // The on-disk JSON is an API (the verifier and PAM both parse it); pin the exact
+    // bytes so `attestation.mode` spellings cannot silently change.
     assert_eq!(
         serde_json::to_string(&sample_record("alice")).unwrap(),
         GOLDEN_STRICT_JSON
@@ -373,8 +371,8 @@ fn insecure_base_is_refused_by_list_and_remove() {
 
 #[test]
 fn missing_base_lists_empty_and_removes_nothing() {
-    // A base that is absent is not an *insecure* base: preserve the prior behaviour of
-    // treating it as "nothing enrolled" rather than erroring.
+    // A base that is absent is not an *insecure* base: it means "nothing enrolled"
+    // rather than an error.
     let d = TempDir::new().unwrap();
     let missing = d.path().join("does-not-exist");
     let store = Store::with_owner(&missing, current_euid());
@@ -451,7 +449,7 @@ fn load_unsupported_schema_is_corrupt() {
 
 #[test]
 fn load_rejects_unknown_attestation_mode_as_corrupt() {
-    // L16-7 = L6-6: a hand-edited `"mode"` must not load clean.
+    // A hand-edited `"mode"` must not load clean.
     let (_d, store) = fresh();
     let dir = store.credentials_dir();
     fs::create_dir(&dir).unwrap();
@@ -846,7 +844,7 @@ fn config_is_symlink_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// Config serialization / persistence (L7-4)
+// Config serialization / persistence
 // ---------------------------------------------------------------------------
 
 fn sample_config() -> Config {
@@ -859,8 +857,8 @@ fn sample_config() -> Config {
 
 #[test]
 fn to_toml_matches_the_installer_shape() {
-    // The historical installer emitted exactly this key order/format; the store-owned
-    // serializer must stay byte-compatible for the handoff (L7-4).
+    // The installer emitted exactly this key order/format; the store-owned serializer
+    // must stay byte-compatible with it.
     assert_eq!(
         sample_config().to_toml(),
         "bridge_path = \"/mnt/c/Users/alice/WSLWebAuthnBridge.exe\"\nwin_mnt = \"/mnt/c\"\ntimeout_secs = 60\n"
@@ -960,7 +958,7 @@ fn save_config_refuses_insecure_base() {
 
 #[test]
 fn default_win_mnt_is_the_canonical_constant() {
-    // L7-5 = L16-9: the CLI/installer must re-export this one constant.
+    // The CLI/installer must re-export this one constant.
     assert_eq!(Config::DEFAULT_WIN_MNT, "/mnt/c");
     let mut cfg = sample_config();
     cfg.win_mnt = PathBuf::from(Config::DEFAULT_WIN_MNT);
@@ -993,7 +991,7 @@ fn system_store_uses_production_paths() {
 
 #[test]
 fn kind_str_is_stable_distinct_and_non_identifying() {
-    // L8-9: the PAM module logs `kind_str`, never `Display`, so no token may embed the
+    // The PAM module logs `kind_str`, never `Display`, so no token may embed the
     // record path (the username leaf) and every variant needs a distinct stable token.
     let path = PathBuf::from("/etc/wsl_webauthn/credentials/alice.json");
     let cases: Vec<(StoreError, &str)> = vec![

@@ -5,8 +5,8 @@
 //!
 //! A rare marker branch runs a seeded oracle asserting that a structurally complete
 //! object parses and an object missing any required member (or a non-map) is rejected,
-//! so a parser that spuriously returns `Ok` for an incomplete object is caught
-//! (L14-10). The marker is committed as
+//! so a parser that spuriously returns `Ok` for an incomplete object is caught. The
+//! marker is committed as
 //! `fuzz/corpus/attestation_object/seed_oracle`.
 
 use libfuzzer_sys::fuzz_target;

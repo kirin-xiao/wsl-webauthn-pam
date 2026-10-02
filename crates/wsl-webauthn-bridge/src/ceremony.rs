@@ -1,5 +1,5 @@
-//! Ceremony orchestration: wire request → platform options → framed response
-//! (plan §5). Platform-independent (no `unsafe`); driven through the
+//! Ceremony orchestration: wire request → platform options → framed response.
+//! Platform-independent (no `unsafe`); driven through the
 //! [`WebAuthnApi`] trait so it is fully unit-testable on Linux.
 //!
 //! The only platform coupling is the watchdog thread, which calls
@@ -7,7 +7,7 @@
 //! inside a ceremony. `WebAuthNAuthenticatorMakeCredential` /
 //! `WebAuthNAuthenticatorGetAssertion` execute on the *calling* Win32 thread;
 //! the hidden window created there is what gives Windows Hello a foreground
-//! owner (plan §5, "window model"). All `unsafe` is confined to `crate::ffi`;
+//! owner. All `unsafe` is confined to `crate::ffi`;
 //! this module is `#![forbid(unsafe_code)]`.
 
 #![forbid(unsafe_code)]
@@ -30,7 +30,7 @@ pub const MAX_USER_ID_BYTES: usize = 64;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CeremonyOptions {
     /// Advisory platform timeout handed to `webauthn.dll` *and* used to arm
-    /// the user-mode watchdog (plan §5/D5: never trust the platform timeout).
+    /// the user-mode watchdog: the platform timeout is never trusted.
     pub timeout_ms: u32,
 }
 
@@ -213,7 +213,7 @@ impl ArmedCancellation {
 /// Windows returns `NTE_USER_CANCELLED` (`0x80090036`) to the ceremony when the
 /// bridge's own `WebAuthNCancelCurrentOperation` fires, so a watchdog-induced
 /// cancel is indistinguishable from a genuine user cancel at the HRESULT
-/// level. Plan §3 requires the bridge to report `timeout` in that case, so:
+/// level. The bridge reports `timeout` in that case, so:
 ///
 /// * the error was already a [`BridgeError::Timeout`] → stays `Timeout`;
 /// * the error mapped to [`BridgeError::UserCancelled`] **and** our watchdog
@@ -240,7 +240,7 @@ fn remap_watchdog_fire<T>(result: Result<T, BridgeError>, fired: bool) -> Result
 /// * `run` executes the blocking platform call on the current thread.
 /// * The watchdog's `fired` flag is snapshotted **after** `run` returns and
 ///   **before** the watchdog is disarmed; if our own cancel produced a
-///   user-cancel-shaped error it is reclassified to `timeout` (plan §3). A
+///   user-cancel-shaped error it is reclassified to `timeout`. A
 ///   successful result is never remapped.
 /// * On completion (success *or* error) the watchdog is disarmed and joined,
 ///   so no thread outlives the ceremony.
@@ -400,7 +400,7 @@ mod tests {
         }
 
         /// A stub whose ceremony blocks until the watchdog cancels, then
-        /// reports `ERROR_TIMEOUT` (the plan's platform-timeout shape).
+        /// reports `ERROR_TIMEOUT` (the platform-timeout shape).
         fn blocking() -> Self {
             StubApi {
                 block_until_cancel: true,
@@ -410,7 +410,7 @@ mod tests {
         }
 
         /// A stub whose ceremony blocks until the watchdog cancels, then
-        /// reports `NTE_USER_CANCELLED` — the spike-observed Windows behavior
+        /// reports `NTE_USER_CANCELLED` — Windows' behavior
         /// when *our* `WebAuthNCancelCurrentOperation` fires.
         fn blocking_user_cancelled() -> Self {
             StubApi {
@@ -432,7 +432,7 @@ mod tests {
 
         /// Block until the watchdog cancels (bounded), then return the
         /// simulated platform error. Returns `Internal` if the watchdog never
-        /// fired, which fails the tests loudly.
+        /// fired, which fails the tests.
         fn ceremony<T: Clone>(&self, scripted: &Result<T, BridgeError>) -> Result<T, BridgeError> {
             if let Some(hr) = self.immediate_error {
                 return Err(map_hresult(hr));
@@ -749,7 +749,7 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(1));
     }
 
-    // ---- watchdog self-cancel reclassification (plan §3) ----------------
+    // ---- watchdog self-cancel reclassification -------------------------
 
     /// (a) Genuine user cancel with the watchdog never fired must stay
     /// `user_cancelled` — on both the enroll and assert paths.

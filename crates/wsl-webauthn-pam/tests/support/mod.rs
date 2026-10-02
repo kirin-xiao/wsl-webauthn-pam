@@ -1,7 +1,5 @@
 //! Shared test machinery for the PAM module integration suite.
 //!
-//! Nothing here is compiled into the `.so`. It provides:
-//!
 //! * [`FakeSeam`] — an in-memory [`PamSeam`] that records messages and fail delays.
 //! * [`TestDeps`] — a [`Deps`] implementation that can serve a real
 //!   [`wsl_webauthn_store::Store`] (tempdir, `Store::with_owner`) or fixed replies,
@@ -40,11 +38,10 @@ use pam_wsl_webauthn::seam::{PamSeam, SeamError};
 // Minimal PAM ABI surface for the integration tests
 // ---------------------------------------------------------------------------
 //
-// `pam_wsl_webauthn::bindings` is crate-private (L6-7), and these tests live in a
-// separate crate, so they declare the handful of `pam_*` constants and types they
-// need themselves — exactly as an out-of-tree consumer would. The values are
-// pinned by the module's own `bindings.rs` layout tests; keeping the test copies
-// here means the test does not depend on a widened production API.
+// `pam_wsl_webauthn::bindings` is crate-private, and these tests live in a separate
+// crate, so they declare the handful of `pam_*` constants and types they need — exactly
+// as an out-of-tree consumer would. The values are pinned by the module's own
+// `bindings.rs` layout tests.
 
 /// `PAM_SUCCESS`.
 pub const PAM_SUCCESS: std::ffi::c_int = 0;

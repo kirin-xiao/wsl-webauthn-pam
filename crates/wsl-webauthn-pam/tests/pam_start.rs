@@ -1,4 +1,4 @@
-//! End-to-end integration through a **real libpam** (plan §8, §12.4).
+//! End-to-end integration through a **real libpam**.
 //!
 //! The unit/suite tests in `tests/pam.rs` drive the state machine through the
 //! [`pam_wsl_webauthn::seam::PamSeam`] abstraction. This test instead lets the real

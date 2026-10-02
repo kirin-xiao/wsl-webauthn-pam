@@ -1,5 +1,5 @@
 //! Platform-independent WebAuthn ceremony vocabulary and the [`WebAuthnApi`]
-//! abstraction (plan §5).
+//! abstraction.
 //!
 //! Everything in this module compiles on Linux *and* Windows and contains no
 //! `unsafe`. The ceremony logic in [`crate::ceremony`] is written against the
@@ -9,13 +9,12 @@
 //! The real Win32 implementation lives in [`crate::ffi`] (`#[cfg(windows)]`);
 //! tests supply a hand-written stub.
 
-// Enforce the plan §5 invariant that all `unsafe` lives in `crate::ffi`.
+// All `unsafe` lives in `crate::ffi`.
 #![forbid(unsafe_code)]
-// This module mirrors the Win32 vocabulary in full (plan D5). Variants that the
+// This module mirrors the Win32 vocabulary in full. Variants that the
 // bridge does not currently select are still a faithful transcription of
 // `webauthn.h`; they carry a narrowly-scoped `#[allow(dead_code)]` each rather
-// than a module-wide allow, so a genuinely orphaned item is still reported
-// (L16-13).
+// than a module-wide allow, so a genuinely orphaned item is still reported.
 
 use std::fmt;
 
@@ -64,7 +63,7 @@ pub const fn hresult_from_win32(code: u32) -> Hresult {
     }
 }
 
-/// Map a `webauthn.dll` HRESULT to the wire error taxonomy (plan §5).
+/// Map a `webauthn.dll` HRESULT to the wire error taxonomy.
 ///
 /// `S_OK` is not an error and maps to [`BridgeError::Internal`] only as a
 /// defensive fallback (callers must not invoke this with `S_OK`).

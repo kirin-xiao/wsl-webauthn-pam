@@ -1,17 +1,17 @@
-//! Linux/client-side helpers layered on the wire contract (L7-7).
+//! Linux/client-side helpers layered on the wire contract.
 //!
 //! Everything in this module is used **only by the Linux side** (`wsl-webauthn-runner`,
 //! `wsl-webauthn-pam`, `wsl-webauthn-cli`): the [`build_client_data`] serializer that
 //! mints the exact `clientDataJSON` bytes, its [`ClientDataKind`]/[`ProtocolError`]
 //! types, and the Linux process-deadline / bridge-`timeout_ms` defaults.
 //!
-//! The Windows bridge (`wsl-webauthn-bridge`) **MUST NOT use anything from this
+//! The Windows bridge (`wsl-webauthn-bridge`) **must not use anything from this
 //! module**. It receives `client_data_json` as an opaque base64url string on the wire
-//! and has no business rebuilding it or second-guessing the Linux-side deadline. These
+//! and does not rebuild it or second-guess the Linux-side deadline. These
 //! items are separated here so the two audiences are visible; the cross-OS contract
 //! itself (requests/responses/framing/`RP_ID`/`ORIGIN`/size caps) stays in the crate
-//! root. The items are re-exported from the crate root for the Linux callers that were
-//! written against the flat layout.
+//! root. The items are re-exported from the crate root for the Linux callers written
+//! against the flat layout.
 
 use serde::Serialize;
 use thiserror::Error;

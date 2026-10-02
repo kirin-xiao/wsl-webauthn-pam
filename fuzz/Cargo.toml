@@ -9,8 +9,7 @@ license = "MIT"
 cargo-fuzz = true
 
 # This directory is deliberately its own workspace root: `cargo-fuzz` requires it,
-# and the parent workspace (`members = ["crates/*"]`) explicitly `exclude`s `fuzz`
-# so a root `cargo test`/`cargo clippy` never tries to build the libFuzzer targets.
+# and the parent workspace (`members = ["crates/*"]`) explicitly `exclude`s `fuzz`.
 [workspace]
 
 [dependencies]

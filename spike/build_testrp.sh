@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build a bridge that pins a *different* RP ID, for the D2 robustness experiment
-# in SPIKE.md (does the platform accept RP IDs of the pinned shape?).
+# Build a bridge that pins a *different* RP ID (does the platform accept RP IDs
+# of the pinned shape?).
 #
 # The RP ID is a compile-time constant in `wsl-webauthn-protocol`, so the only
 # way to test a second RP ID without touching the protocol crate is to patch the

@@ -1,4 +1,4 @@
-//! Safe, symlink-hardened filesystem helpers for the installer (plan D6, §10).
+//! Safe, symlink-hardened filesystem helpers for the installer.
 //!
 //! The installer never walks through a symlink and never writes in place: every
 //! file is written to a temporary file **in the same directory** and then
@@ -8,7 +8,7 @@
 //! Everything here is implemented with safe `std` APIs except a tiny, audited `raw`
 //! submodule (the crate is `#![deny(unsafe_code)]`): [`std`] has no `openat`/`renameat`,
 //! which are required to bind the destination's parent directory by descriptor and close
-//! the parent-swap TOCTOU window in [`atomic_write`] (L12-11).
+//! the parent-swap TOCTOU window in [`atomic_write`].
 //!
 //! * [`lstat_opt`] uses [`std::fs::symlink_metadata`] — the safe `lstat(2)`.
 //! * `O_NOFOLLOW`/`O_CLOEXEC` are applied through
@@ -33,9 +33,7 @@ use sha2::{Digest as _, Sha256};
 ///
 /// This is the **only** `unsafe` in the module: `std` exposes no `openat`/`renameat`, which
 /// [`atomic_write`] needs to create the temp file and rename it relative to a
-/// dev/ino-verified parent directory (L12-11). The wrappers are small and each documents
-/// the ownership invariant it discharges, mirroring `wsl-webauthn-store`'s `sys` module so
-/// callers never write `unsafe`.
+/// dev/ino-verified parent directory. Callers never write `unsafe`.
 mod raw {
     #![allow(unsafe_code)]
 
@@ -185,7 +183,7 @@ fn temp_path(dir: &Path) -> PathBuf {
 /// `before` is the metadata from the caller's `lstat`. An explicit `O_NOFOLLOW` flag makes
 /// the kernel refuse a symlinked parent (`ELOOP`) rather than silently follow it, and the
 /// opened descriptor is `fstat`ed and compared `(dev, ino)` with `before`, so a directory
-/// swapped in between the caller's `lstat` and this open is rejected (L12-11). The returned
+/// swapped in between the caller's `lstat` and this open is rejected. The returned
 /// `File` owns the descriptor and must stay alive while the temp file is created and
 /// renamed relative to it.
 fn open_checked_dir(parent: &Path, before: &Metadata) -> io::Result<File> {
@@ -227,7 +225,7 @@ fn open_checked_dir(parent: &Path, before: &Metadata) -> io::Result<File> {
 /// descriptor (see [`open_checked_dir`]): the temp file is created and renamed via
 /// `openat`/`renameat` relative to the held, `(dev, ino)`-verified parent descriptor, so a
 /// parent directory swapped between the `lstat` and the rename is rejected instead of being
-/// written into (L12-11, mirroring the store's `open_checked_dir`).
+/// written into.
 ///
 /// The temp file is `fchmod`ed exactly, `fsync`ed, then `renameat`ed into place, and the
 /// directory is `fsync`ed on success; it is removed on every error path.
@@ -301,7 +299,7 @@ pub(crate) fn copy_file_atomic(src: &Path, dst: &Path, mode: u32) -> io::Result<
 /// `mkdir -p`, refusing to traverse a symlinked component.
 ///
 /// Unlike [`std::fs::create_dir_all`], every existing component is `lstat`ed and a
-/// symlink anywhere in the path is an error (D6: no symlink traversal). Missing
+/// symlink anywhere in the path is an error. Missing
 /// components are created with the process umask; callers pin the final directory's mode
 /// with [`set_mode`].
 pub(crate) fn create_dir_all(path: &Path) -> io::Result<()> {
@@ -425,7 +423,7 @@ pub(crate) fn short_hash(hex: &str) -> String {
 /// SHA-256 of a regular file as lowercase hex, read in bounded chunks.
 ///
 /// Streaming keeps the CLI's memory use independent of the (potentially large) bridge
-/// executable; the whole-file variant it replaces allocated the entire file.
+/// executable.
 pub(crate) fn sha256_hex_file(path: &Path) -> io::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
@@ -491,11 +489,11 @@ mod tests {
         assert!(lstat(&link).unwrap().file_type().is_symlink());
     }
 
-    /// L12-11: `atomic_write` must bind the parent directory by descriptor.
+    /// `atomic_write` must bind the parent directory by descriptor.
     ///
     /// `open_checked_dir` is the only place the parent `(dev, ino)` is re-verified, so a
-    /// direct unit test of it against a swapped-in directory is the deterministic check of
-    /// the new behaviour (a race from a single test thread cannot hit the window reliably).
+    /// direct unit test of it against a swapped-in directory is the deterministic check (a
+    /// race from a single test thread cannot hit the window reliably).
     #[test]
     fn atomic_write_rejects_swapped_parent_dir() {
         let tmp = TempDir::new().unwrap();
@@ -626,11 +624,10 @@ mod tests {
         assert!(dir.path().join("a/b/c").is_dir());
     }
 
-    /// L4-2: `remove_tree` must not consume one stack frame per directory level.
+    /// `remove_tree` must not consume one stack frame per directory level.
     ///
     /// A ~1500-deep chain is built (the deepest that fits `PATH_MAX`) and removed on a
-    /// deliberately tiny 128 KiB thread stack. The recursive form this replaced would
-    /// overflow such a stack; the explicit worklist must not.
+    /// deliberately tiny 128 KiB thread stack; the explicit worklist must not overflow it.
     #[test]
     fn remove_tree_handles_a_deep_tree_without_stack_overflow() {
         let dir = TempDir::new().unwrap();
@@ -654,7 +651,7 @@ mod tests {
         assert!(!dir.path().join("deep").exists());
     }
 
-    /// L7-5 = L10-1: the shared helpers must agree with the SHA-256 test vector.
+    /// The shared helpers must agree with the SHA-256 test vector.
     #[test]
     fn sha256_hex_file_matches_known_vector() {
         let dir = TempDir::new().unwrap();

@@ -1,13 +1,12 @@
-//! Tiny parsers for the external text the installer consumes (plan §10.2/§10.3).
+//! Tiny parsers for the external text the installer consumes.
 //!
-//! Both parsers are pure functions over a byte/string input so they are fully
-//! unit-testable, and every consumer passes an injectable path. Only the minimal
-//! grammar the installer needs is implemented; there is no general INI parser and no
-//! shell interpolation anywhere.
+//! Both parsers are pure functions over a byte/string input, and every consumer passes an
+//! injectable path. Only the minimal grammar the installer needs is implemented; there is
+//! no general INI parser and no shell interpolation anywhere.
 
 use std::path::PathBuf;
 
-/// Extract the Windows mount root from `/etc/wsl.conf` (plan §10.2).
+/// Extract the Windows mount root from `/etc/wsl.conf`.
 ///
 /// Only the `[automount]` section's `root=` key is honored: a `root=` appearing in
 /// any other section is ignored, because otherwise an unrelated `[network]` section
@@ -81,9 +80,8 @@ fn unquote(value: &str) -> String {
 
 /// Normalize a `%LOCALAPPDATA%` command output into a Windows path string.
 ///
-/// `cmd.exe /c echo %LOCALAPPDATA%` on Windows emits CRLF, and this is also the
-/// function used by tests with injected output. Returns `None` for output that is
-/// empty/whitespace only, or that clearly is an unconverted variable echo
+/// `cmd.exe /c echo %LOCALAPPDATA%` on Windows emits CRLF. Returns `None` for output that
+/// is empty/whitespace only, or that clearly is an unconverted variable echo
 /// (`%LOCALAPPDATA%` — cmd.exe prints it back when the variable is undefined).
 pub(crate) fn parse_local_appdata(raw: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(raw);

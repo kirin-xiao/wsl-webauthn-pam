@@ -1,10 +1,9 @@
-//! PAM module integration suite: the full §8 mapping table, driven end-to-end
-//! through the real runner against the `pam-test-fake-bridge` double and the real
-//! verifier against genuine ES256 assertions.
+//! PAM module integration suite, driven end-to-end through the real runner against
+//! the `pam-test-fake-bridge` double and the real verifier against genuine ES256
+//! assertions.
 //!
-//! Every row of the crate-root mapping table has at least one test here. The success
-//! path is a *real* cryptographic assertion: the test generates a P-256 key, signs
-//! `authenticatorData || SHA-256(clientDataJSON)`, enrolls the COSE key, and lets the
+//! The success path is a *real* cryptographic assertion: the test generates a P-256 key,
+//! signs `authenticatorData || SHA-256(clientDataJSON)`, enrolls the COSE key, and lets the
 //! module verify it. No part of the verifier is mocked.
 
 mod support;
@@ -164,7 +163,7 @@ fn store_error_is_authinfo_unavail() {
     assert_eq!(run_basic(&mut seam, &deps, 0, &[]), PAM_AUTHINFO_UNAVAIL);
 }
 
-/// L8-9: a store failure is logged by its stable *kind*, never the full `Display`. The
+/// A store failure is logged by its stable *kind*, never the full `Display`. The
 /// record path embeds the username, so the audit reason must not leak the leaf or the
 /// `/etc/wsl_webauthn/...` layout into `authpriv`.
 #[test]
@@ -215,7 +214,7 @@ fn dummy_config() -> wsl_webauthn_store::Config {
 }
 
 // ---------------------------------------------------------------------------
-// Bridge pin (D11)
+// Bridge pin
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -232,9 +231,9 @@ fn pin_unreadable_is_authinfo_unavail() {
     assert_eq!(run_basic(&mut seam, &deps, 0, &[]), PAM_AUTHINFO_UNAVAIL);
 }
 
-/// L2-4: the pin can no longer be disabled from the argument surface, and an
-/// untrusted (group/other-writable or symlinked) bridge path is refused before the
-/// hash. The production check is exercised against a tempdir it will accept.
+/// The pin cannot be disabled from the argument surface, and an untrusted
+/// (group/other-writable or symlinked) bridge path is refused before the hash.
+/// The production check is exercised against a tempdir it will accept.
 #[test]
 fn untrusted_bridge_path_is_authinfo_unavail() {
     let (_f, mut seam, mut deps) = happy();
@@ -242,7 +241,7 @@ fn untrusted_bridge_path_is_authinfo_unavail() {
     assert_eq!(run_basic(&mut seam, &deps, 0, &[]), PAM_AUTHINFO_UNAVAIL);
 }
 
-/// A stray `noverifypin` token is now an unknown argument: it must not re-enable a
+/// A stray `noverifypin` token is an unknown argument: it must not re-enable a
 /// pin-check bypass. With the pin intentionally mismatched, the run must still fail.
 #[test]
 fn noverifypin_token_no_longer_bypasses_a_pin_mismatch() {
@@ -482,7 +481,7 @@ fn credential_id_mismatch_is_auth_err() {
     assert_eq!(run_basic(&mut seam, &deps, 0, &[]), PAM_AUTH_ERR);
 }
 
-/// L2-11: a `Probe`/`Enroll` response arriving where an `Assert` was requested is an
+/// A `Probe`/`Enroll` response arriving where an `Assert` was requested is an
 /// unexpected variant and must fail closed with `PAM_AUTH_ERR` — never authenticate.
 #[test]
 fn unexpected_response_variant_is_auth_err() {
@@ -497,8 +496,8 @@ fn unexpected_response_variant_is_auth_err() {
     }
 }
 
-/// L2-11: a record with the correct `rp_id` but a mismatched `origin` is refused
-/// before the bridge runs (defence in depth). Only the `rp_id` mismatch was tested.
+/// A record with the correct `rp_id` but a mismatched `origin` is refused
+/// before the bridge runs (defence in depth).
 #[test]
 fn record_origin_mismatch_is_authinfo_unavail() {
     let fixture = Fixture::new();

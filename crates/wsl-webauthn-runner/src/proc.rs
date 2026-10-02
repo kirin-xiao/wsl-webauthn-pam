@@ -1,4 +1,4 @@
-//! Minimal, audited `libc` bindings for the interop runner.
+//! Safe `libc` bindings for the interop runner.
 //!
 //! This is the only module in the crate permitted to contain `unsafe`; the rest of the
 //! crate is `#![deny(unsafe_code)]`. It exposes safe wrappers for exactly the syscalls
@@ -37,11 +37,10 @@ use std::process::Command;
 /// inode that was opened (and can be `fstat`ed) — a later swap of the path cannot change
 /// the image.
 ///
-/// `F_DUPFD_CLOEXEC` (rather than `F_DUPFD`) is used because `F_DUPFD` fails with
-/// `EINVAL` whenever its minimum is at/above the *soft* `RLIMIT_NOFILE`; that limit is
-/// 1024 on a default WSL/systemd host, so a fixed high minimum such as 1024 would make
-/// every spawn fail before it starts. A low minimum also avoids colliding with an
-/// existing high-numbered descriptor in a long-lived host process.
+/// The minimum of `3` matters: `F_DUPFD` fails with `EINVAL` whenever its minimum is
+/// at/above the *soft* `RLIMIT_NOFILE` (1024 on a default WSL/systemd host), which would
+/// make every spawn fail. A low minimum also avoids colliding with an existing
+/// high-numbered descriptor in a long-lived host process.
 ///
 /// `FD_CLOEXEC` is deliberately *not* set on the inherited descriptor: the WSL binfmt
 /// handler (`WSLInterop`, flags `PF`) needs the descriptor to survive into the child
@@ -76,11 +75,9 @@ impl TrustedFile {
         let file = unsafe { File::from_raw_fd(fd) };
         let (dev, ino) = stat_identity(file.as_raw_fd())?;
 
-        // `F_DUPFD_CLOEXEC` returns the lowest free descriptor at/above 3 and, unlike
-        // `F_DUPFD`, does not fail when its minimum is at/above a low soft
-        // `RLIMIT_NOFILE` (1024 on a default WSL/systemd host). `FD_CLOEXEC` is then
-        // cleared so the descriptor survives `exec` into the WSL binfmt interpreter; the
-        // original stays `CLOEXEC` and closes when `file` drops.
+        // `F_DUPFD_CLOEXEC` returns the lowest free descriptor at/above 3. `FD_CLOEXEC`
+        // is then cleared so the descriptor survives `exec` into the WSL binfmt
+        // interpreter; the original stays `CLOEXEC` and closes when `file` drops.
         // SAFETY: `F_DUPFD_CLOEXEC` takes the fd and a minimum; it returns a new owned
         // fd or -1.
         let dup = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
@@ -148,11 +145,10 @@ fn stat_identity(fd: RawFd) -> io::Result<(u64, u64)> {
 /// Install a `pre_exec` guard that re-checks the held bridge descriptor immediately
 /// before `execve`.
 ///
-/// This is belt-and-braces on top of the held-fd spawn: the executed object is already
-/// the opened descriptor, so the only race left is another thread reusing the descriptor
-/// number. The guard stats the inherited fd in the forked child and fails the exec with
-/// `ESTALE` if either the descriptor is gone or its `(dev, ino)` no longer matches what
-/// was opened.
+/// The executed object is already the opened descriptor, so the only race left is another
+/// thread reusing the descriptor number. The guard stats the inherited fd in the forked
+/// child and fails the exec with `ESTALE` if either the descriptor is gone or its
+/// `(dev, ino)` no longer matches what was opened.
 pub(crate) fn set_spawn_guard(command: &mut Command, trusted: &TrustedFile) {
     let fd = trusted.inherit_fd();
     let (dev, ino) = trusted.identity();
@@ -305,8 +301,8 @@ pub(crate) fn process_alive(pid: u32) -> bool {
 
 /// CPU time consumed by the *calling thread* so far.
 ///
-/// Used by regression tests to prove an over-cap descriptor no longer spins the drain
-/// loop; process-wide accounting would be polluted by tests running in parallel.
+/// Used by regression tests to detect drain-loop spinning; process-wide accounting would
+/// be polluted by tests running in parallel.
 #[cfg(test)]
 pub(crate) fn thread_cpu_time() -> std::time::Duration {
     // SAFETY: clock_gettime writes a timespec into our local.
@@ -331,12 +327,11 @@ mod tests {
 
     /// Lower this process's soft `RLIMIT_NOFILE` to at most `limit`.
     ///
-    /// A default WSL/systemd host ships a soft limit of 1024, which is exactly the value
-    /// that made the old `F_DUPFD(fd, 1024)` held-fd spawn fail with `EINVAL` before the
-    /// fix. Reproducing that limit here keeps the regression meaningful on CI hosts with
-    /// a huge ambient limit. Only the soft limit is lowered (always permitted without
-    /// privilege); the hard limit is untouched, and restoring is unnecessary because the
-    /// lower value is what production sees.
+    /// A default WSL/systemd host ships a soft limit of 1024. Reproducing that limit here
+    /// keeps the regression meaningful on CI hosts with a huge ambient limit. Only the
+    /// soft limit is lowered (always permitted without privilege); the hard limit is
+    /// untouched, and restoring is unnecessary because the lower value is what production
+    /// sees.
     fn lower_soft_nofile_to_at_most(limit: u64) {
         // SAFETY: `getrlimit`/`setrlimit` read/write a local `rlimit`; lowering only the
         // soft limit is always allowed for the calling process.
@@ -360,11 +355,11 @@ mod tests {
         }
     }
 
-    /// L2-2: once the bridge is opened, replacing its path must not change the executed
-    /// image — the held descriptor still points at the originally opened inode.
+    /// Once the bridge is opened, replacing its path must not change the executed image —
+    /// the held descriptor still points at the originally opened inode.
     ///
-    /// The soft `RLIMIT_NOFILE` is lowered first so this exercises the default
-    /// WSL/systemd host limit under which the old `F_DUPFD(fd, 1024)` spawn failed.
+    /// The soft `RLIMIT_NOFILE` is lowered first so this exercises the default WSL/systemd
+    /// host limit.
     #[test]
     fn held_fd_exec_is_not_affected_by_path_replacement() {
         lower_soft_nofile_to_at_most(1024);
@@ -421,7 +416,7 @@ mod tests {
             "held fd must execute the originally opened inode, not the path replacement"
         );
 
-        // Belt-and-braces: the pre_exec guard fails closed if the fd is gone.
+        // The pre_exec guard fails closed if the fd is gone.
         // SAFETY: closing an owned descriptor that we are about to abandon.
         unsafe {
             libc::close(trusted.inherit_fd());

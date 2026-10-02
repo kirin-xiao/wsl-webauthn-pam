@@ -1,4 +1,4 @@
-# Line-ending policy (L15-7).
+# Line-ending policy.
 #
 # The project explicitly supports checking the repo out on Windows (the bridge
 # is built with a native cargo.exe). A Windows `git clone` defaults to

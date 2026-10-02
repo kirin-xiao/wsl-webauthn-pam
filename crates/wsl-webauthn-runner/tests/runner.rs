@@ -1,4 +1,4 @@
-//! Runner integration tests against the `fake-bridge` test double (plan §7).
+//! Runner integration tests against the `fake-bridge` test double.
 //!
 //! The fake bridge is a normal binary built from this package; its path is provided by
 //! Cargo as `CARGO_BIN_EXE_fake-bridge`. Environment-global concerns (the WSL interop
@@ -237,9 +237,9 @@ fn noisy_stderr_does_not_break_pid_parsing() {
     }
 }
 
-/// L10-3: on the EOF fast path (a child that writes a full response, closes its pipes,
-/// then lingers before exiting) the runner must not add a whole 20 ms poll tick after the
-/// response is already complete. The adaptive 1 ms spin reaps the child promptly.
+/// On the EOF fast path (a child that writes a full response, closes its pipes, then
+/// lingers before exiting) the runner must not add a whole poll tick after the response
+/// is complete; the adaptive spin reaps the child promptly.
 #[test]
 fn eof_fast_path_does_not_wait_a_full_tick() {
     let dir = cwd_dir();
@@ -256,7 +256,7 @@ fn eof_fast_path_does_not_wait_a_full_tick() {
     );
 }
 
-/// L9-4: `reap_bounded` must not overshoot the deadline by a full poll tick. A child that
+/// `reap_bounded` must not overshoot the deadline by a full poll tick. A child that
 /// ignores stdin and sleeps must be killed and its Timeout returned at ~deadline.
 #[test]
 fn timeout_does_not_overshoot_deadline_by_a_full_tick() {
@@ -288,7 +288,7 @@ fn missing_bridge_is_bridge_missing() {
     ));
 }
 
-/// L2-2: the bridge is opened `O_NOFOLLOW`, so a symlinked bridge path is refused rather
+/// The bridge is opened `O_NOFOLLOW`, so a symlinked bridge path is refused rather
 /// than followed. The `ELOOP` is surfaced as a `Spawn` error (not disguised as missing).
 #[test]
 fn symlinked_bridge_is_rejected() {
@@ -363,7 +363,7 @@ fn nonzero_exit_is_bridge_failed() {
     match r.probe(Duration::from_secs(5)).unwrap_err() {
         RunnerError::BridgeFailed { reason, message } => {
             assert_eq!(reason, ExitReason::Code(3));
-            // L8-4: exit code 3 is documented as a bad-frame request failure.
+            // Exit code 3 is documented as a bad-frame request failure.
             assert!(
                 message.contains("malformed") || message.contains("request frame"),
                 "{message}"
@@ -373,7 +373,7 @@ fn nonzero_exit_is_bridge_failed() {
     }
 }
 
-/// L8-4: each documented bridge exit code (3/4/5) is classified, not collapsed.
+/// Each documented bridge exit code (3/4/5) is classified, not collapsed.
 #[test]
 fn bridge_exit_codes_map_to_documented_meaning() {
     for (code, needle) in [(3, "request frame"), (4, "`op`"), (5, "stdout write")] {
@@ -389,7 +389,7 @@ fn bridge_exit_codes_map_to_documented_meaning() {
     }
 }
 
-/// L8-11: a signal death is modeled distinctly (not an ambiguous `None` status) and the
+/// A signal death is modeled distinctly (not an ambiguous `None` status) and the
 /// rendered message names the signal.
 #[test]
 fn signal_death_reports_signal_reason_and_name() {
@@ -422,7 +422,7 @@ fn signal_death_reports_signal_reason_and_name() {
     }
 }
 
-/// L8-11: a status with neither an exit code nor a terminating signal must not be
+/// A status with neither an exit code nor a terminating signal must not be
 /// fabricated into `signal 0`; it is reported as [`ExitReason::Unknown`].
 #[test]
 fn unknown_termination_status_is_not_signal_zero() {
@@ -441,7 +441,7 @@ fn unknown_termination_status_is_not_signal_zero() {
     assert_ne!(reason, ExitReason::Signal(0));
 }
 
-/// L8-4: the bridge's stderr tail (its HRESULT/error line) is folded into the failure
+/// The bridge's stderr tail (its HRESULT/error line) is folded into the failure
 /// diagnostic instead of being discarded.
 #[test]
 fn bridge_failed_carries_stderr_tail() {
@@ -456,7 +456,7 @@ fn bridge_failed_carries_stderr_tail() {
     }
 }
 
-/// L8-3: a ceremony error on a healthy transport (exit 0) still exposes the bridge's
+/// A ceremony error on a healthy transport (exit 0) still exposes the bridge's
 /// HRESULT line via `RunnerExchange::bridge_stderr`.
 #[test]
 fn ceremony_error_exposes_bridge_stderr_diagnostic() {
@@ -473,7 +473,7 @@ fn ceremony_error_exposes_bridge_stderr_diagnostic() {
     assert!(diag.contains("0x80070005"), "{diag}");
 }
 
-/// L8-4: the stderr tail is also attached to a malformed-frame transport failure.
+/// The stderr tail is also attached to a malformed-frame transport failure.
 #[test]
 fn transport_failure_carries_stderr_tail() {
     let dir = cwd_dir();
@@ -650,7 +650,7 @@ fn child_closing_stdin_early_is_still_served() {
 }
 
 // ---------------------------------------------------------------------------
-// SIGPIPE (L9-1): a closed stdin must never kill a SIGPIPE=SIG_DFL host
+// SIGPIPE: a closed stdin must never kill a SIGPIPE=SIG_DFL host
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -673,7 +673,7 @@ fn closed_stdin_write_cannot_sigpipe_kill_host() {
 }
 
 // ---------------------------------------------------------------------------
-// Over-cap stderr (L2-1 = L9-2)
+// Over-cap stderr
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -760,7 +760,7 @@ fn response_cap_constant_matches_protocol() {
 }
 
 // ---------------------------------------------------------------------------
-// L9-9: concurrency (runner-side proxy for concurrent PAM calls)
+// Concurrency (runner-side proxy for concurrent PAM calls)
 // ---------------------------------------------------------------------------
 
 /// Several runner instances driven from separate threads at once must all succeed. This

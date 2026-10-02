@@ -1,5 +1,4 @@
-//! `WSLWebAuthnBridge.exe` — the Windows half of the wsl-webauthn-pam pair
-//! (plan §5).
+//! `WSLWebAuthnBridge.exe` — the Windows half of the wsl-webauthn-pam pair.
 //!
 //! The process contract is strict and small:
 //!
@@ -25,7 +24,7 @@
 //! On non-Windows hosts the binary is a stub (the crate still builds and its
 //! platform-independent layers are unit-tested there).
 
-// This crate contains the audited Win32 FFI; `unsafe` is confined to `ffi`.
+// This crate contains the Win32 FFI; `unsafe` is confined to `ffi`.
 #![deny(unsafe_code)]
 
 // An aborting panic would kill the bridge process instead of letting it write a
@@ -45,7 +44,7 @@ compile_error!(
 mod api;
 #[cfg(any(windows, test))]
 mod ceremony;
-// Single, audited unsafe surface: hand-written `webauthn.dll` / Win32 FFI.
+// Single unsafe surface: hand-written `webauthn.dll` / Win32 FFI.
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod ffi;

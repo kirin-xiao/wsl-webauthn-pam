@@ -81,8 +81,7 @@ impl Default for MockCommands {
             calls: RefCell::new(Vec::new()),
             non_interactive: RefCell::new(Vec::new()),
             success: false,
-            // Matches a Debian/Ubuntu-style host so existing tests keep exercising the
-            // `pam-auth-update` path.
+            // Debian/Ubuntu-style host: `pam-auth-update` is reported available.
             available: true,
         }
     }
@@ -290,7 +289,7 @@ fn embedded_profile_matches_repo_file_byte_for_byte() {
         "the embedded profile drifted from {}",
         repo.display()
     );
-    // And the exact profile content the plan mandates.
+    // The exact profile content.
     assert!(PROFILE_TEXT.contains("Name: WSL WebAuthn authentication"));
     assert!(PROFILE_TEXT.contains("Default: no"));
     assert!(PROFILE_TEXT.contains("Priority: 260"));
@@ -306,10 +305,9 @@ fn embedded_profile_matches_repo_file_byte_for_byte() {
 fn install_reads_win_mnt_from_wsl_conf() {
     let h = Harness::new();
     // Point wsl.conf at a drive root *inside the harness tempdir* (final component `d`,
-    // so it stands in for `/mnt/d`) and have LOCALAPPDATA report a D: path. Using a real
-    // `/mnt/d` here would make the installer create the bridge outside the tempdir — on
-    // CI that path is unwritable (EACCES); on a dev box with a real DrvFs mount it would
-    // silently pollute the host. The absolute tempdir path is accepted by the parser.
+    // so it stands in for `/mnt/d`) and have LOCALAPPDATA report a D: path. A real `/mnt/d`
+    // would make the installer create the bridge outside the tempdir — unwritable on CI
+    // (EACCES), and on a dev box with a real DrvFs mount it would pollute the host.
     let win_mnt = h.win_mnt.parent().unwrap().join("d");
     write(
         &h.paths.etc_wsl_conf,
@@ -383,7 +381,7 @@ fn detect_module_dir_finds_lib64() {
     let roots = vec![h._tmp.path().join("usr/lib64")];
     assert_eq!(detect_module_dir(&roots).unwrap(), lib64_security);
 
-    // The production roots must include the lib64 root (regression guard).
+    // The production roots must include the lib64 root.
     assert!(
         InstallPaths::system()
             .module_search_roots
@@ -410,7 +408,7 @@ fn resolve_module_dir_prefers_explicit_flag() {
 
 #[test]
 fn install_prefers_exe_dir_over_cwd() {
-    // L12-10: the implicit artifact search is rooted at the running executable only.
+    // The implicit artifact search is rooted at the running executable only.
     // Two unrelated trees stand in for the executable's directory and an
     // attacker-controlled cwd; the search derived from the exe dir must never touch
     // the cwd tree, even though the latter has the tempting `build/release` layout a
@@ -463,7 +461,7 @@ fn install_prefers_exe_dir_over_cwd() {
 
 #[test]
 fn install_fixes_or_refuses_world_writable_credentials_dir() {
-    // L12-8: a pre-existing credentials/ directory must not be reused with an unsafe
+    // A pre-existing credentials/ directory must not be reused with an unsafe
     // owner/mode.
     let h = Harness::new();
     std::fs::create_dir_all(h.paths.credentials_dir()).unwrap();
@@ -567,12 +565,8 @@ fn install_provisions_everything() {
     );
 }
 
-/// L7-4: the config bytes the installer writes must come from the store's serializer
+/// The config bytes the installer writes must come from the store's serializer
 /// (`Config::to_toml`) and round-trip through the store's `deny_unknown_fields` parser.
-///
-/// `install_provisions_everything` already round-trips via `store.load_config()`; this
-/// pins the exact bytes to the store-owned serializer so the installer cannot quietly
-/// reintroduce a hand-rolled TOML shape.
 #[test]
 fn provision_config_writes_store_serialized_toml() {
     let h = Harness::new();
@@ -622,8 +616,7 @@ fn install_does_not_enroll_when_declined() {
     let h = Harness::new();
     let mut opts = h.opts();
     opts.skip_enroll = false;
-    // First confirmation = enable? (no); enrollment offer = yes for enable... use explicit
-    // answers: enable profile -> false, enroll -> false.
+    // Answer no to enabling the profile and no to the enrollment offer.
     let prompter = ScriptedPrompter::with_answers(&[false, false]);
     let enroller = MockEnroller::default();
     let code = h
@@ -782,8 +775,7 @@ fn install_without_pam_auth_update_prints_manual_steps() {
             .all(|(p, _)| p != "pam-auth-update"),
         "pam-auth-update must not be invoked when absent"
     );
-    // First-class manual instructions are available (data form is asserted; the flow
-    // prints exactly these lines).
+    // The flow prints exactly these manual steps.
     let steps = manual_enable_steps(&h.paths);
     let joined = steps.join("\n");
     assert!(joined.contains("/etc/pam.d/common-auth"), "{joined}");
@@ -910,8 +902,8 @@ fn install_fails_cleanly_when_bridge_artifact_missing() {
 
 #[test]
 fn install_fails_when_module_artifact_is_truncated() {
-    // L12-9: a truncated module artifact must not be installed and "verified"; the
-    // installer compares the installed bytes against the source, not just the type+mode.
+    // A truncated module artifact must not be installed as "verified": the installer
+    // compares the installed bytes against the source, not just the type+mode.
     let h = Harness::new();
     // A normal install + verify succeeds.
     h.run_install(

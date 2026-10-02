@@ -1,11 +1,7 @@
 //! Shared synthetic-vector machinery for the verifier test suite.
 //!
-//! Everything here is *generated in-process*: no real-machine material and no
-//! vendor binaries. It lets the tests exercise every positive and negative
-//! invariant from plan §4 without depending on fixtures that may not exist.
-//!
-//! This module is included by several integration-test binaries, so it is compiled
-//! more than once; unused helpers are expected and allowed.
+//! Everything here is generated in-process: no real-machine material and no
+//! vendor binaries.
 
 #![allow(dead_code)]
 #![allow(unused_imports)]
@@ -52,9 +48,9 @@ pub const OID_TCG_KP_AIK_CERTIFICATE: der::asn1::ObjectIdentifier =
 /// The single wall-clock instant every synthesized fixture is pinned to
 /// (2020-09-13T12:26:40Z). Fixture validity windows and `EnrollCheck::now` are
 /// both derived from it, so no test depends on the verifier re-reading the real
-/// clock independently of the fixture (L14-7). It sits well inside the default
-/// ±1 h validity windows and inside the committed independent vector's
-/// 2020..2049 certificate window.
+/// clock independently of the fixture. It sits well inside the default ±1 h
+/// validity windows and inside the committed independent vector's 2020..2049
+/// certificate window.
 pub const FIXTURE_NOW_SECS: u64 = 1_600_000_000;
 
 /// [`FIXTURE_NOW_SECS`] as a [`SystemTime`].
@@ -329,14 +325,11 @@ pub struct ChainOptions {
     pub leaf_ou: String,
     pub leaf_is_ca: bool,
     pub intermediate_is_ca: bool,
-    /// Insert a fourth CA level between the root and the leaf-signing intermediate
-    /// (`root → extra CA → intermediate CA → leaf`), so a `pathLenConstraint` on the
-    /// extra CA can be genuinely exceeded by the intermediate below it.
+    /// Insert a fourth CA level between the root and the leaf-signing intermediate,
+    /// so an `extra_intermediate_path_len` constraint can be genuinely exceeded.
     pub extra_intermediate: bool,
-    /// The `pathLenConstraint` placed on the extra CA (see
-    /// [`ChainOptions::extra_intermediate`]). `Some(0)` (the default) is violated by
-    /// the single non-self-issued intermediate below it; `Some(1)` or `None` admits
-    /// the chain.
+    /// The `pathLenConstraint` on the extra CA: `Some(0)` (default) is violated by
+    /// the intermediate below it; `Some(1)` or `None` admits the chain.
     pub extra_intermediate_path_len: Option<u8>,
     pub include_aaguid_ext: bool,
     /// Sign the leaf with a key other than the intermediate's (breaks the link).
@@ -351,26 +344,24 @@ pub struct ChainOptions {
     /// Remove the `tpm` leaf's KeyUsage extension entirely (absent is allowed).
     pub omit_aik_key_usage: bool,
     /// Sign the leaf with a certificate name that does not match the issuer's
-    /// subject, so the issuer/subject link must be rejected even though the
-    /// signature still checks out.
+    /// subject, so the issuer/subject link is rejected even though the signature
+    /// checks out.
     pub issuer_name_override: Option<Name>,
-    /// Emit the leaf certificate as X.509 **version 1** (default V3). Extension-less
-    /// v1 certs are the realistic shape; the verifier must reject any non-v3 leaf.
+    /// Emit the leaf certificate as X.509 **version 1** (default V3).
     pub leaf_version_v1: bool,
-    /// Omit the leaf's BasicConstraints extension (it is mandatory for us).
+    /// Omit the leaf's BasicConstraints extension (the verifier requires it).
     pub omit_leaf_basic_constraints: bool,
     /// Omit the intermediate's BasicConstraints extension.
     pub omit_intermediate_basic_constraints: bool,
     /// Override the leaf's OID and its `TBSCertificate.signature` OID with an
-    /// unsupported value (e.g. `1.2.840.113549.1.1.4` = md5WithRSA), so the link
-    /// check reaches `UnsupportedCertificateAlgorithm`.
+    /// unsupported value (e.g. `1.2.840.113549.1.1.4` = md5WithRSA).
     pub leaf_sig_oid: Option<der::asn1::ObjectIdentifier>,
     /// Replace the leaf's `id-fido-gen-ce-aaguid` extension value with arbitrary
-    /// (malformed) bytes, so `CertificateAaguidMalformed` is reached.
+    /// (malformed) bytes.
     pub malformed_aaguid_ext: bool,
     /// Replace the leaf's BasicConstraints extension with the empty SEQUENCE
-    /// encoding of `basicConstraints`; RFC 5280 defines `cA BOOLEAN DEFAULT FALSE`,
-    /// so this is a valid *non-CA* constraints extension and must be accepted.
+    /// encoding; RFC 5280 defines `cA BOOLEAN DEFAULT FALSE`, so this is a valid
+    /// *non-CA* constraints extension and must be accepted.
     pub leaf_basic_constraints_empty: bool,
     pub leaf_validity: Validity,
     pub intermediate_validity: Validity,
@@ -770,12 +761,9 @@ pub fn chain_leaf(opts: &ChainOptions) -> ChainLeaf {
 }
 
 /// Set (or, with `None`, remove) a certificate's KeyUsage extension, re-signing the
-/// TBS with `issuer` so the certificate stays a valid chain link.
-///
-/// `Profile::Leaf` hard-codes `digitalSignature | nonRepudiation`; this is the only
-/// way to synthesize a leaf whose KeyUsage forbids signing (which the verifier's
-/// `tpm` profile must reject) or one that omits KeyUsage entirely (which it must
-/// accept, per RFC 5280).
+/// TBS with `issuer` so the certificate stays a valid chain link. `Profile::Leaf`
+/// hard-codes `digitalSignature | nonRepudiation`, so this is the only way to
+/// synthesize a leaf whose KeyUsage forbids signing, or one that omits it.
 fn set_key_usage(cert: Certificate, issuer: &Signer, usage: Option<KeyUsages>) -> Certificate {
     use der::Encode as _;
 
@@ -996,8 +984,8 @@ pub fn cert_roundtrip(der: &[u8]) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 // TPM (`tpm`) attestation vectors
 //
-// Synthesized from scratch to match the WebAuthn §8.3 structure. The signature is
-// produced by an RSA "AIK" key so the vectors mirror the Windows Hello RS1 layout.
+// Synthesized to match the WebAuthn §8.3 structure, signed by an RSA "AIK" key
+// mirroring the Windows Hello RS1 layout.
 // ---------------------------------------------------------------------------
 
 /// TPM algorithm identifiers used by the vector builder.

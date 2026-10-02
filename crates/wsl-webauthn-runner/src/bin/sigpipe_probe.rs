@@ -1,13 +1,12 @@
-//! `sigpipe-probe` — test double for the L9-1 SIGPIPE host-kill regression.
+//! `sigpipe-probe` — test double emulating a non-Rust PAM host.
 //!
-//! Test support only. It emulates a non-Rust PAM host (the runner is a `cdylib` loaded
-//! into `sudo`/`su`/`sshd`, none of which set `SIGPIPE` to `SIG_IGN`) by resetting
-//! `SIGPIPE` to `SIG_DFL`, then:
+//! Test support only. The runner is a `cdylib` loaded into `sudo`/`su`/`sshd`, none of
+//! which set `SIGPIPE` to `SIG_IGN`; this binary resets `SIGPIPE` to `SIG_DFL` and then:
 //!
-//! 1. writes to a pipe whose read end is closed, via the runner's real SIGPIPE-safe
-//!    write path — a missing fix terminates this process with `SIGPIPE` (exit 141);
-//! 2. if `FAKE_BRIDGE` is set, drives the fake bridge in `closestdin=1` mode (a child
-//!    that closes its stdin before the request is written) and requires a clean probe.
+//! 1. writes to a pipe whose read end is closed, via the runner's real SIGPIPE-safe write
+//!    path — without that protection the process dies with `SIGPIPE` (exit 141);
+//! 2. if `FAKE_BRIDGE` is set, drives the fake bridge in `closestdin=1` mode (a child that
+//!    closes its stdin before the request is written) and requires a clean probe.
 //!
 //! Exits 0 on success; any other status (including death by signal) fails the test.
 
@@ -32,8 +31,8 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Write to a pipe whose read end is already closed. With the fix this returns `EPIPE`;
-/// without it, `SIGPIPE` kills the process before the call returns.
+/// Write to a pipe whose read end is already closed. Returns `EPIPE` through the
+/// SIGPIPE-safe path; a stray `SIGPIPE` would kill the process before the call returns.
 fn direct_closed_pipe() -> Option<ExitCode> {
     let mut pipefd: [libc::c_int; 2] = [0; 2];
     // SAFETY: pipe(2) writes two owned fds into our array.

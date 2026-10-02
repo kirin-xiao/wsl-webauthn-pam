@@ -1,4 +1,4 @@
-//! PAM module argument parsing (plan §8).
+//! PAM module argument parsing.
 //!
 //! Recognised arguments (all optional, order-independent):
 //!
@@ -7,11 +7,10 @@
 //!   `1..=`[`MAX_TIMEOUT_SECS`]; overrides the config value and the 60 s default.
 //!
 //! There is deliberately **no `noverifypin` argument**: disabling the
-//! bridge-executable SHA-256 pin from `/etc/pam.d` let an operator (or a near-miss
-//! typo they believed enabled it) silently turn root authentication into "run
-//! whatever executable is at the configured path". The pin is now always verified.
-//! A future build/install-time escape hatch, if ever needed, must live behind
-//! `cfg(debug_assertions)` — never in the runtime argument surface (L2-4).
+//! bridge-executable SHA-256 pin from `/etc/pam.d` would silently turn root
+//! authentication into "run whatever executable is at the configured path". The pin
+//! is always verified. Any build/install-time escape hatch lives behind
+//! `cfg(debug_assertions)`, never in the runtime argument surface.
 //!
 //! Unknown arguments are **logged at `LOG_ERR`**, not silently debug-logged: a
 //! near-miss `timeout=`, a misspelled flag, or a stale `noverifypin` must be visible
@@ -29,7 +28,7 @@ use crate::logger;
 /// The whole authentication is a 1–3 s Windows Hello gesture; a value above this is
 /// far more likely to be a typo (`timeout=6000`) or a denial-of-service knob than a
 /// deliberate setting, so an out-of-range value is rejected rather than honoured
-/// unboundedly (L2-7).
+/// unboundedly.
 pub const MAX_TIMEOUT_SECS: u64 = 600;
 
 /// Parsed module arguments.
@@ -134,8 +133,8 @@ mod tests {
 
     #[test]
     fn timeout_out_of_range_or_malformed_is_ignored() {
-        // Zero, non-numeric, empty, and the previously-unbounded u64::MAX all fall
-        // back to the config/default rather than being honoured.
+        // Zero, non-numeric, empty, and an over-u64 value all fall back to the
+        // config/default rather than being honoured.
         assert_eq!(parse(&s(&["timeout=0"])).timeout_secs, None);
         assert_eq!(parse(&s(&["timeout=abc"])).timeout_secs, None);
         assert_eq!(parse(&s(&["timeout="])).timeout_secs, None);
@@ -159,7 +158,7 @@ mod tests {
         let a = parse(&s(&["bogus", "foo=bar", "=x", "timeout=5"]));
         assert!(!a.debug);
         assert_eq!(a.timeout_secs, Some(5));
-        // `noverifypin` is no longer an argument; it must not silently do anything.
+        // `noverifypin` is not an argument; it must not silently do anything.
         assert_eq!(parse(&s(&["noverifypin"])), ModuleArgs::default());
         assert_eq!(parse(&s(&["no_verify_pin"])), ModuleArgs::default());
     }

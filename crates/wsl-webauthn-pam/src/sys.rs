@@ -29,7 +29,7 @@ fn cpath(path: &Path) -> io::Result<CString> {
 /// Open `path` read-only, refusing a final symlink.
 ///
 /// `O_NOFOLLOW` makes a symlink at the bridge path fail with `ELOOP` instead of
-/// silently hashing its target (L2-2).
+/// silently hashing its target.
 pub(crate) fn open_readonly_nofollow(path: &Path) -> io::Result<File> {
     let c = cpath(path)?;
     let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NOCTTY | libc::O_CLOEXEC;

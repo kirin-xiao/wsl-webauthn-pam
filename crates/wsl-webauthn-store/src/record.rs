@@ -1,7 +1,7 @@
-//! On-disk credential/config data types (plan §6).
+//! On-disk credential/config data types.
 //!
-//! These are plain serde types with no filesystem logic; [`crate::Store`] owns the
-//! hardening. The JSON schema is documented on the crate root.
+//! Plain serde types with no filesystem logic; [`crate::Store`] owns the hardening. The
+//! JSON schema is documented on the crate root.
 
 use std::path::PathBuf;
 
@@ -11,7 +11,7 @@ use thiserror::Error;
 /// Current on-disk record schema version.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// `attestation.mode` value: attestation was verified under the strict policy (D3).
+/// `attestation.mode` value: attestation was verified under the strict policy.
 pub const MODE_STRICT: &str = "strict";
 
 /// `attestation.mode` value: a self/`none`-attested key admitted by explicit opt-in.
@@ -19,9 +19,6 @@ pub const MODE_UNATTESTED_OPT_IN: &str = "unattested-opt-in";
 
 /// Returns `true` if `mode` is one of the known [`MODE_STRICT`]/[`MODE_UNATTESTED_OPT_IN`]
 /// `attestation.mode` values.
-///
-/// This is the single allow-list used both while serializing a record and while loading
-/// one, so a hand-edited `"mode"` value cannot be persisted or read back as valid.
 pub(crate) fn valid_attestation_mode(mode: &str) -> bool {
     mode == MODE_STRICT || mode == MODE_UNATTESTED_OPT_IN
 }
@@ -40,18 +37,17 @@ pub enum InvalidRecord {
     StrictNotVerified,
 }
 
-/// A single Linux user's enrolled credential (one record per user, plan D8).
+/// A single Linux user's enrolled credential (one record per user).
 ///
 /// Serialized to `<base>/credentials/<linux_user>.json` (mode `0600`, root-owned).
-/// See the crate docs for the exact JSON schema and an example.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialRecord {
     /// On-disk schema version; currently [`SCHEMA_VERSION`].
     pub schema_version: u32,
-    /// Pinned Relying Party ID (compile-time constant, plan D2).
+    /// Pinned Relying Party ID (compile-time constant).
     pub rp_id: String,
-    /// Pinned WebAuthn origin (equal to `rp_id`, plan D2).
+    /// Pinned WebAuthn origin (equal to `rp_id`).
     pub origin: String,
     /// The Linux login name this credential authenticates.
     pub linux_user: String,
@@ -67,15 +63,15 @@ pub struct CredentialRecord {
     pub aaguid: String,
     /// Attestation details captured at enrollment.
     pub attestation: AttestationRecord,
-    /// The enrolling Windows account, when it could be determined (plan D8).
+    /// The enrolling Windows account, when it could be determined.
     pub windows_identity: Option<WindowsIdentity>,
     /// Enrollment time, RFC 3339 in UTC.
     pub enrolled_at: String,
     /// Signature counter captured at enrollment (assertions update the caller's view).
     pub sign_count: u32,
-    /// Absolute path of the pinned bridge executable at enrollment (plan D11).
+    /// Absolute path of the pinned bridge executable at enrollment.
     pub bridge_path: String,
-    /// Lowercase hex SHA-256 of the bridge executable at enrollment (plan D11).
+    /// Lowercase hex SHA-256 of the bridge executable at enrollment.
     pub bridge_sha256: String,
 }
 
@@ -86,11 +82,7 @@ impl CredentialRecord {
     }
 
     /// Validate the invariants the store documents for a record but that serde alone
-    /// cannot express.
-    ///
-    /// This is called from [`crate::Store::load`] and [`crate::Store::save_atomic`], so
-    /// an invalid record is rejected both when read from disk and before it is written.
-    /// Today that means `attestation.mode` must be [`MODE_STRICT`] or
+    /// cannot express: `attestation.mode` must be [`MODE_STRICT`] or
     /// [`MODE_UNATTESTED_OPT_IN`], and a strict record must be `verified`.
     pub fn validate(&self) -> Result<(), InvalidRecord> {
         if !valid_attestation_mode(&self.attestation.mode) {
@@ -105,7 +97,7 @@ impl CredentialRecord {
     }
 }
 
-/// Attestation facts recorded for a credential (plan §6, D3).
+/// Attestation facts recorded for a credential.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AttestationRecord {
@@ -119,7 +111,7 @@ pub struct AttestationRecord {
     pub leaf_sha256: Option<String>,
 }
 
-/// The Windows account bound to a credential for audit purposes (plan D8).
+/// The Windows account bound to a credential for audit purposes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WindowsIdentity {
@@ -129,7 +121,7 @@ pub struct WindowsIdentity {
     pub sid: String,
 }
 
-/// Parsed `<base>/config` (plan §6, §10).
+/// Parsed `<base>/config`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// Path to the pinned bridge executable.
@@ -141,26 +133,18 @@ pub struct Config {
 }
 
 impl Config {
-    /// The single canonical Windows mount root default (`/mnt/c`).
-    ///
-    /// The CLI and installer must re-export this constant rather than declaring their own
-    /// copy; [`Config::to_toml`] and the `RawConfig` parser both key off it.
+    /// The Windows mount root default (`/mnt/c`).
     pub const DEFAULT_WIN_MNT: &'static str = "/mnt/c";
 
     /// Serialize this config as the exact TOML shape [`crate::Store::load_config`] parses.
     ///
-    /// The store owns both sides of the on-disk format (see `L7-4`): this is the writer
-    /// counterpart to the `deny_unknown_fields` `RawConfig` parser, so a field
-    /// added to one side cannot silently drift from the other. The `timeout_secs` line is
-    /// omitted when `None` (matching the installer's historical output and the parser's
-    /// default).
-    ///
-    /// `bridge_path`/`win_mnt` are rendered with `to_string_lossy`, mirroring the
-    /// installer; non-UTF-8 paths are not representable in a TOML basic string.
+    /// The counterpart to the `deny_unknown_fields` `RawConfig` parser. The `timeout_secs`
+    /// line is omitted when `None`. `bridge_path`/`win_mnt` are rendered with
+    /// `to_string_lossy`; non-UTF-8 paths are not representable in a TOML basic string.
     #[must_use]
     pub fn to_toml(&self) -> String {
-        // Serialize a writer type rather than `Self` because `toml` cannot round-trip a
-        // `PathBuf` field (`PathBuf` serializes as a map, which is not a TOML string).
+        // Serialize a separate writer type because `toml` cannot round-trip a `PathBuf`
+        // field (`PathBuf` serializes as a map, not a TOML string).
         #[derive(Serialize)]
         struct ConfigToml<'a> {
             bridge_path: std::borrow::Cow<'a, str>,
@@ -178,7 +162,7 @@ impl Config {
     }
 }
 
-/// Default serialization of [`Config`]'s TOML shape.
+/// Deserialization shape for [`Config`]'s TOML, applying field defaults.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RawConfig {

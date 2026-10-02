@@ -18,11 +18,9 @@
 //!
 //! ## Note on credential id and Windows Hello
 //!
-//! Plan §4 lists "credentialId match" as an assertion invariant. The bridge always
-//! echoes the credential id it used, and the PAM path passes the *enrolled* id here;
-//! the id is therefore already pinned by the store lookup. This function additionally
-//! accepts an assertion whose `authData` carries attested credential data only when
-//! the embedded id equals `credential_id`.
+//! The caller supplies the enrolled credential id, so the id is already pinned by the
+//! store lookup. This function additionally accepts an assertion whose `authData`
+//! carries attested credential data only when the embedded id equals `credential_id`.
 
 use sha2::{Digest as _, Sha256};
 

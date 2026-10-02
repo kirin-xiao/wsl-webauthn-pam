@@ -6,7 +6,7 @@
 //! A rare marker branch runs a seeded oracle asserting that valid structures parse,
 //! every strict truncation is rejected, and (since both parsers consume the whole
 //! buffer) an appended byte is rejected too — so a parser that spuriously returns
-//! `Ok` for a short or over-long buffer is caught (L14-10). The declared-`keyBits`
+//! `Ok` for a short or over-long buffer is caught. The declared-`keyBits`
 //! semantic invariant lives in `tpm::verify`, not this parse seam; see the oracle.
 //! The marker is committed as `fuzz/corpus/tpm/seed_oracle`.
 

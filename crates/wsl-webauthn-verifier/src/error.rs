@@ -3,14 +3,14 @@
 //! Every parser stage has a dedicated `Malformed*` variant; every semantic check
 //! (clientData equality, `rpIdHash`, flags, credential-id match, allow-listed
 //! algorithms, chain constraints) has its own variant. No path panics: all parsing
-//! failures are mapped here (plan §4).
+//! failures are mapped here.
 
 use thiserror::Error;
 
 /// Failure of a WebAuthn assertion or attestation verification.
 ///
 /// Variants are exhaustive and stable so that callers (the PAM module and the CLI)
-/// can map them to PAM result codes per plan §8 without guessing.
+/// can map them to PAM result codes without guessing.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum VerifyError {
     // ------------------------------------------------------------------

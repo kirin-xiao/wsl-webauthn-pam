@@ -1,18 +1,18 @@
-//! `wsl-webauthn-pam` — the operator-facing CLI (plan §9).
+//! `wsl-webauthn-pam` — the operator-facing CLI.
 //!
 //! Subcommands:
 //!
 //! * `enroll` — probe, run a Windows Hello enrollment ceremony, verify the attestation
-//!   under the selected policy (including the D3 **double-enroll** quirk), capture the
+//!   under the selected policy (including the **double-enroll** retry), capture the
 //!   Windows identity, and atomically persist a credential record.
-//! * `unregister` — remove exactly one user's credential record (SR-20).
+//! * `unregister` — remove exactly one user's credential record.
 //! * `probe` — report interop / Hello availability and the bridge pin.
 //! * `status` — list enrolled users and the config summary.
 //! * `verify` — run the verifier against an in-process synthetic attestation+assertion
 //!   to prove the crypto stack works on this machine.
-//! * `install` — the D6 installer (plan §10): provision the bridge, config, module and
-//!   profile, migrate a legacy WSL-Hello-sudo install (D7), and offer enrollment.
-//! * `uninstall` — remove one user's record (SR-20) or, with `--all`, every provisioned
+//! * `install` — provision the bridge, config, module and profile, migrate a legacy
+//!   WSL-Hello-sudo install, and offer enrollment.
+//! * `uninstall` — remove one user's record or, with `--all`, every provisioned
 //!   component (never the legacy `/etc/pam_wsl_hello`).
 //!
 //! # Design notes
@@ -28,20 +28,18 @@
 //!   verifier already parsed from the credential COSE key, so the CLI carries no
 //!   CBOR reader of its own.
 //!
-//! # D3 double-enroll
+//! # Double-enroll retry
 //!
 //! Windows *can* return a `none`-attested credential on the first-ever enrollment for an
-//! RP ID. The spike observed this for one of two RP IDs (the other returned `tpm` even on
-//! its first enrollment), so it is a real but not guaranteed quirk. Under Strict the
-//! verifier rejects `none` because of the format; the CLI then runs exactly one further
-//! ceremony with a **fresh** challenge and verifies that instead — belt-and-braces for the
-//! quirk. The first ceremony's outcome is **discarded** and can never reach the record —
-//! the persisted `credential_id` always names the second credential. See
+//! RP ID. Under Strict the verifier rejects `none` because of the format; the CLI then runs
+//! exactly one further ceremony with a **fresh** challenge and verifies that instead. The
+//! first ceremony's outcome is **discarded** and can never reach the record — the persisted
+//! `credential_id` always names the second credential. See
 //! [`enroll_with_double_enroll`].
 //!
-//! # Wave C installer (plan §10)
+//! # Installer
 //!
-//! The `install` subcommand (plan §10) MUST, before `enroll`/PAM can work, write:
+//! The `install` subcommand must, before `enroll`/PAM can work, write:
 //!
 //! * `/etc/wsl_webauthn/config` (TOML, `0600` root:root) with `bridge_path` (absolute),
 //!   `win_mnt`, and optional `timeout_secs`;
@@ -51,7 +49,7 @@
 //!   `%LOCALAPPDATA%\Programs\wsl-webauthn-pam\WSLWebAuthnBridge.exe` and pin its
 //!   SHA-256 at enrollment;
 //! * `pam_wsl_webauthn.so` and the `pam-config` profile **before** removing the legacy
-//!   module (D7: a stale reference means a load failure and lockout).
+//!   module (a stale reference means a load failure and lockout).
 //!
 //! The implementation lives in [`installer`]; every system path is carried in an
 //! [`installer::InstallPaths`] value so tests are fully tempdir-backed and never touch
@@ -88,16 +86,16 @@ use wsl_webauthn_verifier::{
 
 /// Default Windows mount root when neither the config nor `--win-mnt` supplies one.
 ///
-/// L7-5 = L16-9: re-exported from the store so the default has a single definition
+/// Re-exported from the store so the default has a single definition
 /// (`wsl_webauthn_store::Config::DEFAULT_WIN_MNT`); the CLI must not carry its own copy.
 const DEFAULT_WIN_MNT: &str = wsl_webauthn_store::Config::DEFAULT_WIN_MNT;
-/// Hard Linux deadline for a whole enrollment child process (plan §3).
+/// Hard Linux deadline for a whole enrollment child process.
 const ENROLL_DEADLINE: Duration = Duration::from_secs(180);
 
 /// Hard Linux deadline for a probe.
 const PROBE_DEADLINE: Duration = Duration::from_secs(10);
 
-/// Deadline used for the `whoami.exe` identity probes (plan §9: 5 s).
+/// Deadline used for the `whoami.exe` identity probes.
 const WHOAMI_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Length of the enrollment challenge in bytes.
@@ -116,7 +114,7 @@ USAGE:
 COMMANDS:
     enroll       Enroll a Windows Hello credential for a Linux user (root)
                    --replace             overwrite an existing credential
-                   --allow-unattested    admit self/`none` attestations (opt-in, loud)
+                   --allow-unattested    admit self/`none` attestations (opt-in)
                    --user <NAME>         target user (default: SUDO_USER or current)
                    --bridge <PATH>       bridge exe path (else config, else required)
                    --win-mnt <PATH>      Windows mount root (else config, else /mnt/c)
@@ -236,7 +234,7 @@ const EXIT_OK: i32 = 0;
 const EXIT_FAIL: i32 = 1;
 const EXIT_USAGE: i32 = 2;
 
-/// A stable machine-readable token for an operational failure (L8-10).
+/// A stable machine-readable token for an operational failure.
 ///
 /// Every `error!`-style `anyhow` error carries at least one source; the innermost store,
 /// runner, or verifier error is mapped to a documented token. Errors that originate in the
@@ -447,13 +445,10 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
 
 /// Parse one subcommand's flags.
 ///
-/// Every recognized flag is recorded as it is parsed and then checked against
-/// [`allowed_flags`] once the argument vector is exhausted, so a flag the subcommand does
-/// not consume is rejected with a usage error (exit `2`) rather than being silently
-/// dropped or surfacing later as a confusing root-check failure. Deferring the check
-/// keeps `-h`/`--help` reachable in any position: it is honored even when a misplaced
-/// flag appears before it, exactly as before the table existed. Unknown arguments still
-/// fail immediately.
+/// Every recognized flag is recorded and checked against [`allowed_flags`] only after the
+/// whole vector is parsed, so `-h`/`--help` stays reachable in any position; a flag the
+/// subcommand does not consume is a usage error (exit `2`). Unknown arguments fail
+/// immediately.
 fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
     let Some(allowed) = allowed_flags(name) else {
         return Err(format!("unknown subcommand {name:?}"));
@@ -479,9 +474,7 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
     let mut module_dir: Option<PathBuf> = None;
     let mut artifact_dir: Option<PathBuf> = None;
     // Recognized flags in the order seen; checked against the allow-list after the loop.
-    // Rejecting only after the whole argument vector is parsed keeps `-h`/`--help`
-    // reachable in any position (a later help wins over an earlier misplaced flag),
-    // matching the pre-table parser.
+    // Deferring the check keeps `-h`/`--help` reachable in any position.
     let mut seen: Vec<Flag> = Vec::new();
 
     let mut i = 0usize;
@@ -582,10 +575,6 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
     }
 
     // Enforce the allow-list once the whole vector parsed, so `--help` anywhere still wins.
-    // This is the single source of truth for "does subcommand X accept flag Y": every
-    // recognized flag is recorded in `seen` as it is parsed (both the spaced and the
-    // `--flag=value` forms) and checked here, so a misplaced flag is a usage error
-    // (exit `2`) for *every* subcommand and *every* flag, matching the `EXIT CODES` help.
     for &flag in &seen {
         reject(flag)?;
     }
@@ -663,9 +652,9 @@ fn require_value<'a>(flag: &str, value: &'a str) -> Result<&'a str, String> {
 // ---------------------------------------------------------------------------
 
 fn main() -> ExitCode {
-    // Reject non-UTF-8 arguments explicitly rather than lossily converting them (the
-    // bridge learned this as SEC-018): a mangled username or path must be a clean usage
-    // error, never a silently altered argument.
+    // Reject non-UTF-8 arguments explicitly rather than lossily converting them: a
+    // mangled username or path must be a clean usage error, never a silently altered
+    // argument.
     let mut raw: Vec<String> = Vec::new();
     for arg in std::env::args_os().skip(1) {
         match arg.into_string() {
@@ -855,11 +844,11 @@ impl BridgeConfig {
             .map(|error| format!("warning: {error}"))
     }
 
-    /// Surface a config read error on stderr (L8-5).
+    /// Surface a config read error on stderr.
     ///
-    /// `--bridge`/`--win-mnt` intentionally allow an operator to bypass an unreadable
-    /// config, but silently discarding the read error hides a broken persisted config
-    /// until the next PAM auth fails with an unrelated message.
+    /// `--bridge`/`--win-mnt` let an operator bypass an unreadable config, but silently
+    /// discarding the read error hides a broken persisted config until the next PAM auth
+    /// fails with an unrelated message.
     fn warn_config_error(&self) {
         if let Some(warning) = self.config_warning() {
             eprintln!("{warning}");
@@ -1004,7 +993,7 @@ fn cmd_enroll(
         None => eprintln!("warning: could not determine the Windows account (whoami.exe failed)"),
     }
 
-    // 3. Ceremony with D3 double-enroll handling.
+    // 3. Ceremony with double-enroll handling.
     let policy = if allow_unattested {
         AttestationPolicy::AllowUnattested
     } else {
@@ -1082,15 +1071,13 @@ impl EnrollCeremony for Runner {
 type VerifyCeremony =
     fn(&CeremonyOutcome, &AttestationPolicy) -> Result<EnrollOutcome, VerifyError>;
 
-/// Run the enrollment ceremony, implementing the D3 double-enroll quirk.
+/// Run the enrollment ceremony, implementing the double-enroll retry.
 ///
 /// Windows *can* return a `none`-attested credential (`fmt:"none"`, empty `attStmt`) on a
-/// first-ever enrollment for an RP ID. The spike observed it for one of two RP IDs; the
-/// other returned `tpm` even on its first enrollment, and a re-enrollment on either RP
-/// returned `tpm`. Under Strict the verifier rejects `none` because of the format; we then
-/// run exactly **one** second ceremony with a fresh challenge and verify again. If it is
-/// still unattested we fail with a clear `--allow-unattested` hint. Under
-/// `--allow-unattested` a single ceremony suffices. Exactly one retry is attempted on
+/// first-ever enrollment for an RP ID. Under Strict the verifier rejects `none` because of
+/// the format; we then run exactly **one** second ceremony with a fresh challenge and
+/// verify again. If it is still unattested we fail with a clear `--allow-unattested` hint.
+/// Under `--allow-unattested` a single ceremony suffices. Exactly one retry is attempted on
 /// every path, so this cannot loop.
 ///
 /// **First-credential discard (critical).** The credential created by ceremony #1 exists
@@ -1206,7 +1193,7 @@ fn run_ceremony(runner: &dyn EnrollCeremony, target: &UserInfo) -> anyhow::Resul
         .context("building enrollment clientDataJSON")?;
 
     // User handle: the numeric uid as little-endian bytes. Stable across enrollments and
-    // well within the 64-byte WebAuthn limit; documented per plan §9.
+    // well within the 64-byte WebAuthn limit.
     let user_id = wsl_webauthn_protocol::b64u_encode(&target.uid.to_le_bytes());
     let params = EnrollParams::new(
         wsl_webauthn_protocol::b64u_encode(&client_data),
@@ -1289,7 +1276,7 @@ fn verify_ceremony(
 /// Whether a verification failure is specifically the unattested-format rejection.
 ///
 /// The verifier rejects `fmt:"none"` and `packed`-without-`x5c` under Strict with
-/// [`VerifyError::AttestationNotAllowed`]; that is the D3 signal to double-enroll.
+/// [`VerifyError::AttestationNotAllowed`]; that is the signal to double-enroll.
 fn is_unattested_rejection(error: &VerifyError) -> bool {
     matches!(error, VerifyError::AttestationNotAllowed)
 }
@@ -1364,11 +1351,11 @@ fn uuid_string(aaguid: &[u8; 16]) -> String {
 // unregister
 // ---------------------------------------------------------------------------
 
-/// `unregister [--user NAME] [--yes]` — remove exactly one user's record (SR-20).
+/// `unregister [--user NAME] [--yes]` — remove exactly one user's record.
 fn cmd_unregister(user: Option<String>, yes: bool) -> anyhow::Result<i32> {
     require_root("unregister")?;
     let target = resolve_target_user(user)?;
-    // Share the per-user removal logic with `uninstall` (SR-20: one user at a time).
+    // Share the per-user removal logic with `uninstall` (one user at a time).
     let prompter = installer::StdPrompter {
         assume_yes: yes,
         non_interactive: false,
@@ -1608,8 +1595,7 @@ fn summarize_record(record: &CredentialRecord) -> String {
 
 /// `verify` — run the verifier against an in-process synthetic ceremony.
 ///
-/// This is a living example of the verifier API and a quick "is the crypto stack sane
-/// on this machine" check. It needs no Windows and no root.
+/// Needs no Windows and no root.
 fn cmd_verify() -> anyhow::Result<i32> {
     use ecdsa::signature::Signer as _;
 
@@ -1851,7 +1837,7 @@ fn packed_self_attestation(auth_data: &[u8], signature: &[u8]) -> anyhow::Result
 
 /// Capture `HOST\user` and the SID via `whoami.exe`. Non-fatal: `None` on failure.
 ///
-/// L8-6: an empty SID is *not* a known identity. If the `/user` probe fails or its output
+/// An empty SID is *not* a known identity. If the `/user` probe fails or its output
 /// carries no `S-1-` token, the whole identity is omitted (`None`) rather than persisting
 /// `sid: ""`, so audit data cannot present a half-absent binding as real.
 fn capture_windows_identity(win_mnt: &Path) -> Option<WindowsIdentity> {
@@ -1873,7 +1859,7 @@ fn capture_windows_identity(win_mnt: &Path) -> Option<WindowsIdentity> {
 /// Extract the first `S-1-…` SID token from `whoami.exe /user` output.
 ///
 /// Returns `None` for output without a SID (and never an empty string), so a failed or
-/// unexpected probe cannot be mistaken for a captured identity (L8-6).
+/// unexpected probe cannot be mistaken for a captured identity.
 fn parse_windows_sid(stdout: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(stdout);
     text.split_whitespace()
@@ -1923,9 +1909,9 @@ fn friendly_bridge_error(error: wsl_webauthn_protocol::BridgeError) -> &'static 
     }
 }
 
-/// Render a runner transport error, surfacing a signal-killed bridge (L8-11).
+/// Render a runner transport error, surfacing a signal-killed bridge.
 ///
-/// `RunnerError::BridgeFailed` now carries an [`ExitReason`](wsl_webauthn_runner::ExitReason),
+/// `RunnerError::BridgeFailed` carries an [`ExitReason`](wsl_webauthn_runner::ExitReason),
 /// whose `Display` already names the signal ("signal 9 (SIGKILL)"). For a signal death the
 /// CLI appends the remediation hint; a normal exit code renders verbatim.
 fn render_runner_error(error: &wsl_webauthn_runner::RunnerError) -> String {
@@ -2062,7 +2048,7 @@ mod tests {
         assert!(parse(&args(&["enroll", "--user"])).is_err());
     }
 
-    /// L11-6: empty and flag-like values are usage errors, not silent misparses.
+    /// Empty and flag-like values are usage errors, not silent misparses.
     #[test]
     fn parse_rejects_empty_and_flag_like_values() {
         // Empty inline value.
@@ -2083,7 +2069,7 @@ mod tests {
         );
     }
 
-    /// L11-6: `--` is a trailing no-op; anything after it is a positional argument,
+    /// `--` is a trailing no-op; anything after it is a positional argument,
     /// and no subcommand accepts those.
     #[test]
     fn parse_double_dash_is_trailing_noop_only() {
@@ -2091,7 +2077,7 @@ mod tests {
         assert!(parse(&args(&["enroll", "--", "extra"])).is_err());
     }
 
-    /// L11-6: `-y` is the documented short alias for `--yes`.
+    /// `-y` is the documented short alias for `--yes`.
     #[test]
     fn parse_dash_y_is_yes() {
         assert_eq!(
@@ -2168,8 +2154,7 @@ mod tests {
         assert!(parse(&args(&["verify", "--module-dir", "/x"])).is_err());
     }
 
-    /// A misplaced flag must not hide `--help`: help wins whenever it is reached, exactly
-    /// as it did before the allow-list table existed.
+    /// A misplaced flag must not hide `--help`: help wins whenever it is reached.
     #[test]
     fn parse_help_wins_over_an_earlier_misplaced_flag() {
         assert_eq!(
@@ -2268,8 +2253,8 @@ mod tests {
             }
         }
 
-        // The specific crossings cited by the audit, in both value forms: rejection must
-        // also fire for `--flag=value`, not just `--flag value`.
+        // Rejection must also fire for `--flag=value`, not just `--flag value`, so test
+        // both value forms.
         for bad in [
             vec!["enroll", "--module-dir", "x"],
             vec!["enroll", "--module-dir=x"],
@@ -2373,7 +2358,7 @@ mod tests {
         assert!(resolved.win_mnt.ends_with("tmp"));
     }
 
-    /// L8-5: an unreadable config must be surfaced as a warning on every subcommand that
+    /// An unreadable config must be surfaced as a warning on every subcommand that
     /// consults the config — even when `--bridge` lets the run continue.
     #[test]
     fn resolve_bridge_surfaces_an_unreadable_config_as_a_warning() {
@@ -2565,7 +2550,7 @@ mod tests {
     }
 
     /// A scripted verifier: rejects ceremony #1 with [`VerifyError::AttestationNotAllowed`]
-    /// (the D3 unattested-first-enroll signal) and accepts ceremony #2, returning an
+    /// (the unattested-first-enroll signal) and accepts ceremony #2, returning an
     /// outcome whose `credential_id` identifies which ceremony it came from.
     fn scripted_verify(
         outcome: &CeremonyOutcome,
@@ -2589,7 +2574,7 @@ mod tests {
         })
     }
 
-    /// **First-credential discard (D3, critical).** When ceremony #1 is unattested and
+    /// **First-credential discard (critical).** When ceremony #1 is unattested and
     /// ceremony #2 succeeds, the returned outcome must reference ceremony #2's credential
     /// id, and the verifier must have seen exactly the two distinct ceremonies.
     #[test]
@@ -2922,7 +2907,7 @@ mod tests {
             .unwrap();
     }
 
-    /// L11-3: an unreadable record makes `status` list mode exit non-zero, matching the
+    /// An unreadable record makes `status` list mode exit non-zero, matching the
     /// `status --user` policy, so a broken store is not mistaken for a healthy one.
     #[test]
     fn status_list_reports_unreadable_records_as_failure() {
@@ -2951,7 +2936,7 @@ mod tests {
         assert!(status_with_store(&store, Some("bob".into())).is_err());
     }
 
-    /// SR-20: removing one user never touches another user's record.
+    /// Removing one user never touches another user's record.
     #[test]
     fn unregister_removes_only_the_named_user() {
         let (_dir, store) = tempdir_store();
@@ -2972,7 +2957,7 @@ mod tests {
         assert!(!store.remove("carol").unwrap());
     }
 
-    // ---- stable error tokens / runner rendering (L8-10, L8-11) ----
+    // ---- stable error tokens / runner rendering ----
 
     #[test]
     fn error_codes_are_stable_tokens() {

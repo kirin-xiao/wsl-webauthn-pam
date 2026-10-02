@@ -1,15 +1,13 @@
-//! A non-Rust host for the module (L9-9) and a real-libpam tier that **fails**
-//! rather than skips when the FFI path cannot run (L14-6).
+//! A non-Rust host for the module and a real-libpam tier that **fails** rather than
+//! skips when the FFI path cannot run.
 //!
-//! The audit's two availability defects (L9-1 SIGPIPE host-kill, L9-2 stderr spin)
-//! lived in the gap between "runs under `cargo test`" — a Rust binary whose runtime
-//! sets `SIGPIPE=SIG_IGN` — and "runs under sudo/su/sshd", a C host that leaves
-//! `SIGPIPE` at `SIG_DFL`. This test closes that gap in two ways:
+//! Rust test binaries set `SIGPIPE=SIG_IGN`; a C host under sudo/su/sshd leaves it at
+//! `SIG_DFL`. This test closes that gap in two ways:
 //!
 //! * it compiles `tests/c_host/pam_host.c` with the system C compiler (never a
-//!   checked-in binary) and calls the module through `dlopen`/`dlsym` as a C
-//!   consumer would — including all five non-authentication `pam_sm_*` entry
-//!   points, which the old Rust `dlopen.rs` only checked for *presence*;
+//!   checked-in binary) and calls the module through `dlopen`/`dlsym` as a C consumer
+//!   would — including all five non-authentication `pam_sm_*` entry points, not merely
+//!   checking for their presence;
 //! * it drives the module through the **real libpam** (`pam_start_confdir` →
 //!   `pam_authenticate`) from that C host with `SIGPIPE` reset to `SIG_DFL`.
 //!
@@ -42,8 +40,7 @@
 //! provisioned tempdir store, hashes and trusts the bridge, mints a random
 //! challenge, spawns the dynamic fake bridge, verifies a genuine ES256 assertion it
 //! signed, invokes the application conversation (`PAM_CONV`), and returns
-//! `PAM_SUCCESS` — the conversation prompt and success paths the previous tier
-//! explicitly could not reach.
+//! `PAM_SUCCESS`.
 //!
 //! Requires `libpam0g-dev` (headers + `-lpam`), a C compiler, and one of:
 //! unprivileged user namespaces (`unshare -rm`), root, or passwordless `sudo`.
@@ -294,9 +291,8 @@ fn c_host_libpam_loads_module_and_fails_closed() {
 
 /// The success + conversation path through the real stack, in a mount namespace.
 ///
-/// This is the L14-6 core: the store is provisioned, the bridge is the dynamic
-/// signer, and the module must return `PAM_SUCCESS` *and* invoke the application
-/// conversation.
+/// The store is provisioned, the bridge is the dynamic signer, and the module must
+/// return `PAM_SUCCESS` *and* invoke the application conversation.
 #[test]
 fn c_host_libpam_success_path_with_provisioned_store() {
     let Some(arts) = Artifacts::discover() else {

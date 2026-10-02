@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Stage-1 Windows WebAuthn spike harness (plan §13 wave B3).
+"""Windows WebAuthn spike harness.
 
 This is *spike-only* tooling. It is deliberately stand-alone (no Rust build
 required beyond the bridge exe) and never becomes part of the product. It:
 
-  * frames/parses the plan §3 wire protocol,
+  * frames/parses the wire protocol,
   * builds `clientDataJSON` byte-for-byte the way the Linux side will
     (see `wsl-webauthn-protocol::build_client_data`),
   * invokes the real `WSLWebAuthnBridge.exe` via WSL interop under a hard
     Linux-side deadline (so a hung Windows Hello prompt can never wedge us),
   * decodes the CBOR attestation object / authenticator data / COSE key,
-  * verifies `rpIdHash == SHA-256(RP_ID)` (the D2 validation), the
-    `client_data_json_echo` pass-through (D5/§3) and the assertion signature,
+  * verifies `rpIdHash == SHA-256(RP_ID)`, the `client_data_json_echo`
+    pass-through and the assertion signature,
   * writes/reads local-only vectors under `tests/vectors/local/` (git-ignored).
 
 All values are derived from the pinned `protocol` constants below; keep them in
@@ -40,14 +40,14 @@ from pathlib import Path
 
 RP_ID = "io.github.kirin-xiao.wsl-webauthn-pam"
 RP_NAME = "sudo on WSL (wsl-webauthn-pam)"
-ORIGIN = RP_ID  # D2: origin pinned equal to RP ID
+ORIGIN = RP_ID  # origin pinned equal to RP ID
 MIN_CHALLENGE_BYTES = 16
 MAX_REQUEST_BYTES = 8 * 1024
 MAX_RESPONSE_BYTES = 64 * 1024
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_EXE = REPO_ROOT / "target/x86_64-pc-windows-gnu/release/WSLWebAuthnBridge.exe"
-# D11: always spawn with current_dir = the Windows mount root.
+# Always spawn with current_dir = the Windows mount root.
 DEFAULT_CWD = Path("/mnt/c")
 
 
@@ -362,13 +362,13 @@ def invoke(
     """Send one framed request; enforce a hard Linux-side deadline.
 
     On deadline: SIGKILL the interop child and best-effort `taskkill.exe /F`
-    the reported Windows PID (plan §7 backstop).
+    the reported Windows PID.
     """
     frame = encode_frame(json.dumps(request, separators=(",", ":")).encode())
     assert len(frame) - 4 <= MAX_REQUEST_BYTES
 
     # The Windows exe must be spawned via an absolute path: `cwd` is forced to
-    # the Windows mount root (D11), so a relative exe path would not resolve.
+    # the Windows mount root, so a relative exe path would not resolve.
     exe = Path(exe).resolve()
 
     proc = subprocess.Popen(
@@ -762,8 +762,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--rp-id",
         default=None,
-        help="override RP_ID/ORIGIN (D2 robustness experiment; the exe must be "
-        "built with the same constant)",
+        help="override RP_ID/ORIGIN (the exe must be built with the same constant)",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 

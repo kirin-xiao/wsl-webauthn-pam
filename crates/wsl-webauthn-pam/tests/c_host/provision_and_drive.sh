@@ -1,8 +1,7 @@
 #!/bin/sh
 # provision_and_drive.sh — give a real `pam_start`/libpam stack a provisioned
 # store and a scripted fake bridge, then drive the built pam_wsl_webauthn.so
-# through the compiled C host (`pam_host`). This is the L14-6 "green means the
-# FFI path ran" tier.
+# through the compiled C host (`pam_host`).
 #
 # It is always executed inside a fresh **mount namespace**:
 #

@@ -1,4 +1,4 @@
-//! `wsl-webauthn-verifier` — the security core (plan §4).
+//! `wsl-webauthn-verifier` — the security core.
 //!
 //! This crate is deliberately pure Rust: no OS dependencies, no `unsafe`, and no
 //! panic on any input. It takes the raw bytes produced by the Windows bridge
@@ -36,10 +36,6 @@
 //! | policy | `tpm`/`packed`+x5c accepted under both policies; self/`none` only under [`AttestationPolicy::AllowUnattested`] |
 //! | AAGUID | authData AAGUID must be one of [`STRICT_AAGUIDS`] on every verified **attestation** path (assertions do not enforce an AAGUID allow-list); enforced before format dispatch, so no arm can bypass it |
 //!
-//! The checker `.github/scripts/check-doc-invariants.py` maps each row above to
-//! the test that pins it (`INVARIANT:` tags in the source and in `SECURITY.md`);
-//! a claim without a matching, direction-consistent test fails CI.
-//!
 //! <!-- INVARIANT: ASSERTION-CLIENTDATA-TYPE-EXACT, ASSERTION-CLIENTDATA-CHALLENGE-DECODED, ASSERTION-CLIENTDATA-ORIGIN-PINNED, ASSERTION-RPIDHASH, ASSERTION-UP-UV, ASSERTION-CREDENTIAL-ID-BINDING, COSE-ALG-ALLOWLIST, COSE-P256-UNCOMPRESSED-ON-CURVE, COSE-RSA-MODULUS-SIZE, COSE-RSA-EXPONENT, COSE-ED25519-X-LENGTH, COSE-KTY-ALG-CONSISTENCY, ASSERTION-SIGNED-MESSAGE-DEFINITION, CHAIN-PINNED-ROOT, CHAIN-PATHLEN, CHAIN-LEAF-V3-AND-CA-FALSE, CHAIN-PACKED-OU, CHAIN-AAGUID-EXT-MATCH, CHAIN-ATTSTMT-ALG-MATCH, CHAIN-ISSUER-SUBJECT-LINK, CHAIN-VALIDITY-WINDOW, TPM-CERTINFO-BINDING, TPM-PUBAREA-KEYBITS, TPM-AIK-EKU-REQUIRED, TPM-AIK-KEYUSAGE-DIGITALSIGNATURE, ATTESTATION-ALLOW-UNATTESTED-OPT-IN, AAGUID-ALLOWLIST-EVERY-ATTESTATION-PATH -->
 //!
 //! # `tpm` vs `packed` rule asymmetry
@@ -75,9 +71,9 @@
 //!   `test-anchor` feature) exists solely so the test suite can substitute a synthetic
 //!   root and cannot weaken production.
 //!
-//! # Wave B consumer notes
+//! # Consumer notes
 //!
-//! * Use [`verify_attestation`] (never `verify_attestation_with_anchor`) and pass the
+//! * Use [`verify_attestation`], never `verify_attestation_with_anchor`, and pass the
 //!   [`AttestationPolicy`] chosen from `--allow-unattested`.
 //! * Persist [`EnrollOutcome::sign_count`] and [`AssertionOutcome::sign_count`], but do
 //!   **not** reject on a non-increasing counter: Windows Hello is a zero/constant-counter
@@ -125,12 +121,10 @@ use std::time::SystemTime;
 // Input size bounds
 // ---------------------------------------------------------------------------
 //
-// These are defence-in-depth caps at the verifier boundary. The normal caller is
-// already bounded (a response frame is ≤ `wsl_webauthn_protocol::MAX_RESPONSE_BYTES`,
-// 64 KiB, before base64-decoding), but the verifier is a public API and must not
-// assume it: a caller that relaxes its own cap would otherwise hand the CBOR/der
-// decoders unbounded input and let the materialised `Value`/certificate tree amplify
-// memory use. Every cap is far above any real WebAuthn structure.
+// Defence-in-depth caps at the verifier boundary. A caller that relaxes its own cap
+// must not hand the CBOR/DER decoders unbounded input and let the materialised
+// `Value`/certificate tree amplify memory use. Every cap is far above any real
+// WebAuthn structure.
 
 /// Maximum size of an `attestationObject`.
 pub(crate) const MAX_ATTESTATION_BYTES: usize = 64 * 1024;
@@ -144,7 +138,7 @@ pub(crate) const MAX_SIGNATURE_BYTES: usize = 1024;
 pub(crate) const MAX_COSE_KEY_BYTES: usize = 4 * 1024;
 
 // ---------------------------------------------------------------------------
-// Pinned trust material (plan D3)
+// Pinned trust material
 // ---------------------------------------------------------------------------
 
 /// SHA-256 fingerprint of the pinned **Microsoft TPM Root Certificate Authority
@@ -161,7 +155,7 @@ pub const MS_TPM_ROOT_2014_SHA256: [u8; 32] = [
     0x04, 0xCB, 0x71, 0x51, 0x80, 0x04, 0x35, 0x09, 0x25, 0xFB, 0x2C, 0xED, 0x79, 0xA9, 0x99, 0xDA,
 ];
 
-/// AAGUIDs accepted under [`AttestationPolicy::Strict`] (plan D3).
+/// AAGUIDs accepted under [`AttestationPolicy::Strict`].
 ///
 /// * `08987058-cadc-4b81-b6e1-30de50dcbe96` — Windows Hello software TPM.
 /// * `9ddd1817-af5a-4672-a2b9-3e3dd95000a9` — Windows Hello hardware TPM.
@@ -185,8 +179,7 @@ pub const STRICT_AAGUIDS: [[u8; 16]; 2] = [
 pub enum AttestationPolicy {
     /// Require a fully verified TPM (`tpm`) attestation **or** a `packed`/AttCA
     /// attestation whose chain verifies to the pinned root and whose AAGUID is on
-    /// [`STRICT_AAGUIDS`]. Self and `none` are rejected. (D3, amended after the spike:
-    /// Windows Hello emits `tpm`, so `tpm` is a first-class Strict format.)
+    /// [`STRICT_AAGUIDS`]. Self and `none` are rejected.
     Strict,
     /// Additionally admit self-attestation (`packed` without `x5c`) and `none`
     /// attestation. Used only when the operator explicitly opted in with
@@ -206,7 +199,7 @@ pub enum AttestationMode {
     None,
 }
 
-/// Attestation metadata recorded alongside the credential (plan §6).
+/// Attestation metadata recorded alongside the credential.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttestationMetadata {
     /// The attestation statement format (`packed`, `none`, …).
@@ -407,7 +400,7 @@ pub fn verify_attestation_with_anchor(
 // ---------------------------------------------------------------------------
 
 /// Stable, panic-free parse entry points for the `fuzz/` crate and other external
-/// smoke tests (plan §4 test item 4).
+/// smoke tests.
 ///
 /// Each returns `true` on success; a `false` return (including malformed input)
 /// must never be accompanied by a panic.
@@ -440,13 +433,13 @@ pub mod testing {
     }
 
     /// Parse a TPM `certInfo` (`TPMS_ATTEST`), returning whether it is structurally
-    /// valid. Panic-free (plan §4 test item 4).
+    /// valid.
     pub fn parse_tpm_cert_info(bytes: &[u8]) -> bool {
         crate::tpm::parse_cert_info_ok(bytes)
     }
 
     /// Parse a TPM `pubArea` (`TPMT_PUBLIC`), returning whether it is structurally
-    /// valid. Panic-free (plan §4 test item 4).
+    /// valid.
     pub fn parse_tpm_pub_area(bytes: &[u8]) -> bool {
         crate::tpm::parse_pub_area_ok(bytes)
     }

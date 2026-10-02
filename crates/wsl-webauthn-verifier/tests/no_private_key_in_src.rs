@@ -1,11 +1,10 @@
 //! Guard for the `RUSTSEC-2023-0071` ignore rationale in `deny.toml`.
 //!
 //! The advisory (non-constant-time RSA private-key operations) is ignored on the
-//! grounds that the *production* code path is public-key verification only: RSA
-//! private keys exist solely in this crate's local test harness for synthesized
-//! vectors. This test keeps that rationale honest by scanning every workspace
-//! crate's `src/` for RSA private-key constructs. If a real private-key path
-//! ever lands in `src/`, this fails and the advisory must be re-evaluated.
+//! grounds that the production code path is public-key verification only: RSA
+//! private keys exist solely in this crate's local test harness. This test scans
+//! every workspace crate's `src/` for RSA private-key constructs; if a real
+//! private-key path lands in `src/`, it fails and the advisory must be re-evaluated.
 
 use std::path::{Path, PathBuf};
 

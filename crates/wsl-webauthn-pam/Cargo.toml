@@ -26,7 +26,7 @@ wsl-webauthn-verifier = { path = "../wsl-webauthn-verifier" }
 serde_json = { workspace = true }
 libc = { workspace = true }
 rand = { workspace = true }
-# Bridge executable pin: SHA-256 of the configured `bridge_path` (plan D11).
+# Bridge executable pin: SHA-256 of the configured `bridge_path`.
 sha2 = { workspace = true }
 
 [dev-dependencies]
@@ -45,5 +45,5 @@ ciborium = { workspace = true }
 # `--cfg feature="test-support"` (verify with `cargo build -p wsl-webauthn-pam
 # --release -v`). Resolver 3 unifies features across all edges *within one
 # invocation*, so if this edge were moved into `[dependencies]` the feature would
-# be enabled for the cdylib too — do not move it.
+# be enabled for the cdylib too.
 wsl-webauthn-runner = { path = "../wsl-webauthn-runner", features = ["test-support"] }

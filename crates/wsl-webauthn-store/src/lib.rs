@@ -1,4 +1,4 @@
-//! Linux credential store and config parsing (plan §6).
+//! Linux credential store and config parsing.
 //!
 //! This crate owns the root-owned, symlink-hardened on-disk layout used by the PAM
 //! module (hot path) and the CLI (enrollment):
@@ -9,10 +9,10 @@
 //! <base>/config                # mode 0600, root:root (TOML)
 //! ```
 //!
-//! The production base dir is `/etc/wsl_webauthn` ([`Store::system`]). Tests and the
-//! installer pass an arbitrary base directory via [`Store::with_owner`].
+//! The production base dir is `/etc/wsl_webauthn` ([`Store::system`]); an arbitrary base
+//! directory is passed via [`Store::with_owner`].
 //!
-//! # Hardening model (SR-4)
+//! # Hardening model
 //!
 //! * The username is validated by hand before it is ever joined to a path; anything
 //!   outside `^[A-Za-z_][A-Za-z0-9._-]{0,31}$` is rejected with
@@ -76,15 +76,15 @@
 //! ```
 //!
 //! `windows_identity` may be `null`. `attestation.mode` is `"strict"` or
-//! `"unattested-opt-in"` (plan D3); [`Store::load`] rejects any other value as
+//! `"unattested-opt-in"`; [`Store::load`] rejects any other value as
 //! [`StoreError::Corrupt`].
 //!
-//! The config TOML is written by the store, not the installer: [`Config::to_toml`] is the
-//! serializer and [`Store::save_config`] the atomic, `0600`, owner-checked writer, matching
-//! the [`Store::load_config`] parser (`L7-4`).
+//! The config TOML is written by the store: [`Config::to_toml`] is the serializer,
+//! [`Store::save_config`] the atomic, `0600`, owner-checked writer, and
+//! [`Store::load_config`] the matching parser.
 
-// `forbid` would prevent the audited `sys` module from using `unsafe` at all; we use
-// `deny` crate-wide and a single documented `#[allow(unsafe_code)]` on `sys`.
+// `forbid` would prevent the audited `sys` module from using `unsafe`; use crate-wide
+// `deny` plus one documented `#[allow(unsafe_code)]` on `sys`.
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -111,8 +111,8 @@ pub const FILE_MODE: u32 = 0o600;
 pub const CONFIG_MODE: u32 = 0o600;
 /// Mode used when [`Store::save_config`] creates the base directory itself (`0755`).
 ///
-/// The base directory has no *exact*-mode requirement (only "owner-controlled and not
-/// group/other-writable"), matching the installer's historical `0755` config directory.
+/// The base directory has no *exact*-mode requirement, only "owner-controlled and not
+/// group/other-writable".
 pub const BASE_MODE: u32 = 0o755;
 
 /// Maximum size of a credential record file (256 KiB).
@@ -120,10 +120,10 @@ pub const MAX_RECORD_BYTES: usize = 256 * 1024;
 /// Maximum size of the config file (64 KiB).
 pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
 
-/// The production base directory (`/etc/wsl_webauthn`, plan D1).
+/// The production base directory (`/etc/wsl_webauthn`).
 pub const SYSTEM_BASE: &str = "/etc/wsl_webauthn";
 
-/// Exhaustive error type for every store operation (plan §6).
+/// Exhaustive error type for every store operation.
 ///
 /// The PAM module maps store failures to `PAM_AUTHINFO_UNAVAIL` (fail-closed); a missing
 /// record ([`StoreError::NotFound`]) maps to `PAM_USER_UNKNOWN`. Ceremony vs. transport
@@ -164,10 +164,8 @@ pub enum StoreError {
     },
     /// The base directory is owned by the wrong user or is group/other-writable.
     ///
-    /// Unlike `credentials/` (which must be exactly `0700`), the base directory has no
-    /// fixed mode, but it must be owned by the expected user and must not be writable by
-    /// group or other, or an attacker could replace the `credentials` directory or the
-    /// `config` file underneath it.
+    /// Group/other write access would let an attacker replace the `credentials`
+    /// directory or the `config` file underneath it.
     #[error(
         "insecure base directory {path}: expected uid {expected_uid}, \
          found uid {actual_uid} mode {actual_mode:o}"
@@ -259,10 +257,10 @@ impl StoreError {
     /// A stable, non-identifying token for the error's *kind*.
     ///
     /// Unlike [`Display`](std::fmt::Display), this never embeds an absolute path or a
-    /// username. It exists for the PAM module, whose audit records go to `authpriv`
-    /// syslog: logging the full `Display` would disclose the record path — and therefore
-    /// the username — on every failure (L8-9). The CLI keeps using `Display` for operator
-    /// diagnostics. The spelling of each token is part of this API and must not change.
+    /// username: the PAM module logs it to `authpriv` syslog, where the full `Display`
+    /// would disclose the record path — and therefore the username — on every failure.
+    /// The CLI keeps using `Display` for operator diagnostics. The spelling of each token
+    /// is part of this API and must not change.
     #[must_use]
     pub fn kind_str(&self) -> &'static str {
         match self {
@@ -287,8 +285,7 @@ impl StoreError {
 
 /// A credential store rooted at an arbitrary base directory.
 ///
-/// In production use [`Store::system`], which is rooted at [`SYSTEM_BASE`] and expects
-/// root (`uid 0`) ownership. Tests use [`Store::with_owner`] to expect the current uid.
+/// [`Store::system`] is rooted at [`SYSTEM_BASE`] and expects root (`uid 0`) ownership.
 #[derive(Debug, Clone)]
 pub struct Store {
     base: PathBuf,
@@ -296,9 +293,6 @@ pub struct Store {
 }
 
 /// Borrowed arguments to the shared atomic temp-file install path.
-///
-/// Bundling these keeps [`Store::write_and_install`] readable now that both credential
-/// records and the config file flow through it with different target names/modes.
 struct Install<'a> {
     fd: sys::Fd,
     temp: &'a Path,
@@ -318,8 +312,6 @@ impl Store {
     }
 
     /// Open a store at `base`, expecting files to be owned by `owner_uid`.
-    ///
-    /// Production passes `0`; tests pass [`current_euid`].
     pub fn with_owner(base: impl AsRef<Path>, owner_uid: u32) -> Store {
         Store {
             base: base.as_ref().to_path_buf(),
@@ -378,10 +370,10 @@ impl Store {
 
     /// Validate a directory and return an `O_NOFOLLOW|O_DIRECTORY` handle to it.
     ///
-    /// This closes the window between the `lstat` checks and subsequent operations:
-    /// the metadata is re-read from the **opened descriptor** (`fstat`) and its
-    /// `(dev, ino)` is compared with the earlier `lstat`, so a directory swapped in
-    /// mid-operation is [`StoreError::PathChanged`] rather than silently trusted.
+    /// Closes the window between the `lstat` checks and subsequent operations: metadata
+    /// is re-read from the **opened descriptor** (`fstat`) and its `(dev, ino)` compared
+    /// with the earlier `lstat`, so a directory swapped in mid-operation is
+    /// [`StoreError::PathChanged`] rather than silently trusted.
     fn open_checked_dir(&self, path: &Path, mode: u32) -> Result<sys::Fd, StoreError> {
         let before = match sys::lstat(path) {
             Ok(st) => st,
@@ -426,12 +418,10 @@ impl Store {
     /// Verify the base directory exists, is a directory, is not a symlink, is owned by
     /// the expected user, and is not group/other-writable.
     ///
-    /// The base directory deliberately has **no** exact-mode requirement (an admin may
-    /// use `0755`), but if it were writable by group or other an attacker could swap in
-    /// their own `credentials/` directory or `config` file, so that is refused as
-    /// [`StoreError::InsecureBase`]. The same checks run first on every operation that
-    /// resolves a path under the base (`load`, `save_atomic`, `list`, `remove`), so a
-    /// widened base can never be substituted for a trusted one.
+    /// The base directory has **no** exact-mode requirement (an admin may use `0755`),
+    /// but group/other-writable is refused as [`StoreError::InsecureBase`], since an
+    /// attacker could otherwise swap in their own `credentials/` directory or `config`
+    /// file. Runs first on every operation that resolves a path under the base.
     fn check_base(&self) -> Result<sys::Stat, StoreError> {
         let st = match sys::lstat(&self.base) {
             Ok(st) => st,
@@ -464,11 +454,11 @@ impl Store {
     }
 
     /// Ensure `<base>/credentials` exists with mode `0700` and the expected owner,
-    /// creating it (and explicitly `fchmod`ing to defeat umask) if missing.
+    /// creating it (and `fchmod`ing to defeat umask) if missing.
     ///
-    /// Returns an ownership/mode-validated `O_DIRECTORY|O_NOFOLLOW` handle to the
-    /// directory; callers use it to `fsync` the directory entry after installing a file
-    /// and never re-resolve the path against a potentially swapped directory.
+    /// Returns an ownership/mode-validated `O_DIRECTORY|O_NOFOLLOW` handle used to
+    /// `fsync` the directory entry after installing a file, so callers never re-resolve
+    /// the path against a potentially swapped directory.
     fn ensure_credentials_dir(&self) -> Result<sys::Fd, StoreError> {
         let dir = self.credentials_dir();
         match sys::lstat(&dir) {
@@ -544,8 +534,8 @@ impl Store {
 
     /// Load the credential record for `username` (PAM hot path).
     ///
-    /// Missing record → [`StoreError::NotFound`] (PAM maps this to `PAM_USER_UNKNOWN`);
-    /// any hardening failure is fail-closed.
+    /// A missing record is [`StoreError::NotFound`] (PAM maps it to
+    /// `PAM_USER_UNKNOWN`).
     pub fn load(&self, username: &str) -> Result<CredentialRecord, StoreError> {
         validate_username(username)?;
         self.check_base()?;
@@ -575,9 +565,9 @@ impl Store {
                 argument_user: username.to_string(),
             });
         }
-        // The record's self-consistency invariants (e.g. `attestation.mode` is one of the
-        // known values) are validated here, not just on write, so a hand-edited record
-        // cannot load clean (L16-7 = L6-6).
+        // Validate self-consistency invariants (e.g. `attestation.mode` is one of the
+        // known values) here too, not only on write, so a hand-edited record cannot
+        // load clean.
         if let Err(e) = record.validate() {
             return Err(StoreError::Corrupt {
                 path,
@@ -585,8 +575,8 @@ impl Store {
             });
         }
         // Defense in depth: the two binary fields PAM/verifier will decode must be valid
-        // unpadded base64url *now*, so a corrupt record fails closed at load rather than
-        // deep inside the ceremony. Values are not otherwise constrained here.
+        // unpadded base64url, so a corrupt record fails closed at load rather than deep
+        // inside the ceremony. Values are not otherwise constrained here.
         b64u_decode(&record.credential_id).map_err(|e| StoreError::Corrupt {
             path: path.clone(),
             message: format!("credential_id is not valid base64url: {e}"),
@@ -601,8 +591,7 @@ impl Store {
     /// Atomically write a credential record (enrollment path).
     ///
     /// Fails with [`StoreError::AlreadyExists`] if a record exists and `replace` is
-    /// `false`. The destination path is derived from `record.linux_user`; an invalid
-    /// value there is [`StoreError::InvalidUsername`].
+    /// `false`.
     pub fn save_atomic(&self, record: &CredentialRecord, replace: bool) -> Result<(), StoreError> {
         validate_username(&record.linux_user)?;
         // Refuse to persist a record that would not survive `load` (e.g. an unknown
@@ -612,8 +601,8 @@ impl Store {
         })?;
         self.check_base()?;
         // Re-validate ownership/mode of the destination directory *before* creating a
-        // temp file in it; the returned, identity-checked handle is used for the final
-        // directory fsync so a swapped directory cannot be silently written into.
+        // temp file in it; the returned identity-checked handle is used for the final
+        // directory fsync, so a swapped directory cannot be silently written into.
         let dir_fd = self.ensure_credentials_dir()?;
 
         let dir = self.credentials_dir();
@@ -659,8 +648,8 @@ impl Store {
         sys::fchmod(install.fd.raw(), install.mode).map_err(|e| self.io(install.temp, e))?;
         sys::write_all(install.fd.raw(), install.contents).map_err(|e| self.io(install.temp, e))?;
         sys::fsync(install.fd.raw()).map_err(|e| self.io(install.temp, e))?;
-        // `Install` holds the only owned `Fd`; nothing else can close it, and dropping the
-        // install consumes the descriptor exactly once.
+        // `Install` holds the only owned `Fd`; dropping it closes the descriptor exactly
+        // once.
         if install.replace {
             sys::rename(install.temp, install.target).map_err(|e| self.io(install.target, e))?;
         } else {
@@ -677,19 +666,17 @@ impl Store {
             }
         }
 
-        // Persist the directory entry on every success path (both replace and non-replace
-        // go through here); the handle was identity-checked before the temp file existed.
+        // Persist the directory entry on every success path; the handle was
+        // identity-checked before the temp file existed.
         sys::fsync(install.dir_fd.raw()).map_err(|e| self.io(install.dir_path, e))?;
         Ok(())
     }
 
     /// Remove the record for `username`, returning `false` if there was none.
     ///
-    /// Refuses to act through a symlinked `credentials` directory or on a symlinked
-    /// record, and refuses an insecure base directory
-    /// ([`StoreError::InsecureBase`]). Unlike [`Store::load`], the *record's*
-    /// ownership/mode are not re-checked, so an administrator can clean up a mis-owned
-    /// record.
+    /// Refuses a symlinked `credentials` directory, a symlinked record, and an insecure
+    /// base directory. Unlike [`Store::load`], the record's own ownership/mode are not
+    /// re-checked, so an administrator can clean up a mis-owned record.
     pub fn remove(&self, username: &str) -> Result<bool, StoreError> {
         validate_username(username)?;
         match self.check_base() {
@@ -736,10 +723,9 @@ impl Store {
 
     /// List enrolled usernames (sorted, deduplicated) from `<base>/credentials/*.json`.
     ///
-    /// A missing `credentials` directory yields an empty list, and a missing base is
-    /// likewise empty rather than an error. An insecure base directory is refused as
-    /// [`StoreError::InsecureBase`]. Non-regular files, symlinks, and names that fail
-    /// [`validate_username`] are skipped.
+    /// A missing base or `credentials` directory yields an empty list. An insecure base
+    /// is refused as [`StoreError::InsecureBase`]. Non-regular files, symlinks, and
+    /// names that fail [`validate_username`] are skipped.
     pub fn list(&self) -> Result<Vec<String>, StoreError> {
         match self.check_base() {
             Ok(_) => {}
@@ -787,7 +773,7 @@ impl Store {
 
     /// Load and parse `<base>/config` (TOML, mode `0600`, root-owned).
     ///
-    /// A missing file is [`StoreError::ConfigMissing`]; the installer creates it.
+    /// A missing file is [`StoreError::ConfigMissing`].
     pub fn load_config(&self) -> Result<Config, StoreError> {
         let path = self.config_path();
         let bytes = self.read_secure_file(&path, CONFIG_MODE, MAX_CONFIG_BYTES, |p| {
@@ -806,21 +792,16 @@ impl Store {
     }
 
     /// Atomically write `<base>/config` (TOML, mode `0600`, owned by the store's
-    /// expected owner — root in production).
+    /// expected owner).
     ///
-    /// This is the store-owned counterpart to [`Store::load_config`] (L7-4): the
-    /// installer must call it (with `config.to_toml()` as the serializer) instead of
-    /// hand-rolling the TOML, so the write schema cannot drift from the
-    /// `deny_unknown_fields` read schema. The base directory is created (`0755`) if
-    /// missing; it is validated by [`Store::check_base`] when it already exists.
-    ///
-    /// Serialization is derived from [`Config::to_toml`], which cannot fail for this fixed
-    /// shape.
+    /// The store owns both sides of the on-disk format: serialization goes through
+    /// [`Config::to_toml`] and parsing through the same `deny_unknown_fields` schema, so
+    /// the write and read schemas cannot drift. The base directory is created (`0755`)
+    /// if missing.
     pub fn save_config(&self, config: &Config) -> Result<(), StoreError> {
         let path = self.config_path();
-        // Ensure the base exists, then validate it. A base that already exists must pass
-        // the same insecure-base checks as every other store operation; a fresh one is
-        // created `0755` (umask-corrected) and re-validated.
+        // Ensure the base exists, then validate it. A fresh base is created `0755`
+        // (umask-corrected) and re-validated.
         let before = match self.check_base() {
             Ok(st) => st,
             Err(StoreError::NotFound { .. }) => {
@@ -832,9 +813,8 @@ impl Store {
             }
             Err(e) => return Err(e),
         };
-        // Hold an identity-checked directory descriptor for the final fsync. The base
-        // deliberately has no exact-mode requirement, so this mirrors `open_checked_dir`
-        // without imposing one.
+        // Hold an identity-checked base descriptor for the final fsync. The base has no
+        // exact-mode requirement, so this mirrors `open_checked_dir` without imposing one.
         let base_fd = sys::open_dir(&self.base).map_err(|e| self.io(&self.base, e))?;
         let after = sys::fstat(base_fd.raw()).map_err(|e| self.io(&self.base, e))?;
         if after.uid != self.owner_uid || after.perm_bits() & 0o022 != 0 {
@@ -873,8 +853,8 @@ impl Store {
 
 /// Validate a Linux username against `^[A-Za-z_][A-Za-z0-9._-]{0,31}$`.
 ///
-/// Implemented by hand (no `regex` dependency) and rejects the empty string, anything
-/// longer than 32 bytes, path separators, leading digits/dots/dashes, and NUL bytes.
+/// Implemented by hand (no `regex` dependency); rejects the empty string, names longer
+/// than 32 bytes, path separators, leading digits/dots/dashes, and NUL bytes.
 pub fn validate_username(username: &str) -> Result<(), StoreError> {
     let bytes = username.as_bytes();
     if bytes.is_empty() || bytes.len() > 32 {
@@ -892,8 +872,8 @@ pub fn validate_username(username: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// The effective uid of the calling process, for tests and callers that need to build a
-/// non-root [`Store`].
+/// The effective uid of the calling process, for callers that need to build a non-root
+/// [`Store`].
 pub fn current_euid() -> u32 {
     sys::geteuid()
 }

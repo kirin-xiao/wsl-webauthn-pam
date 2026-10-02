@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate a pam-auth-update-expanded PAM configuration (plan §11 / SR-21).
+"""Validate a pam-auth-update-expanded PAM configuration.
 
 The installer ships a pam-configs profile that uses the ``pam-auth-update``
 "``end``" idiom:
@@ -293,9 +293,8 @@ def check_profile_source(path: str) -> tuple[bool, list[str]]:
     return (not problems), problems
 
 
-# Committed fixtures live at the repository root under `scripts/fixtures/`
-# (the comment above used to name a path one level deeper than the arithmetic
-# actually resolves to).  Expand both `..` segments via normpath below.
+# Committed fixtures live at the repository root under `scripts/fixtures/`.
+# Expand both `..` segments via normpath below.
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "scripts", "fixtures")
 
 

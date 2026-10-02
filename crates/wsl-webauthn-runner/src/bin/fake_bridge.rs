@@ -1,8 +1,8 @@
-//! `fake-bridge` — a test double speaking the §3 wire protocol.
+//! `fake-bridge` — a test double speaking the wire protocol.
 //!
-//! This binary is test support only; it is built as an extra target of the runner
-//! package so integration tests can locate it via
-//! `env!("CARGO_BIN_EXE_fake-bridge")`. It never performs any real ceremony.
+//! Test support only; built as an extra target of the runner package so integration tests
+//! can locate it via `env!("CARGO_BIN_EXE_fake-bridge")`. It never performs any real
+//! ceremony.
 //!
 //! Usage:
 //!
@@ -217,8 +217,8 @@ fn main() -> ExitCode {
 
     if opts.abort {
         // Die by SIGABRT (signal 6) without writing a frame, to exercise the runner's
-        // signal-death modeling (L8-11). The real bridge is a Windows exe, but a Linux
-        // signal stands in for "terminated by a signal".
+        // signal-death path. The real bridge is a Windows exe, but a Linux signal stands
+        // in for "terminated by a signal".
         unsafe {
             libc::signal(libc::SIGABRT, libc::SIG_DFL);
             libc::raise(libc::SIGABRT);
@@ -297,8 +297,8 @@ fn main() -> ExitCode {
     }
     if let Some(ms) = opts.postclose_sleep {
         // Close both stdout and stderr (the runner sees EOF on both) and linger, so the
-        // runner is on its EOF fast path waiting for the child to be reaped (L10-3 timing
-        // test). SAFETY: close owned fds; the frame was already flushed.
+        // runner is on its EOF fast path waiting for the child to be reaped. SAFETY: close
+        // owned fds; the frame was already flushed.
         unsafe {
             libc::close(1);
             libc::close(2);

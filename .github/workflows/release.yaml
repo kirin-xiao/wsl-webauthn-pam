@@ -1,13 +1,13 @@
 name: Release
 
-# Release workflow (plan §11, acceptance 7 / SR-22).
+# Release workflow.
 #
 # Trigger: pushing a tag matching `v*` (e.g. v0.1.0). The whole workflow builds
 # from the *tag* ref (actions/checkout defaults to the triggering ref), so the
 # artifacts are exactly the tagged commit.
 #
 # `publish` is gated on a `gate` job that re-runs fmt/clippy/test on the tagged
-# commit, so a tag cannot publish bytes whose test/lint jobs never ran (L15-3).
+# commit, so a tag cannot publish bytes whose test/lint jobs never ran.
 # (Tag pushes do not trigger ci.yaml, hence the in-workflow re-run.)
 #
 # Every `uses:` is pinned to a full 40-char commit SHA (see ci.yaml header).
@@ -16,8 +16,8 @@ name: Release
 #
 # Runner choice for aarch64: we use the native GitHub-hosted ARM runners
 # (`ubuntu-24.04-arm`, `windows-11-arm`) rather than cross-compiling. This
-# matches what the legacy project used and avoids shipping a cross-linked
-# libpam0g-dev/CRT. If those labels are ever unavailable on a plan, replace the
+# avoids shipping a cross-linked libpam0g-dev/CRT. If those labels are ever
+# unavailable on a plan, replace the
 # matrix `runner` values with an x86_64 runner + `cross`/`cargo-zigbuild`.
 #
 # Release layout (per architecture):
@@ -31,7 +31,7 @@ name: Release
 #   SHA256SUMS                       (checksums for all tarballs)
 #
 # Both the Linux module and the matching Windows bridge ship in the same
-# tarball because install.sh copies the bridge onto the Windows side (plan D11).
+# tarball because install.sh copies the bridge onto the Windows side.
 
 on:
   push:
@@ -136,8 +136,9 @@ jobs:
 
   gate:
     name: gate (fmt, clippy, test)
-    # L15-3: the release workflow was not gated on CI. A tag push does not run
-    # ci.yaml (it triggers on pushes to main and on PRs), so a tag could publish
+    # A tag push does not run
+    # ci.yaml (it triggers on pushes to main and on PRs), so without this a tag
+    # could publish
     # a commit whose fmt/clippy/test never ran or failed. Re-run the gate here on
     # the *tagged* commit (checkout defaults to the tag ref = GITHUB_SHA) and
     # make `publish` depend on it. Cost: one ubuntu-latest job per tag.
@@ -173,7 +174,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      # Required by actions/attest-build-provenance below (L5-7/L10-7/L15-11).
+      # Required by actions/attest-build-provenance below.
       id-token: write
       attestations: write
     steps:
@@ -197,7 +198,7 @@ jobs:
             cp dist/windows-${arch}/WSLWebAuthnBridge.exe   "dist/out/${dir}/"
             cp install.sh pam-config README.md              "dist/out/${dir}/"
             tar -czf "dist/${dir}.tar.gz" -C dist/out "${dir}"
-            # L15-6: the tarball root must be exactly the one named directory, so
+            # The tarball root must be exactly the one named directory, so
             # `tar xzf … && cd …` (README) works and the layout cannot silently
             # regress to "contents at the root".
             top="$(tar -tzf "dist/${dir}.tar.gz" | sed -n '1p')"
@@ -223,7 +224,7 @@ jobs:
             exit 1
           fi
 
-      # L5-7/L10-7/L15-11: attach a signed SLSA build-provenance attestation to
+      # Attach a signed SLSA build-provenance attestation to
       # the published tarballs and SHA256SUMS, so a downloader can verify which
       # workflow + commit produced them (`gh attestation verify <file> -R …`).
       - name: attest build provenance

@@ -1,4 +1,4 @@
-//! stdin/stdout framing glue (plan §3 process contract).
+//! stdin/stdout framing glue.
 //!
 //! Kept free of any platform calls so it is testable on Linux. `main` uses
 //! these helpers for the one-request/one-response invariant; the exit-code
@@ -36,7 +36,7 @@ pub fn read_request<R: std::io::Read>(r: &mut R) -> Result<Request, InputError> 
 /// Classify and deserialize a request payload.
 ///
 /// Distinguishes an *unknown operation* (exit 4) from a *malformed frame*
-/// (exit 3), per the plan's exit-code contract.
+/// (exit 3), per the exit-code contract.
 pub fn decode_request(payload: &[u8]) -> Result<Request, InputError> {
     // First parse as JSON to inspect `op` without losing the malformed case.
     let value: serde_json::Value =

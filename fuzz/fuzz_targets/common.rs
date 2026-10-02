@@ -3,7 +3,7 @@
 //! Arbitrary inputs may still legitimately return either `Ok` or `Err` — the primary
 //! contract is "never panic". The parser targets additionally run seeded oracles that
 //! assert a spurious `Ok` (accepting malformed or semantically-wrong input) is caught
-//! rather than discarded (L14-10). See the per-oracle comments below.
+//! rather than discarded. See the per-oracle comments below.
 
 #![allow(dead_code)]
 
@@ -95,7 +95,7 @@ pub fn split(data: &[u8]) -> (&[u8], &[u8]) {
 }
 
 // ---------------------------------------------------------------------------
-// Fail-open oracles (L14-10)
+// Fail-open oracles
 //
 // Each oracle seeds a known-good structure, asserts it is accepted, then applies a
 // corruption that *must* be rejected. They are run from a rare marker branch in the
@@ -266,7 +266,7 @@ pub fn attestation_object_oracle() {
 /// exactly one structure — so an appended byte is rejected too. This is the strongest
 /// fail-open signal reachable from the structural parse seam.
 ///
-/// The declared-`keyBits`-vs-modulus semantic invariant (L1-4) lives in `tpm::verify`,
+/// The declared-`keyBits`-vs-modulus semantic invariant lives in `tpm::verify`,
 /// which is *not* reachable from `testing::parse_tpm_pub_area`; `parse_pub_area`
 /// correctly accepts a well-formed `pubArea` regardless of whether its fields agree.
 /// Asserting the invariant here would fail, so it is left to the full-verifier

@@ -1,4 +1,4 @@
-//! syslog-only logging for the PAM module (plan §8).
+//! syslog-only logging for the PAM module.
 //!
 //! The module must **never** write to stdout (it would corrupt the PAM stack's
 //! stdio contract) and must honour `PAM_SILENT` for user-facing output. All
@@ -13,7 +13,7 @@
 //! is thread-safe, and a threaded PAM consumer (a display manager, a session broker)
 //! may run several `pam_sm_authenticate` calls concurrently.
 //!
-//! The `debug` verbosity is **per-thread** (L9-7): a process-global flag would let one
+//! The `debug` verbosity is **per-thread**: a process-global flag would let one
 //! service's `debug` argument turn on verbose logging for every concurrent
 //! authentication in the same process. A PAM call runs on one thread, so a
 //! thread-local flag is the correct scope and needs no locking.
@@ -231,8 +231,8 @@ mod tests {
         assert!(records[0].1.contains("hostile\0username"));
     }
 
-    /// L9-7: the `debug` flag is per-thread, so enabling it for one thread must not
-    /// change another thread's verbosity.
+    /// The `debug` flag is per-thread, so enabling it for one thread must not change
+    /// another thread's verbosity.
     #[test]
     fn debug_flag_is_per_thread() {
         set_debug(false);

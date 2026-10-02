@@ -1,4 +1,4 @@
-//! Hand-rolled Linux-PAM FFI bindings (plan §8).
+//! Hand-rolled Linux-PAM FFI bindings.
 //!
 //! No `bindgen`, no `libclang`: the handful of types and constants the module needs
 //! are declared here faithfully to `<security/_pam_types.h>` and
@@ -6,21 +6,15 @@
 //! [`std::mem::offset_of!`] and [`std::mem::size_of`], so a wrong declaration fails
 //! the test suite rather than corrupting a live PAM stack.
 //!
-//! Everything the module touches lives behind a *seam* (see [`crate::seam`]): the
-//! production implementation in this file is a thin wrapper over libpam, while the
-//! unit tests substitute a `#[cfg(test)]` fake. This keeps the unsafe surface tiny
-//! and the authentication logic fully testable without a live PAM application.
-//!
 //! `#[link(name = "pam")]` is link-time only; CI provides `libpam0g-dev`.
 
 #![allow(non_camel_case_types)]
 #![allow(unsafe_code)]
-// This module deliberately mirrors the full slice of `<security/pam_*.h>` the
-// module *could* use, not only the entries the current source calls: a constant
-// such as `PAM_ERROR_MSG` documents the ABI even when only a cfg(test) layout
-// check touches it. Now that the module is `pub(crate)` (L6-7) those entries are
-// no longer externally reachable, so silence the resulting dead-code warnings
-// rather than deleting the ABI mirror.
+// This module mirrors the full slice of `<security/pam_*.h>` the module *could* use,
+// not only the entries the source calls: a constant such as `PAM_ERROR_MSG` documents
+// the ABI even when only a cfg(test) layout check touches it. Since the module is
+// `pub(crate)`, those entries are not externally reachable, so silence the dead-code
+// warnings rather than deleting the ABI mirror.
 #![allow(dead_code)]
 
 use std::ffi::{CStr, c_char, c_int, c_void};
@@ -117,9 +111,9 @@ pub struct pam_conv {
 // libpam functions used by the production seam
 // ---------------------------------------------------------------------------
 
-// `#[link(name = "pam")]` is link-time only (plan §8): it records a `DT_NEEDED`
-// entry so the `.so` resolves these symbols even when loaded into a process that has
-// not itself already pulled in libpam. CI provides `libpam0g-dev`.
+// `#[link(name = "pam")]` is link-time only: it records a `DT_NEEDED` entry so the
+// `.so` resolves these symbols even when loaded into a process that has not itself
+// already pulled in libpam. CI provides `libpam0g-dev`.
 #[link(name = "pam")]
 unsafe extern "C" {
     /// Retrieve the username associated with `pamh`.
@@ -134,7 +128,7 @@ unsafe extern "C" {
         item_type: c_int,
         item: *mut *const c_void,
     ) -> c_int;
-    /// Request a delay on failures (plan §3, CR-14).
+    /// Request a delay on failures.
     pub fn pam_fail_delay(pamh: *mut pam_handle_t, musec_delay: u32) -> c_int;
 }
 

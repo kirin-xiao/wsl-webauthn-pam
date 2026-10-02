@@ -1,9 +1,9 @@
-# cargo-deny configuration (plan §11).
+# cargo-deny configuration.
 # Run: cargo deny check
 #
 # NOTE: the CI `cargo-deny` job (see .github/workflows/ci.yaml) invokes the action
 # with `--all-features`, which overrides the `[graph]` defaults below. A bare local
-# `cargo deny check` uses these `false` values instead. The gate itself is not made
+# `cargo deny check` uses these `false` values instead. The gate is not made
 # looser by either value: keeping `all-features = false` here means a feature-enabled
 # graph is only checked when CI (or a local run) explicitly asks for it, so dropping
 # `--all-features` from CI is a visible edit there rather than a silent config change.
@@ -21,9 +21,9 @@ yanked = "deny"
 ignore = [
     # RUSTSEC-2023-0071 ("Marvin Attack"): non-constant-time RSA private-key
     # operations in the `rsa` crate. It reaches us transitively through the
-    # verifier's RS256 / packed-attestation verification (plan §4, D4).
+    # verifier's RS256 / packed-attestation verification.
     #
-    # True rationale: the *production* path is public-key verification only
+    # The *production* path is public-key verification only
     # (no private-key operation, no key generation) and the PAM path is local
     # and never network-reachable, so the remote-timing sidechannel the advisory
     # describes is not applicable. RSA private keys do exist — but solely in the
@@ -67,15 +67,15 @@ exceptions = []
 
 [bans]
 multiple-versions = "warn"
-# L5-8 = L15-13: the resolved graph carries a few duplicate crate versions. They
-# are documented skips rather than an upstream dedupe we cannot safely perform:
+# The resolved graph carries a few duplicate crate versions. They are
+# documented skips rather than an upstream dedupe we cannot safely perform:
 #   * `winnow` 0.7 + 1.0 are both pulled by `toml` 0.9, which is mid-transition
 #     between its old and new parser and pins each internally. We cannot choose
 #     one without forking/patching `toml`.
 #   * `syn` 2 + 3 are build-time-only proc-macro deps (der_derive/curve25519 vs
 #     serde_derive); they never link into a shipped binary.
 #   * the dev-only `rand` 0.8+0.9 / `getrandom` 0.2+0.3 split is entirely inside
-#     `proptest`'s dev-dependency tree — we do not control those version pins.
+#     `proptest`'s dev-dependency tree — those version pins are not ours to set.
 # `skip` allows all versions of these crates to coexist without a warning; a
 # duplicate of any *other* crate still warns. `skip-tree` exempts proptest's
 # dev-only subtree the same way.
@@ -96,10 +96,11 @@ skip-tree = [{ name = "proptest" }]
 
 [sources]
 unknown-registry = "deny"
-# L5-10: every dependency resolves from the crates.io registry (no git sources in
-# either lockfile). The previous `allow-git = ["https://github.com/"]` matched
-# nothing and pre-authorized *any* github.com repo; if a git dependency is ever
-# introduced, it should be listed explicitly as a pinned revision then, not
-# blanket-allowed. `unknown-git = "deny"` rejects anything unlisted.
+# Every dependency resolves from the crates.io registry (no git sources in
+# either lockfile). `allow-git = ["https://github.com/"]` would match nothing
+# while pre-authorizing *any* github.com repo, so it is removed: if a git
+# dependency is ever introduced, it should be listed explicitly as a pinned
+# revision then, not blanket-allowed. `unknown-git = "deny"` rejects anything
+# unlisted.
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]

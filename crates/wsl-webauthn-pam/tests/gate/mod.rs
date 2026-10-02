@@ -1,9 +1,9 @@
-//! Shared "require libpam" gate (L14-6).
+//! Shared "require libpam" gate.
 //!
-//! `tests/dlopen.rs` and `tests/pam_start.rs` historically *passed by skipping*
-//! when the built `.so` could not be located, so a green run did not prove libpam
-//! ever loaded the module. CI sets `WSL_WEBAUTHN_REQUIRE_LIBPAM=1`, which turns
-//! every such skip into a hard failure; dev boxes leave it unset and still skip.
+//! `tests/dlopen.rs` and `tests/pam_start.rs` would otherwise pass by skipping when
+//! the built `.so` could not be located, so a green run did not prove libpam ever
+//! loaded the module. CI sets `WSL_WEBAUTHN_REQUIRE_LIBPAM=1`, which turns every such
+//! skip into a hard failure; dev boxes leave it unset and still skip.
 //!
 //! This module has no dependencies beyond `std` so it can be included by the
 //! light ABI test as well as the heavier real-libpam tests.

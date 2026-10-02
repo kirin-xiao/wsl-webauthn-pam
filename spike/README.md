@@ -1,30 +1,27 @@
-# Windows WebAuthn spike harness (plan §13 wave B3)
+# Windows WebAuthn spike harness
 
-Spike-only tooling used to empirically validate plan decisions D2/D3/D5 against a
-real Windows host (WSL2 + TPM + Windows Hello). It is **not** product code and is
-not part of the Cargo workspace.
-
-The findings live in [`../SPIKE.md`](../SPIKE.md).
+Spike-only tooling for running the real `WSLWebAuthnBridge.exe` on a Windows host
+(WSL2 + TPM + Windows Hello). It is not product code and is not part of the Cargo
+workspace. The findings are in [`../SPIKE.md`](../SPIKE.md).
 
 ## What it does
 
-`harness.py` drives the real `WSLWebAuthnBridge.exe` through WSL interop:
+`harness.py` drives the bridge through WSL interop:
 
-* builds `clientDataJSON` byte-for-byte the way the Linux side will
-  (`build_client_data` mirrors `wsl-webauthn-protocol::build_client_data`);
-* frames/parses the plan §3 wire protocol (4-byte LE length + JSON);
-* enforces a **hard Linux-side deadline** on every invocation and, on expiry,
-  SIGKILLs the interop child and best-effort `taskkill.exe /F` the reported
-  Windows PID (plan §7 backstop);
-* decodes the CBOR attestation object / authenticator data / COSE key (a small
-  built-in CBOR decoder, so no extra Python deps beyond `cryptography`);
-* verifies `rpIdHash == SHA-256(RP_ID)` (the D2 check), the
-  `client_data_json_echo` pass-through (D5/§3) and the assertion signature.
+* builds `clientDataJSON` the way the Linux side does (`build_client_data` mirrors
+  `wsl-webauthn-protocol::build_client_data`);
+* frames/parses the wire protocol (4-byte LE length + JSON);
+* enforces a Linux-side deadline on every invocation and, on expiry, SIGKILLs the
+  interop child and best-effort `taskkill.exe /F` the reported Windows PID;
+* decodes the CBOR attestation object / authenticator data / COSE key with a small
+  built-in decoder, so no extra Python deps beyond `cryptography`;
+* verifies `rpIdHash == SHA-256(RP_ID)`, the `client_data_json_echo` pass-through,
+  and the assertion signature.
 
 ## Requirements
 
 * `cargo` + `x86_64-pc-windows-gnu` target, `x86_64-w64-mingw32-gcc`;
-* Python 3 with `cryptography` (used for ECDSA/RSA verification only);
+* Python 3 with `cryptography` (ECDSA/RSA verification only);
 * WSL interop enabled; the bridge exe built at
   `target/x86_64-pc-windows-gnu/release/WSLWebAuthnBridge.exe`.
 
@@ -46,17 +43,17 @@ python3 spike/harness.py --deadline 90 assert \
 python3 spike/harness.py verify tests/vectors/local/spike-enroll-assert.json
 ```
 
-Useful knobs: `--exe`, `--deadline`, `--timeout-ms`, `--challenge-hex`. The
-`assert` subcommand without `--merge` needs `--credential-id`.
+Knobs: `--exe`, `--deadline`, `--timeout-ms`, `--challenge-hex`. The `assert`
+subcommand without `--merge` needs `--credential-id`.
 
-> **Safety:** ceremonies raise UI on the user's screen. Run one at a time and
-> tell the user which prompt is coming. Every invocation is deadline-bounded so
-> a hung prompt can never wedge the run.
+> **Safety:** ceremonies raise UI on the user's screen. Run one at a time and say
+> which prompt is coming. Every invocation is deadline-bounded so a hung prompt
+> cannot wedge the run.
 
-## Second-RP-ID experiment (D2 robustness)
+## Second-RP-ID experiment
 
-`build_testrp.sh` patches the compile-time `RP_ID` constant, builds an exe that
-pins a different RP ID, and restores the source (it never commits the patch):
+`build_testrp.sh` patches the compile-time `RP_ID` constant, builds an exe pinning a
+different RP ID, and restores the source:
 
 ```sh
 spike/build_testrp.sh io.github.kirin-xiao.wsl-webauthn-pam-test
@@ -70,6 +67,6 @@ been built with the same constant.
 
 ## Local vectors
 
-`tests/vectors/local/` is **git-ignored** (it contains machine identifiers:
-attestation material, credential IDs, account-linked keys). Nothing captured
-here is ever committed; only the `.gitignore` entry is.
+`tests/vectors/local/` is git-ignored: it contains machine identifiers (attestation
+material, credential IDs, account-linked keys). Nothing captured there is committed;
+only the `.gitignore` entry is.

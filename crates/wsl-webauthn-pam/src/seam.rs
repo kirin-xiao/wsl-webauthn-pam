@@ -1,4 +1,4 @@
-//! The seam between the real PAM FFI and the authentication logic (plan §8).
+//! The seam between the real PAM FFI and the authentication logic.
 //!
 //! [`PamSeam`] abstracts the handful of libpam calls the module makes (user name,
 //! service name, conversation, fail delay). Production uses [`RealPamSeam`], a thin
@@ -6,12 +6,9 @@
 //! entire authentication state machine is exercised without a live PAM application
 //! and without the global system state the real store/runner would touch.
 //!
-//! # Why a seam instead of `pam_start`
-//!
 //! A `pam_start` harness would need a real PAM service, a real store under
 //! `/etc/wsl_webauthn`, and a real interop child — none of which belong in a
-//! hermetic unit test. The seam keeps the unsafe FFI surface at a few lines while
-//! still covering every mapping-table row (see the crate root).
+//! hermetic unit test.
 
 #![allow(unsafe_code)]
 
@@ -52,10 +49,10 @@ pub trait PamSeam {
     /// Send an info/error message to the application, if a conversation exists.
     ///
     /// A missing conversation is [`SeamError::NoConv`]; the caller treats that as a
-    /// non-fatal "cannot prompt" (plan §8: never fail on conv failure).
+    /// non-fatal "cannot prompt" (never fail on conv failure).
     fn conv_text(&mut self, style: c_int, text: &str) -> Result<(), SeamError>;
 
-    /// Request a failure delay via `pam_fail_delay` (plan §3/§8).
+    /// Request a failure delay via `pam_fail_delay`.
     fn fail_delay(&mut self, usec: u32);
 }
 

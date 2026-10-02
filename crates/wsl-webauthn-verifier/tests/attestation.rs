@@ -1,10 +1,4 @@
-//! Synthesized enrollment / attestation verification suite — one negative test per
-//! invariant (plan §4, §12.2).
-//!
-//! Chain tests use the `#[doc(hidden)]` anchor-injection seam
-//! [`verify_attestation_with_anchor`] with a synthetic root; the production default
-//! ([`verify_attestation`]) pins the real Microsoft root fingerprint and is checked
-//! separately.
+//! Enrollment / attestation verification suite.
 
 mod common;
 
@@ -801,7 +795,7 @@ fn negative_leaf_not_v3() {
 #[test]
 fn negative_leaf_missing_basic_constraints() {
     // A standalone leaf (acting as its own trust anchor) with no BasicConstraints
-    // extension. The leaf is checked before any issuer link and the extension is
+    // extension; the leaf is checked before any issuer link and the extension is
     // mandatory, so the rejection is unambiguous.
     let leaf = chain_leaf(&ChainOptions {
         omit_leaf_basic_constraints: true,
@@ -818,8 +812,6 @@ fn negative_leaf_missing_basic_constraints() {
 fn positive_leaf_empty_basic_constraints_is_non_ca() {
     // RFC 5280: `basicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE }`, so an
     // empty SEQUENCE is a valid *non-CA* constraints extension and must be accepted.
-    // This pins the default and guards against a regression that treats an absent
-    // `cA` as CA=true.
     let leaf = chain_leaf(&ChainOptions {
         leaf_basic_constraints_empty: true,
         ..Default::default()
@@ -957,9 +949,7 @@ fn negative_path_len_exceeded() {
 #[test]
 fn positive_path_len_within_limit() {
     // The same extra-CA chain, but the extra CA declares `pathLen=1`, which the
-    // single non-self-issued intermediate below it satisfies. This pins that the
-    // rejection above is caused by the constraint being exceeded, not by the extra
-    // level merely existing (so `negative_path_len_exceeded` is not vacuous).
+    // single non-self-issued intermediate below it satisfies.
     let f = chain_fixture(
         ChainOptions {
             extra_intermediate: true,
@@ -1225,10 +1215,10 @@ fn positive_tpm_rs256_strict() {
 
 #[test]
 fn positive_tpm_rs256_credential_key_strict() {
-    // Regression: an RSA credential key makes `pubArea.unique`/`parameters` describe
-    // an RSA key. `TPMS_RSA_PARMS.exponent` is a fixed-width `u32` (`00 01 00 01` for
-    // 65537) while `BigUint::to_bytes_be` is minimal (`01 00 01`); a byte-length
-    // comparison would reject every RSA credential.
+    // An RSA credential key makes `pubArea.unique`/`parameters` describe an RSA key.
+    // `TPMS_RSA_PARMS.exponent` is a fixed-width `u32` (`00 01 00 01` for 65537) while
+    // `BigUint::to_bytes_be` is minimal (`01 00 01`), so the lengths must not be
+    // compared byte-for-byte.
     let credential = rs256();
     let aik = rsa_aik();
     let aik_test_key = rsa_test_key(&aik);
@@ -1739,10 +1729,10 @@ fn rewrite_att_stmt_bytes_flip(obj: &[u8], name: &str) -> Vec<u8> {
 // TPM attestation (§8.3) — real-machine vector (git-ignored, env-gated)
 // ---------------------------------------------------------------------------
 
-/// Env var pointing at a spike-captured vector JSON (never committed).
+/// Env var pointing at an off-line real-machine vector JSON (never committed).
 const LOCAL_VECTOR_ENV: &str = "WSL_WEBAUTHN_LOCAL_VECTOR";
 
-/// The shape of the spike harness vector we consume.
+/// The shape of the real-machine vector JSON.
 #[derive(serde::Deserialize)]
 struct SpikeVector {
     #[serde(default)]
@@ -1778,7 +1768,7 @@ struct SpikeAssertResponse {
 /// `#[ignore]`d real-machine test. Run with:
 ///
 /// ```text
-/// WSL_WEBAUTHN_LOCAL_VECTOR=/path/to/spike-enroll-assert.json \
+/// WSL_WEBAUTHN_LOCAL_VECTOR=/path/to/vector.json \
 ///   cargo test -p wsl-webauthn-verifier --test attestation -- --ignored local_vector
 /// ```
 #[test]

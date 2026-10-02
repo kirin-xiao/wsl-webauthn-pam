@@ -1,6 +1,6 @@
 name: CI
 
-# Hardened CI (plan §11, acceptance 7 / SR-22).
+# Hardened CI.
 # Every `uses:` is pinned to a full 40-char commit SHA with a `# vX.Y.Z`
 # comment (or, for dtolnay/rust-toolchain which publishes branches and no
 # semver tags, the branch commit). Never use a moving tag here.
@@ -11,18 +11,17 @@ name: CI
 #   build       linux: cargo build --workspace --locked (links the pam cdylib)
 #   test        linux: cargo test --workspace --locked (dlopen/pam_start/vectors);
 #                      WSL_WEBAUTHN_REQUIRE_LIBPAM=1 makes the libpam/ABI tiers
-#                      FAIL (not skip) if the .so or libpam is missing (L14-6)
+#                      FAIL (not skip) if the .so or libpam is missing
 #   pam-ffi     linux: C host (dlopen + real pam_start) with a provisioned store
-#                      in a user+mount namespace; success, deny, and concurrent
-#                      paths (L9-9/L14-6)
+#                      in a user+mount namespace
 #   windows     windows-latest (msvc): bridge clippy + unit tests
 #   windows-gnu ubuntu: cross-build WSLWebAuthnBridge.exe for x86_64-pc-windows-gnu
 #   aarch64     ubuntu-24.04-arm: native release build (really links the cdylib)
 #   cargo-deny  supply-chain: advisories / bans / licenses / sources
 #   machete     lint for genuinely unused manifest dependencies
 #   actionlint  lint the workflow YAML itself
-#   pam-profile SR-21 / acceptance 5: real pam-auth-update expansion guard
-#   doc-invariants  Theme #1: documented invariants map to tests (L1-1/L13-6 class)
+#   pam-profile real pam-auth-update expansion guard
+#   doc-invariants  documented invariants map to tests
 #   fuzz-smoke  nightly cargo-fuzz smoke (pinned 0.13.2, locked, artifacts on failure)
 
 on:
@@ -73,10 +72,10 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      # L15-7 guard: `.gitattributes` forces LF on checkout, so a Windows clone
-      # with core.autocrlf=true can no longer rewrite install.sh/pam-config to
-      # CRLF. This catches a CRLF that is committed *into* a tracked text file
-      # anyway. `git grep -I` skips binary files; the pattern is a literal CR.
+      # `.gitattributes` forces LF on checkout, so a Windows clone with
+      # core.autocrlf=true cannot rewrite install.sh/pam-config to CRLF. This
+      # catches a CRLF that is committed *into* a tracked text file anyway.
+      # `git grep -I` skips binary files; the pattern is a literal CR.
       - name: no CRLF in tracked text files
         run: |
           set -eu
@@ -157,7 +156,7 @@ jobs:
       - name: Allow unprivileged user namespaces (ubuntu-24.04 workaround)
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
 
-      # L14-6: this gate makes the libpam (`pam_start`) and ABI (`dlopen`) tiers
+      # This gate makes the libpam (`pam_start`) and ABI (`dlopen`) tiers
       # FAIL rather than silently skip when the built `.so` (or libpam itself) is
       # absent. Without it a locate-library regression would leave CI green while
       # never loading the module. On a dev box the variable is unset, so the same
@@ -168,19 +167,19 @@ jobs:
         run: cargo test --workspace --locked
 
       # Regression guard: a default WSL/systemd host has a soft RLIMIT_NOFILE of
-      # 1024. The held-fd bridge spawn used to call `F_DUPFD(fd, 1024)`, which fails
+      # 1024. The held-fd bridge spawn must not call `F_DUPFD(fd, 1024)`, which fails
       # with EINVAL at that limit and would make every authentication fail on a
       # correctly configured install. Run the runner suite under that limit so a
       # regression is caught in CI, not just by the in-test setrlimit.
       - name: test (runner, default nofile limit, locked)
         run: bash -c 'ulimit -n 1024; cargo test -p wsl-webauthn-runner --locked'
 
-  # L9-9/L14-6: a *non-Rust* host for the module. It compiles
+  # A *non-Rust* host for the module. It compiles
   # `crates/wsl-webauthn-pam/tests/c_host/pam_host.c`, dlopen(3)s the built cdylib
   # and calls the entry points, then drives the real libpam
   # (`pam_start_confdir` + `pam_authenticate`) with SIGPIPE reset to SIG_DFL —
-  # the exact host disposition under which the audit's two availability defects
-  # (L9-1, L9-2) would surface. The provisioned tier gives the module a tempdir
+  # the host disposition that exercises the module's SIGPIPE handling. The
+  # provisioned tier gives the module a tempdir
   # store and a dynamic fake bridge inside a mount namespace (private /etc), so
   # the success path, the conversation prompt, and concurrent calls with distinct
   # `debug` arguments are all exercised without touching the host /etc.
@@ -253,7 +252,7 @@ jobs:
 
       # mingw-w64 provides a GNU linker/CRT for the windows-gnu target. Modern
       # Rust also ships a self-contained rust-mingw/rust-lld fallback, so this
-      # is belt-and-braces.
+      # is not strictly required.
       - name: Install mingw-w64
         run: sudo apt-get update && sudo apt-get install -y mingw-w64
 
@@ -268,15 +267,12 @@ jobs:
 
   aarch64:
     name: linux aarch64 (native release build)
-    # L15-2: this used to be `cargo check --target aarch64-unknown-linux-gnu`,
-    # which never *links* the cdylib, so a PAM symbol-version or cdylib-ABI
-    # regression passed every PR/push and only surfaced when a tag was cut.
-    # Build on a native GitHub-hosted ARM runner instead — the same runner the
-    # aarch64 leg of release.yaml uses — so PR CI exercises the real link. ARM
-    # runners are free for public repositories, so this adds no billed minutes.
-    # If the `ubuntu-24.04-arm` label is unavailable on a plan, fall back to a
-    # cross build (`dpkg --add-architecture arm64` + `libpam0g-dev:arm64` +
-    # an aarch64 linker) and document the residual gap.
+    # A native ARM build is required here: `cargo check --target
+    # aarch64-unknown-linux-gnu` never *links* the cdylib, so a PAM symbol-version
+    # or cdylib-ABI regression would pass every PR/push and only surface when a
+    # tag was cut. Build on a native GitHub-hosted ARM runner — the same runner
+    # the aarch64 leg of release.yaml uses. ARM runners are free for public
+    # repositories, so this adds no billed minutes.
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -297,8 +293,8 @@ jobs:
           -p wsl-webauthn-pam
           -p wsl-webauthn-cli
 
-      # Assert the cdylib really exists and really is aarch64 — a check-only job
-      # would have passed even if the .so never linked.
+      # A check-only job never links the cdylib, so assert the .so exists and
+      # really is aarch64.
       - name: assert aarch64 module linked
         run: |
           set -eu
@@ -315,10 +311,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # L15-9: `arguments` fully replaces the action's default, so spell out
+      # `arguments` fully replaces the action's default, so spell out
       # `--all-features` explicitly. The action's default is `--all-features`;
-      # passing only `--locked` silently dropped it, which made deny.toml's
-      # `[graph] all-features = false` assertion unreachable and would stop
+      # passing only `--locked` silently drops it, which makes deny.toml's
+      # `[graph] all-features = false` assertion unreachable and stops
       # denying advisories/licenses on a feature-enabled graph.
       - name: cargo-deny
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
@@ -327,9 +323,8 @@ jobs:
           arguments: --all-features --locked
           log-level: warn
 
-  # L5-5 = L7-3 = L16-12: a manifest may declare a dependency no source/target
-  # in the crate actually uses (this caught thiserror/pam, serde/runner+bridge,
-  # base64/store). cargo check/build never notices, so gate it explicitly.
+  # A manifest may declare a dependency no source/target
+  # in the crate actually uses. cargo check/build never notices, so gate it explicitly.
   machete:
     name: unused dependencies (cargo-machete)
     runs-on: ubuntu-latest
@@ -363,7 +358,7 @@ jobs:
           fail-on-error: true
 
   pam-profile:
-    name: PAM profile expansion guard (SR-21)
+    name: PAM profile expansion guard
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -394,17 +389,16 @@ jobs:
           echo '--- generated /etc/pam.d/common-auth ---'
           grep -n 'pam_wsl_webauthn' /etc/pam.d/common-auth
 
-      - name: assert expansion (SR-21)
+      - name: assert expansion
         run: python3 .github/scripts/check-pam-profile.py /etc/pam.d/common-auth
 
-  # Theme #1 / testing-roadmap #9: the documented security invariants
-  # (`SECURITY.md`, the verifier trust table) are a specification that nothing
-  # forced to match the code. This guard maps each `<!-- INVARIANT: ... -->`
-  # claim to the test that pins it and fails when a claim has no test, a mapped
-  # test no longer exists, or a mapped negative test stopped asserting the
-  # documented direction. It is the CI teeth for the L1-1/L1-2/L13-6 class.
+  # The documented security invariants (`SECURITY.md`, the verifier trust table)
+  # are a specification that nothing forced to match the code. This guard maps
+  # each `<!-- INVARIANT: ... -->` claim to the test that pins it and fails when
+  # a claim has no test, a mapped test no longer exists, or a mapped negative
+  # test stopped asserting the documented direction.
   doc-invariants:
-    name: documented invariants map to tests (Theme #1)
+    name: documented invariants map to tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -428,8 +422,8 @@ jobs:
     # `-Zsanitizer only accepted on nightly`. RUSTUP_TOOLCHAIN wins over
     # toolchain files for every process in the job (cargo-fuzz + its children).
     #
-    # L5-9: the fuzz toolchain is pinned to a *dated* nightly so the compiler
-    # (and therefore the sanitizer behaviour) does not drift under us; the same
+    # The fuzz toolchain is pinned to a *dated* nightly so the compiler
+    # (and therefore the sanitizer behaviour) does not drift; the same
     # value is passed to dtolnay/rust-toolchain below. A local `cargo fuzz`
     # invocation without this env var silently uses the stable toolchain from
     # rust-toolchain.toml — export RUSTUP_TOOLCHAIN=<this nightly> when fuzzing
@@ -448,10 +442,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # The `fuzz/` cargo-fuzz workspace is present in the tree (committed since
-      # the fuzz-reproducibility work), so `present` is true on this ref. The
-      # gate is retained so that a future revert or fork dropping `fuzz/` fails
-      # gracefully (skip) instead of erroring.
+      # The gate skips gracefully instead of erroring when `fuzz/` is absent
+      # (e.g. a fork or revert that drops it).
       - name: detect fuzz workspace
         id: detect
         run: |
@@ -466,7 +458,7 @@ jobs:
         if: steps.detect.outputs.present == 'true'
         uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly branch
         with:
-          # L5-9: same dated nightly as RUSTUP_TOOLCHAIN above.
+          # Same dated nightly as RUSTUP_TOOLCHAIN above.
           toolchain: nightly-2026-09-30
 
       - name: Cache

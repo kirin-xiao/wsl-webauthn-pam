@@ -1,6 +1,6 @@
 //! COSE_Key parsing and signature verification (RFC 8152 / CTAP2).
 //!
-//! Supported algorithms (the allow-list mandated by plan §4):
+//! Supported algorithms:
 //!
 //! | alg   | name  | kty | params                        |
 //! |-------|-------|-----|-------------------------------|
@@ -254,7 +254,7 @@ fn parse_es256(map: &[(Value, Value)]) -> Result<ParsedCoseKey, VerifyError> {
 
     // Rebuild the SEC1 uncompressed point (0x04 || X || Y) ourselves rather than
     // trusting any prefix in the input; compressed points are therefore impossible
-    // to smuggle in (plan §4: uncompressed only).
+    // to smuggle in.
     let mut sec1 = [0u8; 65];
     sec1[0] = 0x04;
     sec1[1..33].copy_from_slice(x);

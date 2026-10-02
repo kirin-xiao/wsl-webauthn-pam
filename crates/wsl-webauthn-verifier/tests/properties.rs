@@ -1,6 +1,4 @@
-//! `proptest` round-trip and robustness properties (plan §4 test item 3).
-//!
-//! These run under the normal `cargo test` on stable and keep runtimes short.
+//! `proptest` round-trip and robustness properties.
 
 mod common;
 
@@ -44,9 +42,9 @@ proptest! {
         }
     }
 
-    /// Canonical-CBOR / trailing-byte rejection for COSE keys (replaces the former
-    /// `ciborium`-only round-trip property, L14-9). A key the parser accepts is an
-    /// exact single CBOR item; appending any byte must therefore be rejected.
+    /// Canonical-CBOR / trailing-byte rejection for COSE keys. A key the parser
+    /// accepts is an exact single CBOR item; appending any byte must therefore be
+    /// rejected.
     #[test]
     fn cose_trailing_byte_rejected(
         extra in proptest::collection::vec(any::<u8>(), 1..8),
@@ -169,9 +167,8 @@ proptest! {
     }
 
     /// Arbitrary bytes fed as the whole `attestationObject` must never panic the
-    /// **full** enrollment verifier under either policy — the property the
-    /// parser-only coverage lacked (L14-1). `Ok` is still only reachable when all
-    /// checks genuinely pass.
+    /// full enrollment verifier under either policy. `Ok` is only reachable when
+    /// all checks genuinely pass.
     #[test]
     fn random_attestation_never_panics(data in proptest::collection::vec(any::<u8>(), 0..4096)) {
         let challenge = [0x42u8; 32];
@@ -252,8 +249,8 @@ proptest! {
 
     /// Arbitrary `certInfo`/`pubArea` bytes against a valid, anchored TPM chain.
     /// Each `certInfo` is re-signed with the fixture's AIK so the AIK signature step
-    /// passes and the TPM `certInfo`/`pubArea` semantic checks are actually reached
-    /// with randomized input (the coverage L14-1 calls out).
+    /// passes and the TPM `certInfo`/`pubArea` semantic checks are reached with
+    /// randomized input.
     #[test]
     fn random_tpm_cert_info_never_panics(
         cert_info in proptest::collection::vec(any::<u8>(), 0..512),
@@ -281,8 +278,7 @@ proptest! {
     }
 }
 
-/// A valid, anchored `packed` enrollment built once and reused (mutations are
-/// applied to clones of its bytes).
+/// A valid, anchored `packed` enrollment reused as the base for mutation tests.
 static PACKED_BASE: LazyLock<common::EnrolledPacked> =
     LazyLock::new(|| common::packed_enrollment(&common::es256()));
 

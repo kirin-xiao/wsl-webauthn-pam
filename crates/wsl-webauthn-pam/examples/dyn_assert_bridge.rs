@@ -1,27 +1,17 @@
-//! `dyn_assert_bridge` — a **test helper** (not installed, not part of the module
-//! or its public API) that produces a genuinely valid ES256 assertion for the
-//! `clientDataJSON` the PAM module sends it.
+//! `dyn_assert_bridge` — test helper (not installed, not part of the module or
+//! its public API). It reads an Assert request frame from stdin, extracts
+//! `clientDataJSON`, signs `authenticatorData || SHA-256(clientDataJSON)` with an
+//! ephemeral P-256 key, and writes the framed [`Response::Assert`] to stdout.
 //!
-//! Why it exists: the production `SystemDeps` spawns the configured bridge with
-//! **no command-line arguments**, and the module mints a fresh random challenge per
-//! authentication. The committed `pam-test-fake-bridge` scripts a *pre-built*
-//! response, so it cannot sign over an unpredictable challenge — which is exactly
-//! what a real `PAM_SUCCESS` through `pam_start` + libpam requires. This helper
-//! reads the request frame from stdin, extracts `clientDataJSON`, signs
-//! `authenticatorData || SHA-256(clientDataJSON)` with an ephemeral P-256 key, and
-//! writes the framed [`Response::Assert`] to stdout.
-//!
-//! The ephemeral key and credential id are passed via the **environment** because
-//! the runner supplies no argv to a production bridge:
+//! The key and credential id are passed via the environment because the runner
+//! supplies no argv to a production bridge:
 //!
 //! * `WSLWT_TEST_SIGNING_KEY` — the P-256 private scalar as 64 lowercase hex chars.
 //! * `WSLWT_TEST_CRED_ID` — the credential id as unpadded base64url.
-//! * `WSLWT_TEST_ECHO` — when `1`, echo the request `clientDataJSON` back (drives
-//!   the module's echo-consistency branch).
+//! * `WSLWT_TEST_ECHO` — when `1`, echo the request `clientDataJSON` back.
 //!
-//! It is deliberately *not* named `test_*` and lives under `examples/` so it can use
-//! the crate's dev-dependencies (`p256`) without appearing on the production
-//! dependency graph. `tests/c_host.rs` locates and exercises it.
+//! `examples/` lets it use the crate's dev-dependencies (`p256`) without appearing
+//! on the production dependency graph; `tests/c_host.rs` exercises it.
 
 use std::io::Write as _;
 

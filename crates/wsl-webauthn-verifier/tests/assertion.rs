@@ -1,9 +1,4 @@
-//! Synthesized assertion (login) verification suite — one negative test per
-//! invariant (plan §4/§12.1/§12.2).
-//!
-//! Positive cases cover all three allow-listed algorithms; negative cases cover
-//! `rpIdHash`, UP, UV, challenge, origin, type, credential id, signature, malformed
-//! COSE, and the allow-list boundary.
+//! Assertion (login) verification suite.
 
 mod common;
 
@@ -367,9 +362,8 @@ fn negative_credential_key_malformed_cbor() {
 
 #[test]
 fn negative_credential_key_rsa_modulus_too_small() {
-    // A 1024-bit RSA modulus is below the 2048-bit floor. Table-driven over the
-    // 1024/2048/4096/8192 boundaries: only 2048 and 4096 are accepted, 1024 and
-    // 8192 are rejected with the observed bit length (L14-3).
+    // Table-driven over the 1024/2048/4096/8192 boundaries: only 2048 and 4096
+    // are structurally accepted, 1024 and 8192 rejected with the observed bit length.
     let a = build_assertion(&es256());
     for bits in [1024u64, 2048, 4096, 8192] {
         let n = modulus_of_bits(bits);
@@ -404,7 +398,7 @@ fn negative_credential_key_rsa_modulus_too_small() {
 #[test]
 fn negative_credential_key_kty_alg_mismatch() {
     // Each known kty paired with a known-but-wrong alg is rejected as a
-    // key-type/algorithm *mismatch* (L1-7), distinct from an unknown kty.
+    // key-type/algorithm *mismatch*, distinct from an unknown kty.
     let a = build_assertion(&es256());
     let cases: [(i64, i64); 3] = [
         (2, -257), // kty=EC2 with RS256
@@ -442,7 +436,6 @@ fn modulus_of_bits(bits: u64) -> Vec<u8> {
     let len = (bits / 8) as usize;
     let mut n = vec![0u8; len];
     n[0] = 0x80; // high bit set -> exactly `bits` bits
-    // Keep it odd (not that the verifier requires primality for a public modulus).
     n[len - 1] = 0x01;
     n
 }
@@ -549,6 +542,7 @@ fn counter_regression_is_rejected() {
     let challenge = vec![0x56u8; 32];
     let credential_id = b"counter-regression".to_vec();
     let client_data_json = client_data(ClientDataKind::Get, &challenge);
+    // Sign counter 2: a counter-maintaining authenticator.
     // Sign counter 2: a counter-maintaining authenticator.
     let auth_data = build_auth_data(RP_ID, 0x01 | 0x04, 2, None);
     let signature = key

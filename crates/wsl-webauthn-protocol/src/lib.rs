@@ -1,39 +1,38 @@
-//! Wire protocol shared by the Linux side and the Windows bridge (plan §3).
+//! Wire protocol shared by the Linux side and the Windows bridge.
 //!
-//! Everything in this crate is deliberately OS-agnostic: it compiles identically on
+//! Everything in this crate is OS-agnostic: it compiles identically on
 //! Linux and Windows and contains no `unsafe`, no filesystem, and no OS calls. It is
 //! the cross-crate contract for `wsl-webauthn-runner`, `wsl-webauthn-bridge`, and
 //! (transitively) the verifier/PAM/CLI crates.
 //!
-//! # Frozen decisions
+//! # Wire contract
 //!
-//! * [`RP_ID`] and [`ORIGIN`] are pinned at compile time (plan D2). The wire format
+//! * [`RP_ID`] and [`ORIGIN`] are pinned at compile time. The wire format
 //!   never carries them; both sides derive their parameters from these constants. The
 //!   origin is the RP ID itself because this is a native client with no browser origin.
 //!   Changing either value requires a rebuild *and* re-enrollment.
-//! * Framing is a 4-byte little-endian length prefix followed by a UTF-8 JSON payload
-//!   (plan D10). Requests are capped at [`MAX_REQUEST_BYTES`], responses at
+//! * Framing is a 4-byte little-endian length prefix followed by a UTF-8 JSON payload.
+//!   Requests are capped at [`MAX_REQUEST_BYTES`], responses at
 //!   [`MAX_RESPONSE_BYTES`]; all reads are bounded.
 //! * All binary fields on the wire are `base64url` (RFC 4648 §5) **without** padding.
 //! * `clientDataJSON` is built on the Linux side (which owns the challenge) and passed
 //!   verbatim; see [`build_client_data`].
 //!
-//! # Crate layout (L7-7)
+//! # Crate layout
 //!
-//! The items above are the genuine two-sided wire contract and live in the crate root.
-//! Linux/client-only members — [`build_client_data`], [`ClientDataKind`], the
-//! [`ProtocolError`] it returns, and the process-deadline / bridge-`timeout_ms` defaults
-//! — are grouped in the [`client`] module (re-exported here for the Linux callers). The
-//! Windows bridge **must not** use them: it treats `client_data_json` as an opaque
-//! base64url string and never rebuilds the Linux-side timing defaults.
+//! The two-sided wire contract (requests, responses, framing, `RP_ID`/`ORIGIN`, size
+//! caps) lives in the crate root. Linux/client-only members — [`build_client_data`],
+//! [`ClientDataKind`], the [`ProtocolError`] it returns, and the process-deadline /
+//! bridge-`timeout_ms` defaults — are grouped in the [`client`] module and re-exported
+//! here. The Windows bridge does not use them: it treats `client_data_json` as an opaque
+//! base64url string and does not rebuild the Linux-side timing defaults.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 // `Response`'s variant fields are necessarily public (Rust gives enum-variant fields the
-// enum's visibility), so the opaque `OkFlag` used to pin `ok` trip the
+// enum's visibility), so the opaque `OkFlag` used to pin `ok` trips the
 // `private_interfaces` lint. The field is intentionally reachable-but-not-constructible:
-// callers can read it by `..`-pattern/shadow-matching but cannot `use` its type or build
-// it, which is exactly the invariant L6-2 asks for.
+// callers can read it by `..`-pattern/shadow-matching but cannot `use` its type or build it.
 #![allow(private_interfaces)]
 
 use std::io::Read;
@@ -45,7 +44,7 @@ use thiserror::Error;
 
 pub mod client;
 
-// Linux/client-only helpers, re-exported from [`client`] for the flat-layout callers.
+// Linux/client-only helpers, re-exported from [`client`].
 pub use client::{
     BRIDGE_AUTH_TIMEOUT_MS, BRIDGE_ENROLL_TIMEOUT_MS, ClientDataKind, DEFAULT_AUTH_TIMEOUT_SECS,
     DEFAULT_ENROLL_TIMEOUT_SECS, MIN_CHALLENGE_BYTES, ProtocolError, build_client_data,
@@ -55,7 +54,7 @@ pub use client::{
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Relying Party ID, pinned at compile time (plan D2).
+/// Relying Party ID, pinned at compile time.
 ///
 /// This value is hashed into `rpIdHash` inside `authenticatorData` and is part of the
 /// WebAuthn ceremony. It must never be transmitted on the wire.
@@ -64,7 +63,7 @@ pub const RP_ID: &str = "io.github.kirin-xiao.wsl-webauthn-pam";
 /// Human-readable Relying Party name shown by the platform UI during enrollment.
 pub const RP_NAME: &str = "sudo on WSL (wsl-webauthn-pam)";
 
-/// WebAuthn origin, pinned equal to [`RP_ID`] (plan D2).
+/// WebAuthn origin, pinned equal to [`RP_ID`].
 ///
 /// This is a native client with no browser origin. The value is a pinned constant, not
 /// an origin *guarantee*; it is placed verbatim in `clientDataJSON` and checked byte for
@@ -238,10 +237,10 @@ impl Request {
 // Wire types: Response + BridgeError
 // ---------------------------------------------------------------------------
 
-/// Error taxonomy reported by the bridge (plan §3).
+/// Error taxonomy reported by the bridge.
 ///
 /// A `Response::Error` is a *ceremony* failure delivered on an otherwise well-formed
-/// transport; the Linux side maps it to PAM codes per plan §8. A non-zero exit or a
+/// transport; the Linux side maps it to PAM codes. A non-zero exit or a
 /// malformed frame is a separate *transport* failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -265,15 +264,11 @@ pub enum BridgeError {
 /// The `ok` discriminant of a [`Response`].
 ///
 /// A variant's `ok` is **fixed by the variant**: `true` for the three success replies,
-/// `false` for [`Response::Error`]. Modelling it as this opaque, crate-private type
-/// rather than a public `bool` means a caller in another crate cannot construct a
-/// well-formed frame with a contradictory `ok` (e.g. `Response::Probe { ok: false, .. }`),
-/// which the peer would reject as a transport failure (L6-2).
-///
-/// Serde still serializes it as the plain boolean on the wire, byte-identically, and
-/// deserialization is validated by [`expect_true`]/[`expect_false`]. Enum-variant fields
-/// are always public, so a plain `bool` cannot be made private; an opaque field type is
-/// the way to keep the invariant under the type system.
+/// `false` for [`Response::Error`]. It is opaque and crate-private so a caller in another
+/// crate cannot construct a well-formed frame with a contradictory `ok`
+/// (e.g. `Response::Probe { ok: false, .. }`), which the peer would reject as a transport
+/// failure. Serde serializes it as the plain boolean on the wire, byte-identically, and
+/// deserialization is validated by [`expect_true`]/[`expect_false`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 struct OkFlag(bool);
@@ -334,8 +329,7 @@ pub enum Response {
     },
 }
 
-// The `op` tag for `Response::Error` is literally `"*"`, matching the plan's
-// `{"op":"*","ok":false,"error":"…"}` shape.
+// The `op` tag for `Response::Error` is literally `"*"` on the wire.
 
 /// Deserialize helper enforcing `ok == true` for success variants.
 fn expect_true<'de, D>(d: D) -> Result<OkFlag, D::Error>
@@ -670,7 +664,7 @@ mod tests {
         );
     }
 
-    /// L6-2: `ok` is pinned by the variant (the opaque [`OkFlag`] type cannot be named or
+    /// `ok` is pinned by the variant (the opaque [`OkFlag`] type cannot be named or
     /// constructed outside this crate), and the wire bytes for every valid case are
     /// unchanged — a deserialize→serialize round trip is byte-identical.
     #[test]
@@ -725,7 +719,7 @@ mod tests {
 
     // ---- clientDataJSON ----
 
-    /// L7-7: the Linux-only client helpers are grouped under [`client`] and re-exported
+    /// The Linux-only client helpers are grouped under [`client`] and re-exported
     /// at the crate root; both paths name the same items.
     #[test]
     fn client_helpers_are_reachable_via_module_and_root() {

@@ -32,18 +32,18 @@ anyhow = "1.0.104" # CLI only
 libc = "0.2.189"
 toml = "0.9.8"
 
-# Randomness: OsRng for challenges (plan §8). `getrandom` is the OS entropy
+# Randomness: OsRng for challenges. `getrandom` is the OS entropy
 # backend for the 0.8 series.
 rand = { version = "0.8.5", features = ["getrandom", "std", "std_rng"] }
 
-# CBOR / hashing / crypto (verifier, plan §4)
+# CBOR / hashing / crypto (verifier)
 #
 # PINNED to the `der 0.7` / `signature 2` RustCrypto generation. The newest
 # releases (p256 0.14, ecdsa 0.17, sha2 0.11, x509-cert 0.3, der 0.8) moved to
 # `signature 3`, but no stable `rsa` in that generation exists (rsa 0.10 is
 # release-candidate only) and `rsa 0.9` still uses `der 0.7` / `signature 2`.
 # Mixing them would pull two incompatible `signature`/`der` trees into the
-# verifier. Wave A: keep these; do not bump individually.
+# verifier. Keep these; do not bump individually.
 ciborium = "0.2.2"
 sha2 = "0.10.9"
 p256 = { version = "0.13.2", features = ["ecdsa"] }
@@ -57,8 +57,7 @@ const-oid = "0.9.6"
 # Test-only
 proptest = "1.11.0"
 
-# L5-7 / L10-7 / L15-11: shipped release binaries used to be unstripped with no
-# cross-crate optimization. `strip` removes debug/symbol tables and `thin` LTO
+# `strip` removes debug/symbol tables and `thin` LTO
 # optimizes across the crate boundary without the full `fat`-LTO build-time
 # blowup. `panic` deliberately stays at its default (`unwind`): the PAM mapping
 # to `PAM_ABORT` and the bridge's graceful failure both require unwinding, and

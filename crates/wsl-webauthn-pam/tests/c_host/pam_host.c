@@ -1,12 +1,10 @@
 /*
  * pam_host.c — a non-Rust host for the pam_wsl_webauthn.so ABI/FFI tiers.
  *
- * The audit's two availability defects (L9-1 SIGPIPE host-kill, L9-2 stderr
- * spin) lived in the gap between "runs under `cargo test`" (a Rust host, where
- * the runtime installs SIGPIPE=SIG_IGN) and "runs under sudo/su/sshd" (a C host
- * that leaves SIGPIPE at SIG_DFL). This program closes that gap: it is compiled
- * and invoked by `tests/c_host.rs` (never checked in as a binary) and drives the
- * real `pam_wsl_webauthn.so`.
+ * Rust test binaries set SIGPIPE=SIG_IGN; a C host under sudo/su/sshd leaves it at
+ * SIG_DFL. This program is compiled and invoked by `tests/c_host.rs` (never checked
+ * in as a binary) and drives the real `pam_wsl_webauthn.so` under the latter
+ * disposition.
  *
  * Invocation:
  *
@@ -141,8 +139,8 @@ static int expect_matches(const char *expect, int rc) {
 
 static int run_libpam(const char *confdir, const char *service, const char *user,
                       const char *expect, int require_conv) {
-    /* A real sudo/su/sshd host leaves SIGPIPE at SIG_DFL. Rust's runtime would
-     * have set it to SIG_IGN, masking an EPIPE that kills a C host. */
+    /* A real sudo/su/sshd host leaves SIGPIPE at SIG_DFL; Rust's runtime would
+     * have set SIG_IGN, masking an EPIPE that kills a C host. */
     signal(SIGPIPE, SIG_DFL);
 
     struct pam_conv conv = {conversation, NULL};

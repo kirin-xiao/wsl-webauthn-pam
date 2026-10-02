@@ -4,7 +4,7 @@
 //! It is a minimal, protocol-speaking stand-in for `WSLWebAuthnBridge.exe` whose
 //! output is *scripted by the test*. The PAM integration tests build the exact
 //! response bytes (including a real, verifiable ES256 signature) and hand them to
-//! this binary, which reproduces the §3 process contract: read one framed request,
+//! this binary, which reproduces the process contract: read one framed request,
 //! write one framed response, exit `0`.
 //!
 //! Usage:

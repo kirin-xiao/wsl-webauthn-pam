@@ -1,37 +1,34 @@
-//! Linux interop spawner (plan §7).
+//! Linux interop spawner.
 //!
-//! This crate spawns the Windows bridge executable over WSL interop, speaks the framed
-//! stdio protocol from [`wsl_webauthn_protocol`], and enforces a hard deadline with a
-//! bounded, non-blocking read loop. It performs **no trust decisions** — all assertion
-//! and attestation verification is the caller's job.
+//! Spawns the Windows bridge executable over WSL interop, speaks the framed stdio protocol
+//! from [`wsl_webauthn_protocol`], and enforces a hard deadline with a bounded, non-blocking
+//! read loop. It performs **no trust decisions** — all assertion and attestation
+//! verification is the caller's job.
 //!
 //! # Key behaviors
 //!
-//! * **No shell, ever.** The bridge is spawned with [`std::process::Command`] and an
-//!   argument array (currently zero arguments; the request travels on stdin).
-//! * **`current_dir` is the Windows mount root** (`win_mnt`, e.g. `/mnt/c`). The plan's
-//!   §7 signatures omit this, but WSL interop breaks when the working directory is not a
-//!   translatable Windows path, so all three entry points take `win_mnt` (deviation
-//!   documented in the crate report).
-//! * **Deadline read loop.** The child's stdout/stderr are put in non-blocking mode and
-//!   driven by `poll(2)` with a timeout computed from the caller's deadline. This never
-//!   blocks past the deadline and never calls `wait_with_output`.
+//! * **No shell.** The bridge is spawned with [`std::process::Command`] and an argument
+//!   array; the request travels on stdin.
+//! * **`current_dir` is the Windows mount root** (`win_mnt`, e.g. `/mnt/c`). WSL interop
+//!   breaks when the working directory is not a translatable Windows path, so all three
+//!   entry points take `win_mnt`.
+//! * **Deadline read loop.** The child's stdout/stderr are non-blocking and driven by
+//!   `poll(2)` with a timeout computed from the caller's deadline. This never blocks past
+//!   the deadline and never calls `wait_with_output`.
 //! * **Timeout handling.** On deadline expiry the shim is `SIGKILL`ed and reaped; if the
 //!   bridge printed its Windows PID as the first stderr line (`PID <n>`), a best-effort
-//!   `taskkill.exe /F /PID <n>` is spawned with `current_dir = win_mnt` under a 5 s
-//!   budget. Failures are ignored. The deadline is therefore a *lower bound* on the total
-//!   time when an escalation runs; see [`RunnerError::Timeout`].
+//!   `taskkill.exe /F /PID <n>` runs with `current_dir = win_mnt` under a 5 s budget.
+//!   Failures are ignored, so the deadline is a *lower bound* on total time when an
+//!   escalation runs; see [`RunnerError::Timeout`].
 //! * **Held-fd spawn (tamper resistance).** The bridge is opened
-//!   `O_RDONLY|O_NOFOLLOW|O_CLOEXEC` and that descriptor — not the path — is what is
-//!   spawned, so a check-then-use swap between the module's hash and the exec cannot change
-//!   the executed image. A `pre_exec` guard re-checks `(dev, ino)` immediately before
-//!   `execve` as belt-and-braces. See the `L2-2` note in `proc::TrustedFile`.
-//! * **Pre-flight.** [`RunnerError::BridgeMissing`] only if the bridge path genuinely
-//!   does not exist (`NotFound`); any other open failure (e.g. `EACCES` on an
-//!   unreadable parent, or `ELOOP` for a symlinked bridge) is [`RunnerError::Spawn`]
-//!   carrying the real `io::Error`.
-//!   [`RunnerError::InteropUnavailable`] if the WSL interop binfmt entry is absent or not
-//!   `enabled`. All fail fast without spawning.
+//!   `O_RDONLY|O_NOFOLLOW|O_CLOEXEC` and that descriptor — not the path — is spawned, so a
+//!   check-then-use swap between the module's hash and the exec cannot change the executed
+//!   image. A `pre_exec` guard re-checks `(dev, ino)` immediately before `execve`.
+//! * **Pre-flight.** [`RunnerError::BridgeMissing`] only if the bridge path genuinely does
+//!   not exist (`NotFound`); any other open failure (e.g. `EACCES` on an unreadable parent,
+//!   or `ELOOP` for a symlinked bridge) is [`RunnerError::Spawn`] carrying the real
+//!   `io::Error`. [`RunnerError::InteropUnavailable`] if the WSL interop binfmt entry is
+//!   absent or not `enabled`. All fail fast without spawning.
 //! * **Ceremony vs. transport.** A well-formed `ok:false` framed response is returned as
 //!   [`RunnerResponse::Error`] inside `Ok`. Transport problems (non-zero exit, malformed
 //!   framing, oversize, EOF) become [`RunnerError`].
@@ -56,27 +53,27 @@ use wsl_webauthn_protocol::{
     read_frame,
 };
 
-/// Path of the WSL interop binfmt_misc registration (plan §7 pre-flight).
+/// Path of the WSL interop binfmt_misc registration.
 pub const SYSTEM_INTEROP_PATH: &str = "/proc/sys/fs/binfmt_misc/WSLInterop";
 
-/// `timeout_ms` sent to the bridge for a `probe` (plan §3).
+/// `timeout_ms` sent to the bridge for a `probe`.
 pub const BRIDGE_PROBE_TIMEOUT_MS: u32 = 3_000;
 
-/// Default `timeout_ms` for `enroll`, a re-export of the protocol constant (plan §3).
+/// Default `timeout_ms` for `enroll`, a re-export of the protocol constant.
 pub const BRIDGE_ENROLL_TIMEOUT_MS: u32 = wsl_webauthn_protocol::BRIDGE_ENROLL_TIMEOUT_MS;
 
-/// Default `timeout_ms` for `assert`, a re-export of the protocol constant (plan §3).
+/// Default `timeout_ms` for `assert`, a re-export of the protocol constant.
 pub const BRIDGE_ASSERT_TIMEOUT_MS: u32 = wsl_webauthn_protocol::BRIDGE_AUTH_TIMEOUT_MS;
 
-/// Maximum bytes of the child's stderr we retain (bounded capture).
+/// Maximum bytes of the child's stderr retained (bounded capture).
 pub const MAX_STDERR_BYTES: usize = 4 * 1024;
 
-/// Maximum bytes of the retained stderr tail that is folded into an error diagnostic.
+/// Maximum bytes of the retained stderr tail folded into an error diagnostic.
 ///
 /// Deliberately much smaller than [`MAX_STDERR_BYTES`]: the bridge writes its Windows PID
-/// as the first stderr line on every run, followed by at most a few diagnostic lines (an
-/// HRESULT/error name). A short tail keeps syslog records and PAM reason strings bounded
-/// while still carrying the useful line.
+/// as the first stderr line, followed by at most a few diagnostic lines, so a short tail
+/// keeps syslog records and PAM reason strings bounded while still carrying the useful
+/// line.
 pub const STDERR_DIAGNOSTIC_BYTES: usize = 512;
 
 /// `taskkill.exe` escalation budget after a Linux-side timeout.
@@ -386,7 +383,7 @@ impl RunnerResponse {
 
     /// Decode the optional `client_data_json_echo` of an [`RunnerResponse::Assert`].
     ///
-    /// Returns `Ok(None)` when the bridge reported no echo (ASSERTION v1–v5).
+    /// `None` when the bridge reported no echo (ASSERTION v1–v5).
     pub fn decode_client_data_json_echo(&self) -> Result<Option<Vec<u8>>, DecodeError> {
         match self {
             RunnerResponse::Assert {
@@ -596,7 +593,7 @@ impl Runner {
         // inode opened (O_NOFOLLOW) during pre-flight, so a path swap after that open
         // cannot change the executed image. `bridge` owns the descriptor until the end of
         // this function; the child has its own inheritable duplicate. A `pre_exec` guard
-        // re-checks (dev,ino) immediately before `execve` as belt-and-braces.
+        // re-checks (dev,ino) immediately before `execve`.
         let mut command = Command::new(bridge.fd_path());
         command
             .args(&self.args)
@@ -611,13 +608,13 @@ impl Runner {
         })?;
 
         // Own the child for the rest of the exchange: every early return below (including
-        // the `?`-propagated ones) now kills and reaps it via `ChildGuard::drop`.
+        // the `?`-propagated ones) kills and reaps it via `ChildGuard::drop`.
         let mut guard = ChildGuard::new(child);
 
         // Write the single framed request, then close stdin. 8 KiB fits comfortably in
-        // the default 64 KiB pipe buffer, but we still make the write non-blocking and
-        // bound it by the deadline: a bridge/child that never reads stdin must never be
-        // able to hang the PAM stack past its deadline.
+        // the default 64 KiB pipe buffer, but the write is still non-blocking and bounded
+        // by the deadline: a bridge/child that never reads stdin must never be able to
+        // hang the PAM stack past its deadline.
         {
             // `Stdio::piped()` is requested just above, so these handles always exist.
             let stdin = guard
@@ -653,8 +650,8 @@ impl Runner {
     ///
     /// The bridge is opened `O_RDONLY|O_NOFOLLOW` and the descriptor is returned, so the
     /// caller spawns exactly the opened inode rather than re-resolving the path (closing
-    /// the hash→exec check-then-use window; see `L2-2`). Because the path is never used
-    /// for the spawn, a symlink is refused (`O_NOFOLLOW` → `ELOOP`), not followed.
+    /// the hash→exec check-then-use window). Because the path is never used for the
+    /// spawn, a symlink is refused (`O_NOFOLLOW` → `ELOOP`), not followed.
     fn preflight(&self) -> Result<proc::TrustedFile, RunnerError> {
         // `Path::exists()`/`metadata` collapse *every* `stat` failure into "missing".
         // Open directly so only a genuine `NotFound` is reported as
@@ -992,7 +989,6 @@ impl AssertParams {
     }
 }
 
-/// Convert a protocol [`Response`] into a [`RunnerResponse`].
 fn runner_response(response: Response) -> RunnerResponse {
     match response {
         Response::Probe {
@@ -1110,10 +1106,9 @@ fn stderr_tail(bytes: &[u8], cap: usize) -> Option<String> {
 
 /// Owns a spawned child and guarantees it is killed and reaped on drop.
 ///
-/// `std::process::Child` does *not* reap on drop, so every early return in the
-/// spawn/write/drain paths used to leak a running (root-spawned) child. Wrapping the
-/// child in this guard makes those paths safe by construction: whatever `?`/`return`
-/// unwinds, the child is `SIGKILL`ed and waited on.
+/// `std::process::Child` does *not* reap on drop, so wrapping it makes every early return
+/// in the spawn/write/drain paths safe by construction: whatever `?`/`return` unwinds, the
+/// child is `SIGKILL`ed and waited on.
 struct ChildGuard {
     child: Option<std::process::Child>,
 }
@@ -1123,7 +1118,6 @@ impl ChildGuard {
         ChildGuard { child: Some(child) }
     }
 
-    /// Access the still-owned child.
     fn child_mut(&mut self) -> &mut std::process::Child {
         self.child.as_mut().expect("child is alive until reaped")
     }
@@ -1270,7 +1264,7 @@ fn drive_child(
         match guard.try_wait() {
             Ok(Some(status)) => {
                 // Final drain: the child has closed its write ends, so a complete frame
-                // (and any trailing stderr) is now visible.
+                // (and any trailing stderr) is visible.
                 out.drain();
                 err.drain();
                 if out.overflow {
@@ -1423,8 +1417,6 @@ fn interop_candidates(
 /// A bare name is not portable under `sudo`'s `secure_path` (which omits the Windows
 /// mount): the kernel resolves the name against `PATH` at `execve` and returns `ENOENT`
 /// before the binfmt handler can hand it to WSL. Passing an absolute path sidesteps that.
-///
-/// Returns the first candidate that exists as a file, or `None` if none do.
 pub fn resolve_interop_program(
     program: impl AsRef<std::ffi::OsStr>,
     win_mnt: &Path,
@@ -1437,8 +1429,8 @@ pub fn resolve_interop_program(
 
 /// Convenience: run `whoami.exe`-style helper commands with a deadline.
 ///
-/// Used by the CLI to capture the Windows identity (§9); exposed here so the interop
-/// cwd/timeout handling is shared. `argv` are passed as an argument array (no shell).
+/// Exposed so the CLI shares the interop cwd/timeout handling. `argv` are passed as an
+/// argument array (no shell).
 pub struct InteropCommand;
 
 impl InteropCommand {
@@ -1582,10 +1574,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // L2-3 child lifecycle: the guard must kill+reap on every exit path.
-    // -----------------------------------------------------------------------
-
     /// Dropping the guard around a live child must `SIGKILL` and reap it, so any early
     /// return that unwinds through the guard cannot leak a root-owned process.
     #[test]
@@ -1620,18 +1608,14 @@ mod tests {
         assert!(!proc::process_alive(pid), "child {pid} was not reaped");
     }
 
-    // -----------------------------------------------------------------------
-    // L2-1 = L9-2 bounded IO: an over-cap descriptor must not busy-drain.
-    // -----------------------------------------------------------------------
-
     /// A child that floods stderr past `MAX_STDERR_BYTES` and then blocks must be waited
     /// out to the deadline without the drain loop spinning the calling thread.
     #[test]
     fn stderr_flood_does_not_spin() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let deadline = Duration::from_millis(400);
-        // The bridge is now opened O_NOFOLLOW, so use the resolved binary rather than a
-        // symlink (which the runner deliberately refuses).
+        // The runner opens the bridge O_NOFOLLOW, so use the resolved binary rather than
+        // a symlink (which it deliberately refuses).
         let sh = std::fs::canonicalize("/bin/sh").expect("resolve /bin/sh");
         let runner = Runner::without_interop_check(sh, dir.path())
             .args(["-c", "while :; do printf x 1>&2; done"]);

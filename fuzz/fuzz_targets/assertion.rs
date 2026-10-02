@@ -4,11 +4,11 @@
 //! fixed clientData. Arbitrary `authenticatorData`/`signature` bytes must only ever
 //! produce `Ok`/`Err`, never a panic.
 //!
-//! To catch a verifier that spuriously accepts (returns `Ok`) without a genuine
-//! signature (L14-10), a cheap seeded branch additionally builds a valid signature
-//! over a fixed message, asserts it verifies, then flips one byte and asserts the
-//! result is `Err`. The branch is gated on a rare marker so it does not slow the
-//! main libFuzzer throughput materially.
+//! A seeded branch builds a valid signature over a fixed message, asserts it
+//! verifies, then flips one byte and asserts the result is `Err`, so a verifier
+//! that spuriously accepts (`Ok`) without a genuine signature is caught. The
+//! branch is gated on a rare marker so it does not slow the main libFuzzer
+//! throughput materially.
 
 use libfuzzer_sys::fuzz_target;
 use wsl_webauthn_verifier::{AssertionCheck, verify_assertion};

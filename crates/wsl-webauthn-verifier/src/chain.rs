@@ -42,7 +42,7 @@ const MAX_CHAIN_LEN: usize = 8;
 /// 2 KiB, so 8 KiB is generous. The bound exists so the verifier does not depend on
 /// the `rsa` crate's own `check_public_with_max_size(4096)` to reject an oversized
 /// declared key: a certificate larger than this is refused before `Certificate::from_der`
-/// or any SPKI extraction runs. An invariant test asserts this bound.
+/// or any SPKI extraction runs.
 pub(crate) const MAX_CERT_BYTES: usize = 8 * 1024;
 
 /// OID `id-fido-gen-ce-aaguid` (1.3.6.1.4.1.45724.1.1.4).
@@ -57,9 +57,8 @@ pub(crate) const TCG_KP_AIK_CERTIFICATE: der::asn1::ObjectIdentifier =
 /// `ecdsa-with-SHA256` (1.2.840.10045.4.3.2).
 const ECDSA_WITH_SHA256: der::asn1::ObjectIdentifier =
     der::asn1::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
-/// `sha1WithRSAEncryption` (1.2.840.113549.1.1.5). Present in the Microsoft TPM
-/// intermediate observed in the spike; accepted for chain links (the leaf and anchor
-/// are still pinned by fingerprint and constraints).
+/// `sha1WithRSAEncryption` (1.2.840.113549.1.1.5). Accepted for chain links; the leaf
+/// and anchor are still pinned by fingerprint and constraints.
 const SHA1_WITH_RSA: der::asn1::ObjectIdentifier =
     der::asn1::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.5");
 /// `sha256WithRSAEncryption` (1.2.840.113549.1.1.11).

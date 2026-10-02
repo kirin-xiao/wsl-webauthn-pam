@@ -1,4 +1,4 @@
-//! The `install` / `uninstall` implementation (plan §10, decisions D6/D7).
+//! The `install` / `uninstall` implementation.
 //!
 //! This module is the **only** place that writes system paths. It is written as pure
 //! Rust (no shell) and every mutation goes through [`crate::fsutil`], which refuses
@@ -21,7 +21,7 @@
 //! * [`Prompter`] — asks the operator yes/no questions.
 //! * [`Enroller`] — runs the in-process enrollment offer.
 //!
-//! # Install order (D7 + lockout safety)
+//! # Install order (lockout safety)
 //!
 //! 1. Provision the Windows bridge exe (needed before enrollment can pin it).
 //! 2. Write `/etc/wsl_webauthn/config` (`0600`) and `credentials/` (`0700`).
@@ -36,9 +36,9 @@
 //! Any step *up to and including verification* that fails rolls back exactly what *this
 //! run* wrote: new files and directories are removed and any file this run *overwrote*
 //! is restored from a pre-write snapshot (so an upgrade/re-install failure cannot delete
-//! a previously-working module/config). Nothing after verification is rolled back:
-//! committing before migration means a failure can never remove the module/profile or
-//! un-rewrite a `/etc/pam.d` file back into a stale `pam_wsl_hello` reference.
+//! a working module/config). Nothing after verification is rolled back: committing before
+//! migration means a failure can never remove the module/profile or un-rewrite a
+//! `/etc/pam.d` file back into a stale `pam_wsl_hello` reference.
 
 use std::io::Write as _;
 use std::os::unix::fs::MetadataExt as _;
@@ -60,7 +60,7 @@ use crate::{DEFAULT_WIN_MNT, EXIT_FAIL, EXIT_OK, WHOAMI_DEADLINE};
 /// against the file on disk by a test, so the two can never drift.
 pub(crate) const PROFILE_TEXT: &str = include_str!("../../../../pam-config");
 
-/// Name of the `pam-configs` profile (plan D1: `wsl-webauthn`).
+/// Name of the `pam-configs` profile.
 pub(crate) const PROFILE_NAME: &str = "wsl-webauthn";
 /// Name of the legacy `pam-configs` profile (WSL-Hello-sudo).
 pub(crate) const LEGACY_PROFILE_NAME: &str = "wsl-hello";
@@ -72,9 +72,9 @@ pub(crate) const LEGACY_MODULE_NAME: &str = "pam_wsl_hello.so";
 pub(crate) const LEGACY_MODULE_STEM: &[u8] = b"pam_wsl_hello";
 /// The new module *stem*.
 pub(crate) const MODULE_STEM: &[u8] = b"pam_wsl_webauthn";
-/// Windows bridge executable name (plan D1/D11).
+/// Windows bridge executable name.
 pub(crate) const BRIDGE_EXE: &str = "WSLWebAuthnBridge.exe";
-/// Sub-path under `%LOCALAPPDATA%` where the bridge is installed (plan D11).
+/// Sub-path under `%LOCALAPPDATA%` where the bridge is installed.
 pub(crate) const WIN_BRIDGE_SUBPATH: &[&str] = &["Programs", "wsl-webauthn-pam"];
 
 /// Mode of the installed module and profile (`root:root`).
@@ -86,18 +86,18 @@ pub(crate) const BRIDGE_MODE: u32 = 0o755;
 /// Directory mode for `credentials/`.
 pub(crate) const DIR_MODE: u32 = 0o700;
 
-/// Deadline for the `cmd.exe` invocation that resolves `%LOCALAPPDATA%` (plan §10.3).
+/// Deadline for the `cmd.exe` invocation that resolves `%LOCALAPPDATA%`.
 const LOCALAPPDATA_DEADLINE: Duration = Duration::from_secs(5);
 /// Hard cap on a Linux helper invocation (`pam-auth-update`). It is generous because an
 /// *interactive* debconf run still needs the operator, but it guarantees a helper can
-/// never block the installer forever (the `--non-interactive` hang this was added for).
+/// never block the installer forever.
 const HELPER_TIMEOUT: Duration = Duration::from_secs(300);
 /// The environment variable that makes debconf clients (`pam-auth-update`) non-blocking.
 const DEBIAN_FRONTEND: &str = "DEBIAN_FRONTEND";
 
 // `DEFAULT_WIN_MNT`, `WHOAMI_DEADLINE`, `EXIT_OK`, and `EXIT_FAIL` are not declared here:
-// L7-5 = L16-9 requires the CLI to carry each of these exactly once. They are imported
-// from the crate root (`main.rs`), which in turn re-exports
+// the CLI carries each of these exactly once. They are imported from the crate root
+// (`main.rs`), which in turn re-exports
 // `wsl_webauthn_store::Config::DEFAULT_WIN_MNT`.
 
 // ---------------------------------------------------------------------------
@@ -225,7 +225,7 @@ pub(crate) trait CommandRunner {
     /// Whether `program` can be executed (found on `PATH`).
     ///
     /// The installer uses this up front to decide between driving `pam-auth-update` and
-    /// printing first-class manual `/etc/pam.d` instructions.
+    /// printing manual `/etc/pam.d` instructions.
     fn available(&self, program: &str) -> bool;
 }
 
@@ -692,10 +692,9 @@ fn resolve_module_dir(paths: &InstallPaths, explicit: Option<&Path>) -> anyhow::
 
 /// The `[base]/config` contents for `bridge_path`/`win_mnt`, serialized by the store.
 ///
-/// L7-4: the on-disk format is owned by [`wsl_webauthn_store::Config::to_toml`] (the writer
-/// counterpart to the store's `deny_unknown_fields` parser), so the installer no longer
-/// hand-rolls TOML. `timeout_secs` is `None` because the installer does not set an auth
-/// deadline override, matching the historical output.
+/// The on-disk format is owned by [`wsl_webauthn_store::Config::to_toml`] (the writer
+/// counterpart to the store's `deny_unknown_fields` parser). `timeout_secs` is `None`
+/// because the installer does not set an auth deadline override.
 fn config_toml(bridge_path: &Path, win_mnt: &Path) -> String {
     Config {
         bridge_path: bridge_path.to_path_buf(),
@@ -1136,7 +1135,7 @@ fn verify_installed(
 }
 
 // ---------------------------------------------------------------------------
-// Legacy migration (D7)
+// Legacy migration
 // ---------------------------------------------------------------------------
 
 /// A detected legacy WSL-Hello-sudo installation.
@@ -1205,7 +1204,7 @@ pub(crate) fn detect_legacy(paths: &InstallPaths) -> Legacy {
 ///
 /// A legacy line whose control is not fail-safe (`sufficient`/`optional`/`[success=…]`)
 /// would become a Hello-gated `required`/`requisite` line after a naive stem swap, so the
-/// control is normalized to [`CANONICAL_CONTROL`] behind a loud second confirmation.
+/// control is normalized to [`CANONICAL_CONTROL`] behind an explicit second confirmation.
 ///
 /// This runs *after* [`Rollback::commit`], so a later failure can never roll the rewrite
 /// back into the stale `pam_wsl_hello` state.
@@ -1376,7 +1375,7 @@ fn migrate_remove_legacy(
 // ---------------------------------------------------------------------------
 
 /// The manual enable instructions (one line per element), used when `pam-auth-update`
-/// is not installed (e.g. RHEL/Fedora). Kept as data so the flow and tests agree.
+/// is not installed (e.g. RHEL/Fedora).
 fn manual_enable_steps(paths: &InstallPaths) -> Vec<String> {
     vec![
         "`pam-auth-update` was not found on this system; enable the module by hand:".to_string(),
@@ -1399,9 +1398,8 @@ fn print_manual_enable_steps(paths: &InstallPaths) {
 
 /// Offer to enable the profile (default **no** — the profile is `Default: no`).
 ///
-/// When `pam-auth-update` is absent this is not a bare warning: the operator gets
-/// first-class manual `/etc/pam.d` instructions instead, so "install" never appears to
-/// succeed while silently never becoming active.
+/// When `pam-auth-update` is absent, print manual `/etc/pam.d` instructions instead of a
+/// bare warning, so `install` cannot appear to succeed while never becoming active.
 fn offer_enable(
     paths: &InstallPaths,
     commands: &dyn CommandRunner,
@@ -1438,7 +1436,7 @@ fn offer_enable(
     Ok(())
 }
 
-/// Print the lockout guidance required by plan §10.8 / R5.
+/// Print lockout-recovery guidance.
 ///
 /// WSL has no virtual console to fall back to, so the recovery path is a Windows-side
 /// root shell; for non-WSL Linux the classic TTY route is offered too.
@@ -1549,7 +1547,7 @@ pub(crate) fn install_with(
     let mut rollback = Rollback::new();
 
     // 1. Windows bridge (must exist before enrollment, which pins it).
-    // A `whoami.exe` sanity check (plan §10.2): warn, do not abort — some hosts have
+    // A `whoami.exe` sanity check: warn, do not abort — some hosts have
     // interop enabled but a restricted whoami.
     if let Err(e) = interop.run("whoami.exe", &[], &win_mnt, WHOAMI_DEADLINE) {
         eprintln!("warning: interop sanity check (`whoami.exe`) failed: {e}");
@@ -1682,7 +1680,7 @@ pub(crate) fn cmd_install(
 
 /// Remove one user's credential record (shared by `unregister` and `uninstall`).
 ///
-/// Never touches another user's record (SR-20). Returns [`EXIT_OK`] if a record was
+/// Never touches another user's record. Returns [`EXIT_OK`] if a record was
 /// removed, [`EXIT_FAIL`] if there was nothing to do.
 pub(crate) fn uninstall_user(
     store: &Store,

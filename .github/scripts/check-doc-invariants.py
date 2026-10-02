@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Make the documented security invariants executable (REVIEW.md Theme #1, L13-7).
+"""Make the documented security invariants executable.
 
 The verifier trust table (`crates/wsl-webauthn-verifier/src/lib.rs`) and
 `SECURITY.md` are treated as a specification, but nothing forced that
-specification to match the code.  The L1-1/L1-2/L13-6 class of defect — a
-documented invariant ("the AAGUID allow-list runs on every attestation path",
-"the tpm AIK carries an EKU") that the code did not actually enforce — survived
-because prose is not executable.
+specification to match the code.  A documented invariant ("the AAGUID
+allow-list runs on every attestation path", "the tpm AIK carries an EKU") can
+survive a code change that stops enforcing it, because prose is not executable.
 
 This guard keeps a *curated* mapping from each invariant to the negative
 (or positive) test that pins it, and fails CI when:
@@ -874,9 +873,9 @@ def find_test_body(root: Path, name: str) -> tuple[Path | None, str]:
 def strip_comments(text: str) -> str:
     """Remove `//…` and `/* … */` comments, respecting string literals.
 
-    Comments must never satisfy a direction check: the adversarial review
-    showed that replacing `assert_eq!(x, Err(CertificatePathLenExceeded))` with
-    `assert!(x.is_ok())` plus a comment naming the old error still printed OK.
+    Comments must never satisfy a direction check: replacing
+    `assert_eq!(x, Err(CertificatePathLenExceeded))` with `assert!(x.is_ok())`
+    plus a comment naming the old error still prints OK.
     The scanner mirrors `_match_body`, so a `//` inside a URL literal or a `/*`
     inside a message is not mistaken for a comment.
     """
@@ -1121,9 +1120,8 @@ def self_test() -> int:
         )
 
         # (1) Comment-only satisfaction: the `expect` needle appears only inside
-        # a comment, so the direction check must still fail.  This is the exact
-        # false-confidence mode the adversarial review proved (a positive body
-        # plus a comment naming the old error used to print OK).
+        # a comment, so the direction check must still fail (a positive body
+        # plus a comment naming the old error must not print OK).
         write(
             "crates/demo/src/lib.rs",
             "fn helper() {}\n"

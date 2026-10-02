@@ -1,23 +1,9 @@
 //! Independent golden vector for the verifier.
 //!
-//! Every byte below was produced **off-line, outside Rust**, by
-//! `python3` + the `cryptography` package and a hand-rolled minimal CBOR
-//! encoder: the ECDSA P-256 certificate chain, the `packed` attestation
-//! object, the credential COSE key, the `clientDataJSON`, and both signatures.
-//! Nothing here calls `tests/common`'s builders, so the suite no longer relies
-//! solely on helpers that mirror the verifier's own construction (L14-5).
-//!
-//! The synthetic CA/leaf names are obviously fake ("Independent Test …"); no
-//! real machine identifier, serial, key, or user is present. The trust anchor
-//! is the test root, injected through the `test-anchor` seam exactly as the
-//! other synthesized chains are.
-//!
-//! Regeneration recipe (recorded for provenance; do not edit the literals by
-//! hand): build a P-256 root → P-256 intermediate → P-256 leaf whose Subject OU
-//! is `Authenticator Attestation` and whose
-//! `1.3.6.1.4.1.45724.1.1.4` extension carries the AAGUID; sign
-//! `authData || SHA-256(clientDataJSON)` with the leaf key; sign a `webauthn.get`
-//! over the same message shape with the credential key.
+//! Every byte below was produced off-line, outside Rust, with `python3` + the
+//! `cryptography` package and a hand-rolled minimal CBOR encoder. Nothing here
+//! calls `tests/common`'s builders, so the vectors are independent of the
+//! verifier's own construction; the literals must not be edited by hand.
 
 use std::time::{Duration, SystemTime};
 
@@ -62,8 +48,8 @@ fn unhex(s: &str) -> Vec<u8> {
         .collect()
 }
 
-/// The pinned verification instant: 2020-09-13, comfortably inside the
-/// certificate validity window (2020-01-01 .. 2049-01-01).
+/// The pinned verification instant: 2020-09-13, inside the certificate validity
+/// window (2020-01-01 .. 2049-01-01).
 fn pinned_now() -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000)
 }
@@ -141,9 +127,8 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Mutation oracle (L14-5b): every single-byte corruption of the known-good
-/// attestation object must be rejected. A byte that the verifier does not bind
-/// would let a tampered vector verify, so a single `Ok` fails this test.
+/// Every single-byte corruption of the known-good attestation object must be
+/// rejected: a byte the verifier does not bind would let a tampered vector verify.
 #[test]
 fn independent_mutation_oracle() {
     let challenge = unhex(CHALLENGE_HEX);
@@ -167,8 +152,8 @@ fn independent_mutation_oracle() {
     }
 }
 
-/// Sanity: a flipped verification signature must not verify (guards against a
-/// mutation oracle that is vacuously true because the base never verifies).
+/// A flipped verification signature must not verify; this catches a mutation
+/// oracle that would be vacuously true because the base never verifies.
 #[test]
 fn independent_base_is_not_vacuous() {
     let challenge = unhex(CHALLENGE_HEX);

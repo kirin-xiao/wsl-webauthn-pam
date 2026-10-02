@@ -1,6 +1,5 @@
-//! Stable-runnable equivalents of the four `cargo-fuzz` targets (plan §4 test
-//! item 4). Each mirrors a `fuzz/fuzz_targets/*.rs` entry, so CI smoke covers the
-//! same logic on stable without nightly/libFuzzer.
+//! Stable-runnable equivalents of the four `cargo-fuzz` targets. Each mirrors a
+//! `fuzz/fuzz_targets/*.rs` entry.
 
 mod common;
 
@@ -102,9 +101,8 @@ proptest! {
     }
 }
 
-/// Stable counterpart of the no-spurious-`Ok` oracle added to
-/// `fuzz_targets/assertion.rs` (L14-10): a genuinely signed assertion verifies, and a
-/// single flipped bit in the signature or the authenticator data is rejected.
+/// A genuinely signed assertion verifies, and a single flipped bit in the
+/// signature or the authenticator data is rejected.
 #[test]
 fn assertion_flipped_bit_is_rejected() {
     let challenge = [0x11u8; 32];

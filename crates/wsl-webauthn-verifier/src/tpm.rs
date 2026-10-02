@@ -1,7 +1,7 @@
 //! TPM attestation statement verification (WebAuthn §8.3, TPM 2.0 Part 2).
 //!
-//! Windows Hello emits `fmt: "tpm"` attestations on TPM-equipped machines (D3 amended
-//! after the spike). The `attStmt` carries:
+//! Windows Hello emits `fmt: "tpm"` attestations on TPM-equipped machines. The
+//! `attStmt` carries:
 //!
 //! ```text
 //! { ver: "2.0", alg: COSEAlgorithmIdentifier, x5c: [aikCert, …],

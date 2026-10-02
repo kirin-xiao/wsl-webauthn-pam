@@ -1,5 +1,5 @@
 //! ABI smoke test: `dlopen` the built `libpam_wsl_webauthn.so` and `dlsym` all six
-//! `pam_sm_*` symbols (plan §8, §12.4).
+//! `pam_sm_*` symbols.
 //!
 //! `cargo test` builds the `cdylib` alongside the test binaries (it is a target of the
 //! crate), so the artifact is normally present at `target/{debug,release}/deps/` (and
@@ -9,9 +9,9 @@
 //! * **runs the real `dlopen`/`dlsym` check** when the artifact is found (always the
 //!   case for a normal `cargo test`, locally or in CI);
 //! * **skips with a clear, printed reason** only when the artifact is genuinely absent
-//!   (e.g. a filtered build that never compiled the cdylib), so a stale checkout does
-//!   not produce a spurious failure — *unless* `WSL_WEBAUTHN_REQUIRE_LIBPAM=1` is set
-//!   (CI does), in which case a missing artifact is a hard failure (L14-6).
+//!   (e.g. a filtered build that never compiled the cdylib) — *unless*
+//!   `WSL_WEBAUTHN_REQUIRE_LIBPAM=1` is set (CI does), in which case a missing artifact
+//!   is a hard failure.
 //!
 //! The check does not depend on `CI`; in CI it runs and must pass. A richer,
 //! non-Rust `dlopen` that also *calls* the entry points lives in `tests/c_host.rs`.
@@ -28,7 +28,7 @@ use std::path::PathBuf;
 /// `cargo test` builds the `cdylib` into `target/<profile>/deps/` (next to the test
 /// binaries); `cargo build` puts it at `target/<profile>/`. Both are checked, along
 /// with the alternate profile, resolved from the running test binary and from
-/// `CARGO_MANIFEST_DIR` so the lookup also works if the two ever diverge.
+/// `CARGO_MANIFEST_DIR`.
 fn locate_library() -> Option<PathBuf> {
     let mut candidates = Vec::new();
 

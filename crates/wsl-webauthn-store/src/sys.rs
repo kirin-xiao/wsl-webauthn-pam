@@ -1,9 +1,7 @@
 //! Minimal, audited `libc` bindings for the credential store.
 //!
-//! This is the **only** module in the crate permitted to contain `unsafe`
-//! (see `lib.rs`), and it is deliberately tiny: it exposes safe wrappers around the
-//! small set of syscalls the store needs. Every wrapper documents the exact safety
-//! obligation it discharges internally, so callers never write `unsafe`.
+//! The **only** module in the crate permitted to contain `unsafe` (see `lib.rs`). Every
+//! wrapper discharges its safety obligation internally, so callers never write `unsafe`.
 //!
 //! Syscalls used:
 //! * `open(2)` / `openat(2)` — `O_RDONLY|O_NOFOLLOW|O_NOCTTY|O_CLOEXEC` credential reads
@@ -25,10 +23,8 @@ use std::os::fd::RawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 
-/// Convert a path to a NUL-terminated C string.
-///
-/// Returns [`io::ErrorKind::InvalidInput`] if the path contains an interior NUL byte;
-/// the store treats that as a hard error rather than truncating silently.
+/// Convert a path to a NUL-terminated C string, failing on an interior NUL byte rather
+/// than truncating silently.
 pub(crate) fn cpath(path: &Path) -> io::Result<CString> {
     CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))
@@ -66,8 +62,7 @@ impl Stat {
 }
 
 // The `as` casts below are required for portability: `st_mode` is `u16` on some libc
-// targets and `st_dev`/`st_ino` vary between 32- and 64-bit off_t/ino_t. They are
-// no-ops on x86_64, hence the targeted `allow`.
+// targets and `st_dev`/`st_ino` vary between 32- and 64-bit off_t/ino_t.
 #[allow(clippy::unnecessary_cast)]
 fn stat_from_raw(raw: libc::stat) -> Stat {
     Stat {
@@ -120,9 +115,8 @@ pub(crate) fn open_readonly(path: &Path) -> io::Result<Fd> {
 /// `fstatat(dirfd, name, AT_SYMLINK_NOFOLLOW)`: stat a single path component relative to
 /// an open directory without following a final symlink.
 ///
-/// `name` must be a single component (the store only ever passes a validated `*.json`
-/// leaf). Operating relative to a held directory descriptor removes the path-swap window
-/// that a second absolute `lstat` would otherwise open.
+/// `name` must be a single component. Operating relative to a held directory descriptor
+/// removes the path-swap window a second absolute `lstat` would open.
 pub(crate) fn fstatat_nofollow(dirfd: RawFd, name: &OsStr) -> io::Result<Stat> {
     let c = CString::new(name.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains NUL byte"))?;
@@ -167,11 +161,9 @@ pub(crate) fn open_dir(path: &Path) -> io::Result<Fd> {
 
 /// RAII guard closing a raw fd exactly once.
 ///
-/// The inner descriptor is **private**. Callers cannot reach in with `fd.0`, re-wrap the
-/// raw integer in a second guard, or otherwise extract the descriptor and defeat the
-/// "close exactly once" guarantee. The only way to observe it is [`Fd::raw`] (a borrowed
-/// `RawFd`), and the only way to close it is dropping the guard. This turns the property
-/// from a convention into one the type enforces.
+/// The inner descriptor is **private**: callers can only observe it via [`Fd::raw`] (a
+/// borrowed `RawFd`) and can only close it by dropping the guard, so "close exactly once"
+/// is enforced by the type rather than by convention.
 #[derive(Debug)]
 pub(crate) struct Fd(RawFd);
 
@@ -240,8 +232,7 @@ pub(crate) fn fchmod(fd: RawFd, mode: u32) -> io::Result<()> {
 }
 
 /// `fsync(2)`, retrying `EINTR` and mapping `EINVAL`/`ENOTSUP` (unsupported filesystems)
-/// to success so the store still works on exotic mounts while keeping durability
-/// best-effort.
+/// to success so the store still works on exotic mounts with best-effort durability.
 pub(crate) fn fsync(fd: RawFd) -> io::Result<()> {
     loop {
         // SAFETY: `fd` is an owned descriptor.
@@ -263,8 +254,8 @@ pub(crate) fn fsync(fd: RawFd) -> io::Result<()> {
 /// Create a uniquely named temp file in `dir` with a `0600` mode.
 ///
 /// The template is `<dir>/.tmp-XXXXXX`; `mkstemp` replaces the `XXXXXX` with a unique
-/// suffix and opens the file `O_RDWR|O_CREAT|O_EXCL` with mode `0600` (subject to umask,
-/// hence the explicit `fchmod` by the caller). Returns the fd and the chosen name.
+/// suffix and opens `O_RDWR|O_CREAT|O_EXCL` (mode `0600`, subject to umask, hence the
+/// caller's explicit `fchmod`). Returns the fd and the chosen name.
 pub(crate) fn mkstemp_in(dir: &Path) -> io::Result<(Fd, OsString)> {
     let mut template = OsString::from(dir.as_os_str());
     template.push(OsStr::new("/.tmp-XXXXXX"));

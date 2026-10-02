@@ -1,8 +1,8 @@
-# wsl-webauthn-pam build orchestration (plan §2).
+# wsl-webauthn-pam build orchestration.
 #
 # The real cross-platform, fully-pinned CI lives in .github/workflows/; this
 # Makefile is a convenience wrapper for local development and mirrors the same
-# release layout (plan §11).
+# release layout.
 #
 # Windows bridge: prefer a native `cargo.exe` when present on PATH (real MSVC
 # build), otherwise cross-compile to a self-contained GNU/LLVM target (see the
@@ -11,10 +11,10 @@
 CARGO ?= cargo
 VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 
-# L9-6 = L15-5: a single mapping from the host CPU to (a) the release arch label
-# used by release.yaml (`x86_64` | `aarch64`) and (b) the matching Windows
-# bridge cross-target. Deriving both from one input keeps the tarball name, the
-# bridge .exe architecture and the release workflow's naming coherent, and
+# A single mapping from the host CPU to (a) the release arch label used by
+# release.yaml (`x86_64` | `aarch64`) and (b) the matching Windows bridge
+# cross-target. Deriving both from one input keeps the tarball name, the bridge
+# .exe architecture and the release workflow's naming coherent, and
 # `arm64`/`amd64` are normalized so a macOS/ARM spelling cannot leak into an
 # artifact name. An unsupported architecture is a hard error (see the checks in
 # `bridge`/`release`) instead of a mislabeled x86_64 build.
@@ -36,17 +36,17 @@ else
   GNU_TARGET :=
 endif
 
-# L15-6: the local release layout mirrors release.yaml exactly — the tarball root
-# is a single `wsl-webauthn-pam-<version>-<arch>/` directory, and SHA256SUMS
-# covers the tarballs (not the files inside them).
+# The local release layout mirrors release.yaml exactly — the tarball root is a
+# single `wsl-webauthn-pam-<version>-<arch>/` directory, and SHA256SUMS covers
+# the tarballs (not the files inside them).
 PKG_DIR := wsl-webauthn-pam-$(VERSION)-$(ARCH)
 STAGE_DIR := build/$(PKG_DIR)
 TARBALL := build/$(PKG_DIR).tar.gz
 
 # actionlint is not packaged everywhere; fetch a pinned release into ~/.local/bin.
-# L15-10: the tarball is verified against a SHA-256 pinned per (os, arch) below,
-# taken from the upstream `actionlint_<ver>_checksums.txt`. Bump both the version
-# and the matching hashes together (see CONTRIBUTING.md).
+# The tarball is verified against a per-(os, arch) SHA-256 below, taken from the
+# upstream `actionlint_<ver>_checksums.txt`. Bump both the version and the
+# matching hashes together (see CONTRIBUTING.md).
 ACTIONLINT_VERSION ?= 1.7.12
 ACTIONLINT ?= $(HOME)/.local/bin/actionlint
 
@@ -94,7 +94,6 @@ deny:
 		echo ">> cargo-deny not installed; skipping (cargo install cargo-deny)"; \
 	fi
 
-# L5-5: catch manifest dependencies no crate source actually uses.
 machete:
 	@if command -v cargo-machete >/dev/null 2>&1; then \
 		cargo-machete; \
@@ -106,8 +105,8 @@ pam-profile:
 	python3 .github/scripts/check-pam-profile.py --self-test
 	python3 .github/scripts/check-pam-profile.py --profile pam-config
 
-# L15-7: no tracked text file may contain CR. A CRLF committed into install.sh
-# or pam-config breaks them on Windows checkouts (autocrlf). `git grep -I` skips
+# No tracked text file may contain CR: a CRLF committed into install.sh or
+# pam-config breaks them on Windows checkouts (autocrlf). `git grep -I` skips
 # binaries; the pattern is a literal CR built portably (dash has no $'…').
 crlf:
 	@if git grep -I -l "$$(printf '\r')" -- . ; then \
@@ -144,10 +143,9 @@ $(ACTIONLINT):
 	  rm -rf "$$tmp"; \
 	  "$(ACTIONLINT)" --version
 
-# Assemble the per-arch tarball + top-level SHA256SUMS, mirroring release.yaml:
-# the tarball root is the single `wsl-webauthn-pam-<version>-<arch>/` directory
-# and SHA256SUMS covers the tarballs. `make all` has already built both the
-# Linux module/CLI and the bridge.
+# Assemble the per-arch tarball + top-level SHA256SUMS: the tarball root is the
+# single `wsl-webauthn-pam-<version>-<arch>/` directory and SHA256SUMS covers the
+# tarballs. `make all` has already built both the Linux module/CLI and the bridge.
 release: all
 	@if [ -z "$(ARCH)" ]; then \
 		echo ">> unsupported host arch '$(HOST_ARCH)' (expected x86_64/amd64/aarch64/arm64)" >&2; \

@@ -2,8 +2,7 @@
 
 //! Fuzz the **full** attestation (enrollment) verification path under both
 //! policies — the X.509 chain walker, the packed/tpm leaf-shape state machine, and
-//! the TPM `certInfo`/`pubArea` semantic checks were previously reachable only
-//! through hand-built fixtures (L14-1).
+//! the TPM `certInfo`/`pubArea` semantic checks.
 //!
 //! Two shapes are exercised per input:
 //!
@@ -17,9 +16,9 @@
 //!
 //! The chain entry (`chain::verify_chain`) is `pub(crate)` and takes a
 //! `&[Vec<u8>]`, so it is not directly reachable from the public/test API; the
-//! stitched shape below is the chain-oriented coverage the task asks for. `Ok`
-//! results are only reachable through a genuine verification (the verifier is
-//! unchanged), so no `Ok` is asserted here.
+//! stitched shape below provides the chain-oriented coverage. `Ok`
+//! results are only reachable through a genuine verification, so no `Ok` is
+//! asserted here.
 
 use ciborium::value::Value;
 use libfuzzer_sys::fuzz_target;
@@ -134,8 +133,8 @@ fn stitched_attestation(data: &[u8]) {
 /// Fail-open oracle over an **independent** (non-Rust) golden vector: a known-good
 /// `packed`/x5c object must verify, one bit of its signature must not, and a
 /// single-byte mutation anywhere in the object must be rejected. This catches a
-/// verifier that returns `Ok` without genuinely binding the signed message (L14-5,
-/// L14-10) and does not use the synthesized-vector helpers.
+/// verifier that returns `Ok` without genuinely binding the signed message and does
+/// not use the synthesized-vector helpers.
 fn independent_oracle() {
     let challenge = common::unhex(common::INDEPENDENT_CHALLENGE_HEX);
     let good = common::unhex(common::INDEPENDENT_ATTESTATION_OBJECT_HEX);

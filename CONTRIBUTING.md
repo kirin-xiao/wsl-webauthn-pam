@@ -10,30 +10,23 @@ infrastructure, so correctness and fail-closed behavior matter more than speed.
 
 - **Rust:** stable, pinned by `rust-toolchain.toml` (edition 2024,
   `rust-version = 1.88`). Nothing else is required for `cargo check`.
-- **PAM headers** (to link the `cdylib` and run the `pam_start` tests):
-
-  ```sh
-  sudo apt-get install -y libpam0g-dev        # Debian/Ubuntu
-  ```
-
-- **Cross-compiling the Windows bridge** (optional; CI also builds it):
+- **PAM headers**, to link the `cdylib` and run the `pam_start` tests:
+  `sudo apt-get install -y libpam0g-dev` (Debian/Ubuntu).
+- **The Windows bridge** builds on Windows with `cargo.exe` (native MSVC, what
+  CI ships) or cross-compiles on Linux:
 
   ```sh
   rustup target add x86_64-pc-windows-gnu
   cargo build --release -p wsl-webauthn-bridge --target x86_64-pc-windows-gnu
   ```
 
-  `cmd`/`powershell` users can instead build natively with `cargo.exe` (MSVC).
-
-- **Fuzzing** (`fuzz/`, a separate cargo-fuzz workspace) needs nightly. Because
-  `rust-toolchain.toml` pins stable, `cargo fuzz` and its child `cargo` would
-  otherwise use stable and fail on `-Zsanitizer`. Install a matching nightly and
-  export `RUSTUP_TOOLCHAIN` for the whole invocation (this env var overrides the
-  toolchain file for cargo-fuzz *and* every process it spawns):
+- **Fuzzing** (`fuzz/`, a separate cargo-fuzz workspace) needs nightly. Export
+  `RUSTUP_TOOLCHAIN` for the whole invocation so cargo-fuzz and its child
+  `cargo` use the same nightly despite the stable toolchain file:
 
   ```sh
   rustup toolchain install nightly-2026-09-30
-  export RUSTUP_TOOLCHAIN=nightly-2026-09-30   # same pin CI uses (ci.yaml fuzz-smoke)
+  export RUSTUP_TOOLCHAIN=nightly-2026-09-30
   cargo install cargo-fuzz --version 0.13.2 --locked
   cd fuzz && cargo fuzz run assertion
   ```
@@ -51,31 +44,17 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-Or, where available, `make check` (adds `cargo-deny`). CI additionally runs
-`cargo-deny check`, `actionlint`, the `pam-auth-update` profile-expansion guard,
-the Windows bridge build/tests, and a native aarch64 `cargo build --release`
-(which really links the PAM `cdylib`, not just `cargo check`). See
-`.github/workflows/ci.yaml`.
+Or, where available, `make check` (adds `cargo-deny`). CI adds `cargo-deny
+check`, `actionlint`, the `pam-auth-update` profile-expansion guard, the Windows
+bridge build/tests, and a native aarch64 `cargo build --release` (which really
+links the PAM `cdylib`). See `.github/workflows/ci.yaml`.
 
 Notes:
 
 - Use `--locked` everywhere. If you change a dependency, commit the updated
   `Cargo.lock`.
-- Keep the code `unsafe`-free where practical. Every `unsafe` site is a small,
-  documented FFI/syscall module that turns a raw C ABI or syscall into safe
-  wrappers; new `unsafe` needs a `// SAFETY:` justification. The complete list
-  (each opens with `#![allow(unsafe_code)]`, while its parent crate is
-  `#![deny(unsafe_code)]` or `#![forbid(unsafe_code)]`):
-  - `wsl-webauthn-pam/src/bindings.rs` — raw libpam/`syslog` C declarations.
-  - `wsl-webauthn-pam/src/seam.rs` — the libpam calls (`pam_get_item`,
-    `pam_get_user`, the conversation callback, `free`).
-  - `wsl-webauthn-pam/src/logger.rs` — `openlog`/`syslog`.
-  - `wsl-webauthn-store/src/sys.rs` — `openat`/`fstat`/`read`/`write`/`renameat`
-    syscall wrappers.
-  - `wsl-webauthn-runner/src/proc.rs` — `poll`/`read`/`write`/`fcntl` and the
-    per-thread `pthread_sigmask` SIGPIPE guard.
-  - `wsl-webauthn-cli/src/main.rs` (`mod userdb`) — `getpwnam`/`getpwuid` passwd
-    lookups.
+- Keep the code `unsafe`-free where practical; new `unsafe` needs a
+  `// SAFETY:` justification.
 - The verifier must never panic on attacker-controlled input and must return an
   error for every malformed path.
 - Never commit real-machine attestation material or machine identifiers. Local

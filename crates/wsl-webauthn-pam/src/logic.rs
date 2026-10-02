@@ -1,4 +1,4 @@
-//! The fail-closed authentication state machine (plan §8).
+//! The fail-closed authentication state machine.
 //!
 //! [`authenticate`] holds the entire decision logic. It talks to libpam through a
 //! [`PamSeam`] and to the outside world (store, bridge, verifier, entropy) through a
@@ -32,15 +32,14 @@ use crate::bindings::{
 use crate::logger;
 use crate::seam::PamSeam;
 
-/// Failure delay requested on every failure path (2 s; plan §3/§8, CR-14).
+/// Failure delay requested on every failure path (2 s).
 pub const FAIL_DELAY_USEC: u32 = 2_000_000;
 
 /// The result of one authentication attempt.
 ///
-/// There is no PAM-code accessor and no counter on the success arm: the PAM code is
-/// the failure's `code` (or `PAM_SUCCESS` for `Success`), mapped by [`run`], and the
-/// observed signature counter is only debug-logged. Keeping the counter out of the
-/// type avoids a field that no consumer reads (L16-2).
+/// The observed signature counter is only debug-logged, so it is not part of the type;
+/// the PAM code is the failure's `code` (or `PAM_SUCCESS` for `Success`), mapped by
+/// [`run`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthOutcome {
     /// A verified assertion. This is the only success variant.
@@ -77,7 +76,7 @@ pub trait Deps {
     /// not honour, so enforcing the POSIX ownership/mode rule there would reject every
     /// legitimate bridge; on such a mount the check is reduced to "regular file, not a
     /// symlink" and the SHA-256 pin remains the integrity control. Anywhere else a
-    /// user-writable directory is refused (L2-4).
+    /// user-writable directory is refused.
     fn bridge_path_is_trusted(&self, path: &Path, win_mnt: &Path) -> Result<(), String>;
     /// Fill `dest` with cryptographically secure random bytes.
     ///
@@ -160,7 +159,7 @@ impl Deps for SystemDeps {
 /// arbitrarily large bridge executable is never held in memory.
 ///
 /// `O_NOFOLLOW` closes the "hash a symlink target, then spawn the link" gap: a symlink
-/// at the configured path is refused rather than silently followed (L2-2). The runner
+/// at the configured path is refused rather than silently followed. The runner
 /// spawns by path *after* this hash, so this narrows — but does not by itself close —
 /// the check-then-use window; see [`bridge_path_is_trusted`].
 pub fn sha256_file_nofollow(path: &Path) -> Result<[u8; 32], String> {
@@ -169,7 +168,7 @@ pub fn sha256_file_nofollow(path: &Path) -> Result<[u8; 32], String> {
 
     /// Upper bound on the bytes this module will read from the bridge path. The real
     /// bridge is ~2 MB; a value this far above it is a sanity guard against hashing an
-    /// attacker-planted huge/special file (L10-2), not a functional limit.
+    /// attacker-planted huge/special file, not a functional limit.
     const MAX_BRIDGE_BYTES: u64 = 64 * 1024 * 1024;
 
     let file = crate::sys::open_readonly_nofollow(path)
@@ -260,11 +259,11 @@ pub fn bridge_path_is_trusted(path: &Path, win_mnt: &Path) -> Result<(), String>
     Ok(())
 }
 
-/// Map a bridge ceremony error to a PAM code (plan §8 mapping table).
+/// Map a bridge ceremony error to a PAM code.
 ///
-/// The plan is explicit: only `user_cancelled` is an authentication failure; every
-/// other taxonomy entry means the underlying service could not authenticate
-/// information, which is `PAM_AUTHINFO_UNAVAIL`.
+/// Only `user_cancelled` is an authentication failure; every other taxonomy entry
+/// means the underlying service could not authenticate information, which is
+/// `PAM_AUTHINFO_UNAVAIL`.
 fn bridge_error_code(error: BridgeError) -> i32 {
     match error {
         BridgeError::UserCancelled => PAM_AUTH_ERR,
@@ -290,9 +289,6 @@ fn bridge_error_name(error: BridgeError) -> &'static str {
 }
 
 /// Human-readable name for a PAM return code, for audit logs.
-///
-/// Unknown codes still get their numeric value in [`failure_message`]; this helper only
-/// names the codes the module can return.
 fn pam_code_name(code: i32) -> &'static str {
     match code {
         PAM_SUCCESS => "PAM_SUCCESS",
@@ -322,11 +318,7 @@ fn failure_severity(code: i32) -> i32 {
     }
 }
 
-/// Format the audit-log line for a failure.
-///
-/// The PAM code *and* its name are always present, so an admin grepping `authpriv` can
-/// tell a rejected assertion (`PAM_AUTH_ERR`) from an unavailable service
-/// (`PAM_AUTHINFO_UNAVAIL`) from an unknown user (`PAM_USER_UNKNOWN`).
+/// Format the audit-log line for a failure: the PAM code and its name, then the reason.
 fn failure_message(code: i32, reason: &str) -> String {
     format!(
         "authentication failed: {}({code}): {reason}",
@@ -334,12 +326,11 @@ fn failure_message(code: i32, reason: &str) -> String {
     )
 }
 
-/// Map a `VerifyError` to a PAM code (plan §8 mapping table).
+/// Map a `VerifyError` to a PAM code.
 ///
 /// Every current variant is an authentication decision → `PAM_AUTH_ERR`; the function
-/// exists so the mapping is one auditable place and every variant is table-tested
-/// (L8-7). A future variant that is *not* an authentication decision (say, an
-/// unsupported algorithm we choose to treat as a service condition) must be added here
+/// exists so the mapping is one auditable place and every variant is table-tested. A
+/// future variant that is *not* an authentication decision must be added here
 /// deliberately rather than falling through an undocumented catch-all.
 fn pam_code_for_verify(_error: &VerifyError) -> i32 {
     PAM_AUTH_ERR
@@ -397,7 +388,7 @@ pub fn authenticate<S: PamSeam, D: Deps>(
         Err(e) => {
             // Log only the stable error *kind*: the full `Display` embeds the absolute
             // record path and therefore the username, which must not reach `authpriv`
-            // syslog (L8-9). The CLI keeps the rich `Display` for operators.
+            // syslog. The CLI keeps the rich `Display` for operators.
             return fail(
                 PAM_AUTHINFO_UNAVAIL,
                 format!("credential store error: {}", e.kind_str()),
@@ -434,7 +425,7 @@ pub fn authenticate<S: PamSeam, D: Deps>(
         }
     };
 
-    // --- 4. Bridge executable pin (plan D11) -----------------------------
+    // --- 4. Bridge executable pin ----------------------------------------
     let bridge_path = config.bridge_path.as_path();
     if record.bridge_path != config.bridge_path.to_string_lossy() {
         logger::debug(&format!(
@@ -442,10 +433,9 @@ pub fn authenticate<S: PamSeam, D: Deps>(
             record.bridge_path, config.bridge_path
         ));
     }
-    // The pin is always enforced (L2-4 removed the `noverifypin` argument). Before
-    // hashing, refuse a path a non-root writer could swap: with the pin disabled there
-    // would be no integrity control at all, and even with it the runner spawns by name
-    // after this hash, so the path must be trustworthy in its own right (L2-2/L2-4).
+    // The pin is always enforced. Before hashing, refuse a path a non-root writer could
+    // swap: the runner spawns by name after this hash, so the path must be trustworthy
+    // in its own right.
     if let Err(e) = deps.bridge_path_is_trusted(bridge_path, &config.win_mnt) {
         return fail(
             PAM_AUTHINFO_UNAVAIL,
@@ -502,7 +492,7 @@ pub fn authenticate<S: PamSeam, D: Deps>(
         }
     };
 
-    // --- 6. Optional consent pre-prompt (SR-11) --------------------------
+    // --- 6. Optional consent pre-prompt ----------------------------------
     // Windows Hello shows the RP ID, not RP_NAME; this conversation message is the
     // primary consent-naming mechanism. It is best-effort: a missing or failing
     // conversation never blocks authentication.
@@ -539,7 +529,7 @@ pub fn authenticate<S: PamSeam, D: Deps>(
     // --- 8. Response handling --------------------------------------------
     match response {
         RunnerResponse::Assert { .. } => {
-            // 8a. echo consistency (ASSERTION v6 bonus).
+            // 8a. echo consistency.
             match response.decode_client_data_json_echo() {
                 Ok(Some(echo)) => {
                     if echo != client_data_json {
@@ -589,8 +579,8 @@ pub fn authenticate<S: PamSeam, D: Deps>(
             match verify_assertion(&check) {
                 Ok(outcome) => {
                     // The PAM module does NOT persist the counter: the record stays
-                    // authoritative for enrollment-time data and the counter is
-                    // advisory (Windows Hello reports zero). A follow-up may persist it.
+                    // authoritative for enrollment-time data, and the counter is
+                    // advisory (Windows Hello reports zero).
                     logger::debug(&format!(
                         "assertion verified (observed sign_count {})",
                         outcome.sign_count
@@ -633,7 +623,7 @@ pub fn authenticate<S: PamSeam, D: Deps>(
 /// On failure this requests `pam_fail_delay` (2 s) *before* returning.
 pub fn run<S: PamSeam, D: Deps>(seam: &mut S, deps: &D, flags: i32, raw_args: &[String]) -> i32 {
     // Install the syslog-only panic hook before enclosing `authenticate` in
-    // `catch_unwind` (L8-1); this also covers direct callers that skip `guarded`.
+    // `catch_unwind`; this also covers direct callers that skip `guarded`.
     logger::install_panic_hook();
     let args = crate::args::parse(raw_args);
     logger::set_debug(args.debug);
@@ -796,8 +786,8 @@ mod tests {
         ]
     }
 
-    /// L8-7: every `VerifyError` maps to `PAM_AUTH_ERR`, and the call-site reason and
-    /// audit line carry both the event label and the error's own display text.
+    /// Every `VerifyError` maps to `PAM_AUTH_ERR`, and the call-site reason and audit
+    /// line carry both the event label and the error's own display text.
     #[test]
     fn every_verify_error_maps_to_pam_auth_err_with_a_stable_reason() {
         let errors = all_verify_errors();
@@ -819,7 +809,7 @@ mod tests {
         }
     }
 
-    /// L10-2: the bridge hasher streams (never `fs::read`-ing the whole executable) and
+    /// The bridge hasher streams (never `fs::read`-ing the whole executable) and
     /// returns a digest identical to a one-shot hash of the same bytes.
     #[test]
     fn sha256_file_nofollow_streams_and_matches_a_known_digest() {

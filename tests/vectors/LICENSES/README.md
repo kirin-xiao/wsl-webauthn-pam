@@ -1,8 +1,7 @@
 # Third-party licenses for consulted references
 
-The verifier test suite does **not** vendor binary or source fixtures from these
-projects; they were consulted only to validate the TPM/packed verification
-semantics. Their licenses are recorded here for provenance.
+These projects were consulted only to validate TPM/packed verification semantics; no binary
+or source fixtures are vendored. Their licenses are recorded here for provenance.
 
 ---
 
@@ -39,5 +38,5 @@ The full license text is available at
 
 - Source: https://www.w3.org/TR/webauthn-2/
 - License: W3C Document License
-- Used for: normative reading of §7.2, §8.2, §8.3, §8.3.1. **No text is copied
-  into this repository.**
+- Used for: normative reading of §7.2, §8.2, §8.3, §8.3.1. No text is copied into this
+  repository.
