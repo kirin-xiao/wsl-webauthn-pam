@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 /// Current on-disk record schema version.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -15,6 +16,29 @@ pub const MODE_STRICT: &str = "strict";
 
 /// `attestation.mode` value: a self/`none`-attested key admitted by explicit opt-in.
 pub const MODE_UNATTESTED_OPT_IN: &str = "unattested-opt-in";
+
+/// Returns `true` if `mode` is one of the known [`MODE_STRICT`]/[`MODE_UNATTESTED_OPT_IN`]
+/// `attestation.mode` values.
+///
+/// This is the single allow-list used both while serializing a record and while loading
+/// one, so a hand-edited `"mode"` value cannot be persisted or read back as valid.
+pub(crate) fn valid_attestation_mode(mode: &str) -> bool {
+    mode == MODE_STRICT || mode == MODE_UNATTESTED_OPT_IN
+}
+
+/// A `CredentialRecord` that violates the on-disk invariant documented at
+/// [`crate::CredentialRecord::validate`].
+#[derive(Debug, Error)]
+pub enum InvalidRecord {
+    /// `attestation.mode` was not [`MODE_STRICT`] or [`MODE_UNATTESTED_OPT_IN`].
+    #[error(
+        "unknown attestation mode {0:?} (expected {MODE_STRICT:?} or {MODE_UNATTESTED_OPT_IN:?})"
+    )]
+    AttestationMode(String),
+    /// `attestation.verified` was `false` while `attestation.mode` claimed [`MODE_STRICT`].
+    #[error("attestation.mode {MODE_STRICT:?} requires verified = true")]
+    StrictNotVerified,
+}
 
 /// A single Linux user's enrolled credential (one record per user, plan D8).
 ///
@@ -61,9 +85,23 @@ impl CredentialRecord {
         self.schema_version == SCHEMA_VERSION
     }
 
-    /// Returns `true` if `attestation.mode` is one of the known values.
-    pub fn has_known_attestation_mode(&self) -> bool {
-        self.attestation.has_known_mode()
+    /// Validate the invariants the store documents for a record but that serde alone
+    /// cannot express.
+    ///
+    /// This is called from [`crate::Store::load`] and [`crate::Store::save_atomic`], so
+    /// an invalid record is rejected both when read from disk and before it is written.
+    /// Today that means `attestation.mode` must be [`MODE_STRICT`] or
+    /// [`MODE_UNATTESTED_OPT_IN`], and a strict record must be `verified`.
+    pub fn validate(&self) -> Result<(), InvalidRecord> {
+        if !valid_attestation_mode(&self.attestation.mode) {
+            return Err(InvalidRecord::AttestationMode(
+                self.attestation.mode.clone(),
+            ));
+        }
+        if self.attestation.mode == MODE_STRICT && !self.attestation.verified {
+            return Err(InvalidRecord::StrictNotVerified);
+        }
+        Ok(())
     }
 }
 
@@ -79,13 +117,6 @@ pub struct AttestationRecord {
     pub verified: bool,
     /// Lowercase hex SHA-256 of the leaf certificate, when one was present.
     pub leaf_sha256: Option<String>,
-}
-
-impl AttestationRecord {
-    /// Returns `true` if `mode` is one of the known values.
-    pub fn has_known_mode(&self) -> bool {
-        self.mode == MODE_STRICT || self.mode == MODE_UNATTESTED_OPT_IN
-    }
 }
 
 /// The Windows account bound to a credential for audit purposes (plan D8).
@@ -110,8 +141,40 @@ pub struct Config {
 }
 
 impl Config {
-    /// Default Windows mount root when the config file omits `win_mnt`.
+    /// The single canonical Windows mount root default (`/mnt/c`).
+    ///
+    /// The CLI and installer must re-export this constant rather than declaring their own
+    /// copy; [`Config::to_toml`] and the `RawConfig` parser both key off it.
     pub const DEFAULT_WIN_MNT: &'static str = "/mnt/c";
+
+    /// Serialize this config as the exact TOML shape [`crate::Store::load_config`] parses.
+    ///
+    /// The store owns both sides of the on-disk format (see `L7-4`): this is the writer
+    /// counterpart to the `deny_unknown_fields` `RawConfig` parser, so a field
+    /// added to one side cannot silently drift from the other. The `timeout_secs` line is
+    /// omitted when `None` (matching the installer's historical output and the parser's
+    /// default).
+    ///
+    /// `bridge_path`/`win_mnt` are rendered with `to_string_lossy`, mirroring the
+    /// installer; non-UTF-8 paths are not representable in a TOML basic string.
+    pub fn to_toml(&self) -> String {
+        // Serialize a writer type rather than `Self` because `toml` cannot round-trip a
+        // `PathBuf` field (`PathBuf` serializes as a map, which is not a TOML string).
+        #[derive(Serialize)]
+        struct ConfigToml<'a> {
+            bridge_path: std::borrow::Cow<'a, str>,
+            win_mnt: std::borrow::Cow<'a, str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            timeout_secs: Option<u64>,
+        }
+        let writer = ConfigToml {
+            bridge_path: self.bridge_path.to_string_lossy(),
+            win_mnt: self.win_mnt.to_string_lossy(),
+            timeout_secs: self.timeout_secs,
+        };
+        // The shape is a flat struct of owned primitives, so serialization cannot fail.
+        toml::to_string(&writer).expect("Config serialization cannot fail")
+    }
 }
 
 /// Default serialization of [`Config`]'s TOML shape.

@@ -38,8 +38,11 @@
 //! * The record's `schema_version` must be exactly 1 and its `linux_user` must equal the
 //!   lookup name; otherwise [`StoreError::Corrupt`]/[`StoreError::RecordUserMismatch`].
 //!   Parsing uses `deny_unknown_fields`, so a record carrying unexpected keys is
-//!   [`StoreError::Corrupt`] (strict, fail-closed). `enrolled_at` is stored but not
-//!   re-validated here (the verifier/PAM trust only the cryptographic fields).
+//!   [`StoreError::Corrupt`] (strict, fail-closed). [`CredentialRecord::validate`] also
+//!   enforces the cross-field invariants serde cannot express: `attestation.mode` must be
+//!   `"strict"` or `"unattested-opt-in"`, and a `"strict"` record must be `verified`.
+//!   `enrolled_at` is stored but not re-validated here (the verifier/PAM trust only the
+//!   cryptographic fields).
 //! * Writes are atomic: `mkstemp` in the target directory (`.tmp-XXXXXX`), `fchmod 0600`,
 //!   `fsync` the file, then `rename` over the target (or `link` when `replace == false`),
 //!   then `fsync` the directory **on every success path** (durability of the rename). A
@@ -73,7 +76,12 @@
 //! ```
 //!
 //! `windows_identity` may be `null`. `attestation.mode` is `"strict"` or
-//! `"unattested-opt-in"` (plan D3).
+//! `"unattested-opt-in"` (plan D3); [`Store::load`] rejects any other value as
+//! [`StoreError::Corrupt`].
+//!
+//! The config TOML is written by the store, not the installer: [`Config::to_toml`] is the
+//! serializer and [`Store::save_config`] the atomic, `0600`, owner-checked writer, matching
+//! the [`Store::load_config`] parser (`L7-4`).
 
 // `forbid` would prevent the audited `sys` module from using `unsafe` at all; we use
 // `deny` crate-wide and a single documented `#[allow(unsafe_code)]` on `sys`.
@@ -91,8 +99,8 @@ use thiserror::Error;
 use wsl_webauthn_protocol::b64u_decode;
 
 pub use record::{
-    AttestationRecord, Config, CredentialRecord, MODE_STRICT, MODE_UNATTESTED_OPT_IN,
-    SCHEMA_VERSION, WindowsIdentity,
+    AttestationRecord, Config, CredentialRecord, InvalidRecord, MODE_STRICT,
+    MODE_UNATTESTED_OPT_IN, SCHEMA_VERSION, WindowsIdentity,
 };
 
 /// Mode required on the `credentials` directory.
@@ -101,6 +109,11 @@ pub const DIR_MODE: u32 = 0o700;
 pub const FILE_MODE: u32 = 0o600;
 /// Mode required on the config file.
 pub const CONFIG_MODE: u32 = 0o600;
+/// Mode used when [`Store::save_config`] creates the base directory itself (`0755`).
+///
+/// The base directory has no *exact*-mode requirement (only "owner-controlled and not
+/// group/other-writable"), matching the installer's historical `0755` config directory.
+pub const BASE_MODE: u32 = 0o755;
 
 /// Maximum size of a credential record file (256 KiB).
 pub const MAX_RECORD_BYTES: usize = 256 * 1024;
@@ -250,6 +263,22 @@ pub enum StoreError {
 pub struct Store {
     base: PathBuf,
     owner_uid: u32,
+}
+
+/// Borrowed arguments to the shared atomic temp-file install path.
+///
+/// Bundling these keeps [`Store::write_and_install`] readable now that both credential
+/// records and the config file flow through it with different target names/modes.
+struct Install<'a> {
+    fd: sys::Fd,
+    temp: &'a Path,
+    target: &'a Path,
+    contents: &'a [u8],
+    replace: bool,
+    dir_fd: &'a sys::Fd,
+    mode: u32,
+    /// Directory being fsynced (for the error message only).
+    dir_path: &'a Path,
 }
 
 impl Store {
@@ -520,6 +549,15 @@ impl Store {
                 argument_user: username.to_string(),
             });
         }
+        // The record's self-consistency invariants (e.g. `attestation.mode` is one of the
+        // known values) are validated here, not just on write, so a hand-edited record
+        // cannot load clean (L16-7 = L6-6).
+        if let Err(e) = record.validate() {
+            return Err(StoreError::Corrupt {
+                path,
+                message: e.to_string(),
+            });
+        }
         // Defense in depth: the two binary fields PAM/verifier will decode must be valid
         // unpadded base64url *now*, so a corrupt record fails closed at load rather than
         // deep inside the ceremony. Values are not otherwise constrained here.
@@ -541,6 +579,11 @@ impl Store {
     /// value there is [`StoreError::InvalidUsername`].
     pub fn save_atomic(&self, record: &CredentialRecord, replace: bool) -> Result<(), StoreError> {
         validate_username(&record.linux_user)?;
+        // Refuse to persist a record that would not survive `load` (e.g. an unknown
+        // `attestation.mode`), so the writer cannot create a record the reader rejects.
+        record.validate().map_err(|e| StoreError::Encode {
+            message: e.to_string(),
+        })?;
         self.check_base()?;
         // Re-validate ownership/mode of the destination directory *before* creating a
         // temp file in it; the returned, identity-checked handle is used for the final
@@ -569,7 +612,16 @@ impl Store {
 
         let (fd, temp_path) = sys::mkstemp_in(&dir).map_err(|e| self.io(&dir, e))?;
         let temp = PathBuf::from(temp_path);
-        let result = self.write_and_install(fd, &temp, &target, &json, replace, &dir_fd);
+        let result = self.write_and_install(&Install {
+            fd,
+            temp: &temp,
+            target: &target,
+            contents: &json,
+            replace,
+            dir_fd: &dir_fd,
+            mode: FILE_MODE,
+            dir_path: &dir,
+        });
         if result.is_err() {
             // Best-effort cleanup of the temp file on every failure path.
             let _ = sys::remove_file(&temp);
@@ -577,39 +629,31 @@ impl Store {
         result
     }
 
-    fn write_and_install(
-        &self,
-        fd: sys::Fd,
-        temp: &Path,
-        target: &Path,
-        json: &[u8],
-        replace: bool,
-        dir_fd: &sys::Fd,
-    ) -> Result<(), StoreError> {
-        sys::fchmod(fd.raw(), FILE_MODE).map_err(|e| self.io(temp, e))?;
-        sys::write_all(fd.raw(), json).map_err(|e| self.io(temp, e))?;
-        sys::fsync(fd.raw()).map_err(|e| self.io(temp, e))?;
-        drop(fd);
-
-        if replace {
-            sys::rename(temp, target).map_err(|e| self.io(target, e))?;
+    fn write_and_install(&self, install: &Install<'_>) -> Result<(), StoreError> {
+        sys::fchmod(install.fd.raw(), install.mode).map_err(|e| self.io(install.temp, e))?;
+        sys::write_all(install.fd.raw(), install.contents).map_err(|e| self.io(install.temp, e))?;
+        sys::fsync(install.fd.raw()).map_err(|e| self.io(install.temp, e))?;
+        // `Install` holds the only owned `Fd`; nothing else can close it, and dropping the
+        // install consumes the descriptor exactly once.
+        if install.replace {
+            sys::rename(install.temp, install.target).map_err(|e| self.io(install.target, e))?;
         } else {
-            match sys::link(temp, target) {
+            match sys::link(install.temp, install.target) {
                 Ok(()) => {
-                    sys::remove_file(temp).map_err(|e| self.io(temp, e))?;
+                    sys::remove_file(install.temp).map_err(|e| self.io(install.temp, e))?;
                 }
                 Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
                     return Err(StoreError::AlreadyExists {
-                        path: target.to_path_buf(),
+                        path: install.target.to_path_buf(),
                     });
                 }
-                Err(e) => return Err(self.io(temp, e)),
+                Err(e) => return Err(self.io(install.temp, e)),
             }
         }
 
         // Persist the directory entry on every success path (both replace and non-replace
         // go through here); the handle was identity-checked before the temp file existed.
-        sys::fsync(dir_fd.raw()).map_err(|e| self.io(self.credentials_dir(), e))?;
+        sys::fsync(install.dir_fd.raw()).map_err(|e| self.io(install.dir_path, e))?;
         Ok(())
     }
 
@@ -733,6 +777,71 @@ impl Store {
                 message: e.to_string(),
             })?;
         Ok(raw.into())
+    }
+
+    /// Atomically write `<base>/config` (TOML, mode `0600`, owned by the store's
+    /// expected owner — root in production).
+    ///
+    /// This is the store-owned counterpart to [`Store::load_config`] (L7-4): the
+    /// installer must call it (with `config.to_toml()` as the serializer) instead of
+    /// hand-rolling the TOML, so the write schema cannot drift from the
+    /// `deny_unknown_fields` read schema. The base directory is created (`0755`) if
+    /// missing; it is validated by [`Store::check_base`] when it already exists.
+    ///
+    /// Serialization is derived from [`Config::to_toml`], which cannot fail for this fixed
+    /// shape.
+    pub fn save_config(&self, config: &Config) -> Result<(), StoreError> {
+        let path = self.config_path();
+        // Ensure the base exists, then validate it. A base that already exists must pass
+        // the same insecure-base checks as every other store operation; a fresh one is
+        // created `0755` (umask-corrected) and re-validated.
+        let before = match self.check_base() {
+            Ok(st) => st,
+            Err(StoreError::NotFound { .. }) => {
+                sys::mkdir(&self.base, BASE_MODE).map_err(|e| self.io(&self.base, e))?;
+                let fd = sys::open_dir(&self.base).map_err(|e| self.io(&self.base, e))?;
+                sys::fchmod(fd.raw(), BASE_MODE).map_err(|e| self.io(&self.base, e))?;
+                drop(fd);
+                self.check_base()?
+            }
+            Err(e) => return Err(e),
+        };
+        // Hold an identity-checked directory descriptor for the final fsync. The base
+        // deliberately has no exact-mode requirement, so this mirrors `open_checked_dir`
+        // without imposing one.
+        let base_fd = sys::open_dir(&self.base).map_err(|e| self.io(&self.base, e))?;
+        let after = sys::fstat(base_fd.raw()).map_err(|e| self.io(&self.base, e))?;
+        if after.uid != self.owner_uid || after.perm_bits() & 0o022 != 0 {
+            return Err(StoreError::InsecureBase {
+                path: self.base.clone(),
+                expected_uid: self.owner_uid,
+                actual_uid: after.uid,
+                actual_mode: after.perm_bits(),
+            });
+        }
+        if after.dev != before.dev || after.ino != before.ino {
+            return Err(StoreError::PathChanged {
+                path: self.base.clone(),
+            });
+        }
+
+        let toml_bytes = config.to_toml().into_bytes();
+        let (fd, temp_path) = sys::mkstemp_in(&self.base).map_err(|e| self.io(&self.base, e))?;
+        let temp = PathBuf::from(temp_path);
+        let result = self.write_and_install(&Install {
+            fd,
+            temp: &temp,
+            target: &path,
+            contents: &toml_bytes,
+            replace: true,
+            dir_fd: &base_fd,
+            mode: CONFIG_MODE,
+            dir_path: &self.base,
+        });
+        if result.is_err() {
+            let _ = sys::remove_file(&temp);
+        }
+        result
     }
 }
 
