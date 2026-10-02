@@ -11,11 +11,11 @@
 
 // Enforce the plan §5 invariant that all `unsafe` lives in `crate::ffi`.
 #![forbid(unsafe_code)]
-// This module mirrors the Win32 vocabulary in full (plan D5); the variants and
-// constants that the bridge does not currently select are still part of the
-// faithful transcription and are referenced from the `#[cfg(windows)]` FFI
-// layer. On the Linux test build some of them are unreferenced.
-#![allow(dead_code)]
+// This module mirrors the Win32 vocabulary in full (plan D5). Variants that the
+// bridge does not currently select are still a faithful transcription of
+// `webauthn.h`; they carry a narrowly-scoped `#[allow(dead_code)]` each rather
+// than a module-wide allow, so a genuinely orphaned item is still reported
+// (L16-13).
 
 use std::fmt;
 
@@ -25,6 +25,7 @@ use wsl_webauthn_protocol::BridgeError;
 pub type Hresult = i32;
 
 /// `S_OK`.
+#[allow(dead_code)] // consumed only by the `#[cfg(windows)]` FFI layer
 pub const S_OK: Hresult = 0;
 
 // ---------------------------------------------------------------------------
@@ -94,12 +95,15 @@ pub const fn map_hresult(hr: Hresult) -> BridgeError {
 #[repr(u32)]
 pub enum UvRequirement {
     /// `WEBAUTHN_USER_VERIFICATION_REQUIREMENT_ANY`.
+    #[allow(dead_code)] // faithful transcription; bridge pins `Required`
     Any = 0,
     /// `WEBAUTHN_USER_VERIFICATION_REQUIREMENT_REQUIRED`.
     Required = 1,
     /// `WEBAUTHN_USER_VERIFICATION_REQUIREMENT_PREFERRED`.
+    #[allow(dead_code)] // faithful transcription; bridge pins `Required`
     Preferred = 2,
     /// `WEBAUTHN_USER_VERIFICATION_REQUIREMENT_DISCOURAGED`.
+    #[allow(dead_code)] // faithful transcription; bridge pins `Required`
     Discouraged = 3,
 }
 
@@ -108,10 +112,13 @@ pub enum UvRequirement {
 #[repr(u32)]
 pub enum AttestationConveyance {
     /// `WEBAUTHN_ATTESTATION_CONVEYANCE_PREFERENCE_ANY`.
+    #[allow(dead_code)] // faithful transcription; bridge pins `Direct`
     Any = 0,
     /// `WEBAUTHN_ATTESTATION_CONVEYANCE_PREFERENCE_NONE`.
+    #[allow(dead_code)] // faithful transcription; bridge pins `Direct`
     None = 1,
     /// `WEBAUTHN_ATTESTATION_CONVEYANCE_PREFERENCE_INDIRECT`.
+    #[allow(dead_code)] // faithful transcription; bridge pins `Direct`
     Indirect = 2,
     /// `WEBAUTHN_ATTESTATION_CONVEYANCE_PREFERENCE_DIRECT`.
     Direct = 3,
@@ -122,12 +129,15 @@ pub enum AttestationConveyance {
 #[repr(u32)]
 pub enum AuthenticatorAttachment {
     /// `WEBAUTHN_AUTHENTICATOR_ATTACHMENT_ANY`.
+    #[allow(dead_code)] // faithful transcription; bridge pins `Platform`
     Any = 0,
     /// `WEBAUTHN_AUTHENTICATOR_ATTACHMENT_PLATFORM`.
     Platform = 1,
     /// `WEBAUTHN_AUTHENTICATOR_ATTACHMENT_CROSS_PLATFORM`.
+    #[allow(dead_code)] // faithful transcription; bridge pins `Platform`
     CrossPlatform = 2,
     /// `WEBAUTHN_AUTHENTICATOR_ATTACHMENT_CROSS_PLATFORM_U2F_V2`.
+    #[allow(dead_code)] // faithful transcription; bridge pins `Platform`
     CrossPlatformU2fV2 = 3,
 }
 
