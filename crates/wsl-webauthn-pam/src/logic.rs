@@ -395,7 +395,13 @@ pub fn authenticate<S: PamSeam, D: Deps>(
             return fail(PAM_USER_UNKNOWN, "no credential enrolled for user");
         }
         Err(e) => {
-            return fail(PAM_AUTHINFO_UNAVAIL, format!("credential store error: {e}"));
+            // Log only the stable error *kind*: the full `Display` embeds the absolute
+            // record path and therefore the username, which must not reach `authpriv`
+            // syslog (L8-9). The CLI keeps the rich `Display` for operators.
+            return fail(
+                PAM_AUTHINFO_UNAVAIL,
+                format!("credential store error: {}", e.kind_str()),
+            );
         }
     };
     // Defense in depth: a record whose pinned RP/origin do not match this build can
