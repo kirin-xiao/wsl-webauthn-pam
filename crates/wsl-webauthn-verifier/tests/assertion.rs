@@ -8,7 +8,6 @@
 mod common;
 
 use common::*;
-use std::time::SystemTime;
 use wsl_webauthn_protocol::{ClientDataKind, RP_ID};
 use wsl_webauthn_verifier::{AssertionCheck, VerifyError, verify_assertion};
 
@@ -49,7 +48,6 @@ fn check<'a>(a: &'a Assertion) -> AssertionCheck<'a> {
         authenticator_data: &a.auth_data,
         signature: &a.signature,
         expected_sign_count: None,
-        now: SystemTime::now(),
     }
 }
 

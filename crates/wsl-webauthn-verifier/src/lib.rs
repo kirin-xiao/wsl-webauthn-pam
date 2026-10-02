@@ -191,8 +191,9 @@ pub struct AttestationMetadata {
 
 /// Inputs to an assertion (login) verification.
 ///
-/// Construct with [`AssertionCheck::new`], which sets `now` to
-/// [`SystemTime::now`]. Tests may set `now` directly to pin the clock.
+/// Construct with [`AssertionCheck::new`]. The assertion path has no time semantics:
+/// unlike enrollment, no certificate validity window is consulted, so there is no
+/// clock input.
 #[derive(Debug)]
 pub struct AssertionCheck<'a> {
     /// The raw (≥16 byte) challenge we minted and put in `clientDataJSON`.
@@ -213,12 +214,11 @@ pub struct AssertionCheck<'a> {
     /// `None` (or a stored count of 0 on a zero-counter authenticator) skips the
     /// check. Pass the value loaded with the credential record.
     pub expected_sign_count: Option<u32>,
-    /// The instant used for any time-based checks. Defaults to `SystemTime::now()`.
-    pub now: SystemTime,
 }
 
 impl<'a> AssertionCheck<'a> {
-    /// Build an assertion check with `now = SystemTime::now()`.
+    /// Build an assertion check. The assertion path has no time semantics, so no
+    /// clock is captured.
     pub fn new(
         expected_challenge: &'a [u8],
         credential_id: &'a [u8],
@@ -237,7 +237,6 @@ impl<'a> AssertionCheck<'a> {
             // No stored count by default: the counter check is skipped. The PAM
             // module and CLI set this from the loaded credential record.
             expected_sign_count: None,
-            now: SystemTime::now(),
         }
     }
 
