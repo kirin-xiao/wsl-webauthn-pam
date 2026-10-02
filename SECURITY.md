@@ -73,6 +73,7 @@ fail, stall, or attempt consent phishing.
   on the Linux side against the enrolled public key over a challenge the Linux
   side minted; a replaced bridge has no private key. The bridge pin also refuses
   to launch a changed `.exe`; there is no module argument that disables it.
+  <!-- INVARIANT: PAM-BRIDGE-PIN-FAIL-CLOSED -->
 - **Silently raise privilege.** Even a successful ceremony is checked against
   `rpIdHash`, UP/UV, the enrolled credential id, and the signature.
 - **Enroll a software key under the default policy.** Strict attestation chains
@@ -101,6 +102,8 @@ intend — is accepted and documented as SR-OUT-1/3 (see
 - Be launched unchanged by the module if its hash differs from the one pinned at
   enrollment. The pin is fail-closed and cannot be disabled from the module
   arguments.
+  <!-- INVARIANT: RUNNER-BOUNDED-READ -->
+  <!-- INVARIANT: RUNNER-EXACTLY-ONE-FRAME, RUNNER-TIMEOUT-REAP, RUNNER-SIGPIPE-SAFE, RUNNER-NO-SHELL -->
 
 Because the bridge holds no trust, an attacker who fully controls it gains only
 the ability to deny authentication or to relay a genuine ceremony — not to
@@ -122,6 +125,8 @@ authenticate.
 | RP ID | `io.github.kirin-xiao.wsl-webauthn-pam` (compile-time constant) | `crates/wsl-webauthn-protocol/src/lib.rs` (`RP_ID`) |
 | Origin | pinned equal to the RP ID (native client, no browser origin) | `crates/wsl-webauthn-protocol/src/lib.rs` (`ORIGIN`) |
 | Attestation root | **Microsoft TPM Root Certificate Authority 2014**, SHA-256 `87:0C:7A:35:CE:AB:3D:59:97:9F:2C:6A:52:40:42:D4:04:CB:71:51:80:04:35:09:25:FB:2C:ED:79:A9:99:DA` | `crates/wsl-webauthn-verifier/src/lib.rs` (`MS_TPM_ROOT_2014_SHA256`) |
+<!-- INVARIANT: CHAIN-PINNED-ROOT -->
+<!-- INVARIANT: CHAIN-PATHLEN -->
 | AAGUID allow-list | `08987058-cadc-4b81-b6e1-30de50dcbe96` (software TPM), `9ddd1817-af5a-4672-a2b9-3e3dd95000a9` (hardware TPM) | `STRICT_AAGUIDS` |
 | Bridge binary | SHA-256 recorded at enrollment, re-checked on every authentication | credential record `bridge_sha256`; `logic.rs` pin step |
 | COSE algorithms | `{-7 ES256, -257 RS256, -8 EdDSA}` | `crates/wsl-webauthn-verifier/src/cose.rs` |
@@ -137,17 +142,25 @@ crates never enable that feature, so it cannot weaken the production path.
 
 - `clientDataJSON`: exact `type` (`webauthn.get`), `challenge` compared on
   **decoded** bytes, `origin` byte-equal to the pinned constant, valid UTF-8.
+  <!-- INVARIANT: ASSERTION-CLIENTDATA-TYPE-EXACT, ASSERTION-CLIENTDATA-CHALLENGE-DECODED, ASSERTION-CLIENTDATA-ORIGIN-PINNED -->
 - `authenticatorData`: `rpIdHash == SHA-256(RP_ID)`; **UP = 1**; **UV = 1**;
   length bounds.
+  <!-- INVARIANT: ASSERTION-RPIDHASH, ASSERTION-UP-UV, AUTHDATA-ED-GATES-TRAILING, AUTHDATA-CANONICAL-COSE-FIRST, CBOR-EXACT-NO-TRAILING, CBOR-NO-DUPLICATE-KEYS -->
 - Credential id returned == enrolled id.
+  <!-- INVARIANT: ASSERTION-CREDENTIAL-ID-BINDING -->
 - COSE key: allow-listed `alg`, P-256 uncompressed point-on-curve, RSA
   `n` in 2048..=4096, Ed25519 `x` 32 bytes.
+  <!-- INVARIANT: COSE-ALG-ALLOWLIST, COSE-P256-UNCOMPRESSED-ON-CURVE, COSE-RSA-MODULUS-SIZE, COSE-RSA-EXPONENT, COSE-ED25519-X-LENGTH, COSE-KTY-ALG-CONSISTENCY -->
 - Signature: ES256 (DER), RS256 (PKCS#1 v1.5), EdDSA (`verify_strict`) over
   `authenticatorData ‖ SHA-256(clientDataJSON)`.
+  <!-- INVARIANT: ASSERTION-SIGNED-MESSAGE-DEFINITION -->
 - Signature-counter clone signal per WebAuthn §7.2 step 22 (advisory; Windows
   Hello reports a constant counter and the store is not written back).
+  <!-- INVARIANT: ASSERTION-COUNTER-POLICY -->
 
 ### Verified invariants (attestation)
+
+<!-- INVARIANT: ATTESTATION-ALLOW-UNATTESTED-OPT-IN, TPM-CERTINFO-BINDING, TPM-PUBAREA-KEYBITS, TPM-AIK-EKU-REQUIRED, TPM-AIK-KEYUSAGE-DIGITALSIGNATURE, CHAIN-LEAF-V3-AND-CA-FALSE, CHAIN-PACKED-OU, CHAIN-AAGUID-EXT-MATCH, CHAIN-ATTSTMT-ALG-MATCH, CHAIN-ISSUER-SUBJECT-LINK, CHAIN-VALIDITY-WINDOW -->
 
 - `tpm` (§8.3): `ver == "2.0"`, `certInfo` magic/type, `extraData ==
   H(authData ‖ clientDataHash)`, `name` recomputed from `pubArea`, AIK `sig`
@@ -164,6 +177,7 @@ crates never enable that feature, so it cannot weaken the production path.
   dispatch, so self and `none` (admitted under `AllowUnattested`) cannot bypass
   it. Assertions do not enforce an AAGUID allow-list; the assertion path does not
   trust or compare an AAGUID.
+  <!-- INVARIANT: AAGUID-ALLOWLIST-EVERY-ATTESTATION-PATH -->
 - Self/`none` attestation: admitted **only** under explicit
   `AttestationPolicy::AllowUnattested` — never a silent fallback. The policy is
   permissive, not prescriptive: a fully verified `tpm`/`packed` attestation is
@@ -182,10 +196,13 @@ crates therefore require `panic = "unwind"` (the Cargo default). Each crate root
 carries a `#[cfg(not(panic = "unwind"))] compile_error!` guard, so a
 `panic = "abort"` profile fails the build rather than silently disabling the
 fail-closed mapping.
+<!-- INVARIANT: PAM-BUILD-PANIC-UNWIND, MSRV-1.88 -->
 
 ---
 
 ## Enrollment security properties
+
+<!-- INVARIANT: ENROLL-VERIFY-BEFORE-PERSIST, ENROLL-DOUBLE-ENROLL-DISCARDS-FIRST, ENROLL-REPLACE-ORPHAN-GUARD, ENROLL-STORAGE-ERROR-FAILS-CLOSED, STORE-ROOT-ONLY-OWNERSHIP-MODE, STORE-SYMLINK-HARDENED, STORE-ATOMIC-NO-TEMP-LEFTOVER, STORE-BOUNDED-READS, STORE-MODE-VALIDATED-ON-LOAD -->
 
 - **Attestation verified before the anchor is written.** The CLI builds the
   enrollment `clientDataJSON`, runs the ceremony, and only writes a record after
@@ -218,6 +235,8 @@ fail-closed mapping.
 ## PAM fail-closed mapping (summary)
 
 From `crates/wsl-webauthn-pam/src/lib.rs`:
+
+<!-- INVARIANT: PAM-ONE-SUCCESS-PATH, PAM-PANIC-ABORT, PAM-NON-AUTH-EXPORTS, PAM-FAIL-DELAY -->
 
 | Situation | PAM code |
 |---|---|

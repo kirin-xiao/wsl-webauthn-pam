@@ -36,6 +36,12 @@
 //! | policy | `tpm`/`packed`+x5c accepted under both policies; self/`none` only under [`AttestationPolicy::AllowUnattested`] |
 //! | AAGUID | authData AAGUID must be one of [`STRICT_AAGUIDS`] on every verified **attestation** path (assertions do not enforce an AAGUID allow-list); enforced before format dispatch, so no arm can bypass it |
 //!
+//! The checker `.github/scripts/check-doc-invariants.py` maps each row above to
+//! the test that pins it (`INVARIANT:` tags in the source and in `SECURITY.md`);
+//! a claim without a matching, direction-consistent test fails CI.
+//!
+//! <!-- INVARIANT: ASSERTION-CLIENTDATA-TYPE-EXACT, ASSERTION-CLIENTDATA-CHALLENGE-DECODED, ASSERTION-CLIENTDATA-ORIGIN-PINNED, ASSERTION-RPIDHASH, ASSERTION-UP-UV, ASSERTION-CREDENTIAL-ID-BINDING, COSE-ALG-ALLOWLIST, COSE-P256-UNCOMPRESSED-ON-CURVE, COSE-RSA-MODULUS-SIZE, COSE-RSA-EXPONENT, COSE-ED25519-X-LENGTH, COSE-KTY-ALG-CONSISTENCY, ASSERTION-SIGNED-MESSAGE-DEFINITION, CHAIN-PINNED-ROOT, CHAIN-PATHLEN, CHAIN-LEAF-V3-AND-CA-FALSE, CHAIN-PACKED-OU, CHAIN-AAGUID-EXT-MATCH, CHAIN-ATTSTMT-ALG-MATCH, CHAIN-ISSUER-SUBJECT-LINK, CHAIN-VALIDITY-WINDOW, TPM-CERTINFO-BINDING, TPM-PUBAREA-KEYBITS, TPM-AIK-EKU-REQUIRED, TPM-AIK-KEYUSAGE-DIGITALSIGNATURE, ATTESTATION-ALLOW-UNATTESTED-OPT-IN, AAGUID-ALLOWLIST-EVERY-ATTESTATION-PATH -->
+//!
 //! # `tpm` vs `packed` rule asymmetry
 //!
 //! The two AttCA profiles deliberately apply **different leaf rules**, because the

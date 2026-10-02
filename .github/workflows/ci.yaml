@@ -17,6 +17,7 @@ name: CI
 #   machete     lint for genuinely unused manifest dependencies
 #   actionlint  lint the workflow YAML itself
 #   pam-profile SR-21 / acceptance 5: real pam-auth-update expansion guard
+#   doc-invariants  Theme #1: documented invariants map to tests (L1-1/L13-6 class)
 #   fuzz-smoke  nightly cargo-fuzz smoke (pinned 0.13.2, locked, artifacts on failure)
 
 on:
@@ -328,6 +329,29 @@ jobs:
 
       - name: assert expansion (SR-21)
         run: python3 .github/scripts/check-pam-profile.py /etc/pam.d/common-auth
+
+  # Theme #1 / testing-roadmap #9: the documented security invariants
+  # (`SECURITY.md`, the verifier trust table) are a specification that nothing
+  # forced to match the code. This guard maps each `<!-- INVARIANT: ... -->`
+  # claim to the test that pins it and fails when a claim has no test, a mapped
+  # test no longer exists, or a mapped negative test stopped asserting the
+  # documented direction. It is the CI teeth for the L1-1/L1-2/L13-6 class.
+  doc-invariants:
+    name: documented invariants map to tests (Theme #1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # 1. Unit-test the checker against synthetic inputs (marker extraction,
+      #    body matching, direction enforcement, unknown markers).
+      - name: checker self-test
+        run: python3 .github/scripts/check-doc-invariants.py --self-test
+
+      # 2. The real gate: every documented invariant resolves to an existing,
+      #    direction-consistent test. Known-uncovered invariants are reported
+      #    distinctly and do not fail the job.
+      - name: check documented invariants
+        run: python3 .github/scripts/check-doc-invariants.py
 
   fuzz-smoke:
     name: fuzz smoke (nightly)
