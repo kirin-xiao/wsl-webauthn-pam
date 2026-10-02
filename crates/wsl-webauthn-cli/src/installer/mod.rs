@@ -1530,15 +1530,17 @@ pub(crate) fn enable_profile(
 fn print_lockout_guidance(enroll_cmd: &str) {
     println!();
     println!("Lockout safety:");
-    println!("  * Keep at least one of `sudo`/`su` working with a password while you test.");
+    println!("  * Once enabled, the profile is fail-through ([success=end default=ignore]):");
+    println!("    a failed or absent Hello attempt falls back to the next method, normally");
+    println!("    your password. Keep the account's local password working.");
     println!("  * The profile is not enabled yet; run `sudo pam-auth-update` and");
     println!("    select \"WSL WebAuthn authentication\" when you are ready.");
     println!("  * Enroll a credential before relying on the module: `sudo {enroll_cmd} enroll`");
     println!("  * Manual alternative (add to /etc/pam.d/common-auth above the password line):");
     println!("        auth sufficient pam_wsl_webauthn.so");
-    println!("  * If sudo/su breaks, recover WITHOUT relying on the broken login:");
-    println!("      WSL: from a Windows terminal, open a root shell for this distro and");
-    println!("           remove the module line:");
+    println!("  * If sudo/su breaks, recover from outside the broken login:");
+    println!("      WSL: from a Windows terminal, open a root shell for this distro;");
+    println!("           it bypasses PAM entirely:");
     println!("             wsl.exe -d <distro> -u root");
     println!("             # then edit /etc/pam.d/* (or run");
     println!("             #   pam-auth-update --remove wsl-webauthn)");

@@ -1,210 +1,150 @@
 # wsl-webauthn-pam
 
-Authenticate `sudo`/`su` on WSL with the **Windows Hello WebAuthn platform
-authenticator** (`webauthn.dll`, TPM-backed) — with **all cryptographic
-verification performed on the Linux side**.
+[![CI](https://github.com/kirin-xiao/wsl-webauthn-pam/actions/workflows/ci.yaml/badge.svg)](https://github.com/kirin-xiao/wsl-webauthn-pam/actions/workflows/ci.yaml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange?logo=rust&logoColor=white)](#other-ways-to-install)
+[![Windows 10 1903+ · WSL2](https://img.shields.io/badge/Windows-10%20build%201903%2B%20%C2%B7%20WSL2-0078D6?logo=windows&logoColor=white)](#requirements)
 
-An independent rewrite of
-[WSL-Hello-sudo](https://github.com/nullpo-head/WSL-Hello-sudo) that keeps the
-reusable-Hello-gesture idea but replaces its `KeyCredentialManager` RSA-signing
-oracle with a real WebAuthn / FIDO2 ceremony. The legacy PEM is never imported;
-every user re-enrolls from scratch.
+**Passwordless `sudo` and `su` inside WSL2, authenticated with the Windows
+Hello passkey you already use — with every cryptographic decision made on the
+Linux side.**
 
-- Repository: **https://github.com/kirin-xiao/wsl-webauthn-pam**
-- Releases (binaries + `SHA256SUMS`): <https://github.com/kirin-xiao/wsl-webauthn-pam/releases>
-- License: [MIT](LICENSE)
+`wsl-webauthn-pam` is a Linux PAM module plus a tiny Windows helper. Run
+`sudo`, a Windows passkey prompt appears; approve it with your PIN,
+fingerprint, or face and you are done. Decline it, and `sudo` falls back to
+your password exactly as before.
 
----
+It is a pure PAM module — it does not fork or replace `sudo`, does not touch
+`sudoers`, and works for anything that authenticates through PAM. It is an
+independent rewrite of
+[WSL-Hello-sudo](https://github.com/nullpo-head/WSL-Hello-sudo) built on the
+real Windows WebAuthn / FIDO2 platform authenticator instead of the legacy
+project's `KeyCredentialManager` signing oracle (see
+[Prior art](#prior-art)).
 
-## What it does
+> **Status.** 0.1.0 is the initial release. Windows Hello credentials from
+> WSL-Hello-sudo are **not** migrated: the legacy key is never imported and
+> every user re-enrolls from scratch. Bug reports and feedback are welcome.
 
-When a user runs `sudo` (or `su`), PAM calls `pam_wsl_webauthn.so`, which mints
-a fresh 32-byte challenge, builds `clientDataJSON` with the pinned origin, and
-loads the enrolled credential record. It spawns `WSLWebAuthnBridge.exe` as the
-Windows user over WSL interop (framed stdio; no shell, no temp files); the bridge
-runs `WebAuthNAuthenticatorGetAssertion` (`UV=REQUIRED`, platform) — the Windows
-Hello prompt — and relays `{authenticatorData, signature, credentialId,
-clientDataJSON echo}`, deciding nothing.
+## Highlights
 
-Linux-side root code then verifies the client data, `rpIdHash`, UP/UV,
-credential-id binding, COSE key structure, and the signature over
-`authenticatorData ‖ SHA-256(clientDataJSON)`, returning `PAM_SUCCESS` only if
-every check passes; every other path is fail-closed.
+- **A real WebAuthn ceremony, not a signing oracle.** Enrollment verifies the
+  TPM attestation chain up to the pinned **Microsoft TPM Root CA 2014**; every
+  `sudo` verifies a signature over a fresh, Linux-minted challenge.
+- **All trust stays on Linux.** The Windows helper (`WSLWebAuthnBridge.exe`)
+  relays bytes and decides nothing. Root-owned Linux code verifies every
+  byte it receives: RP ID hash, user-presence and user-verification flags,
+  credential binding, and the signature itself.
+- **Fail-closed by construction.** Exactly one code path returns success. A
+  missing config, interop failure, timeout, or unreadable credential store
+  denies Hello and falls through to the next PAM method.
+- **The bridge binary is pinned.** Its SHA-256 is recorded at enrollment and
+  re-checked on every authentication — a replaced `.exe` is never launched,
+  and there is no flag to disable the check.
+- **No shells, no temp files, no OpenSSL.** The bridge is spawned with framed
+  stdio over WSL interop; the verifier is pure Rust (`#![forbid(unsafe_code)]`)
+  over a root-only, symlink-hardened credential store.
+- **Observable.** `probe`, `status`, and `verify` answer "why didn't it work?"
+  in seconds, and every decision is logged to the auth journal — no more
+  debugging blind through `su`.
 
-Enrollment uses `WebAuthNAuthenticatorMakeCredential` (`attestation = DIRECT`,
-`UV = REQUIRED`, platform attachment, non-resident credential) and verifies the
-**attestation chain to a pinned Microsoft TPM root CA** before writing the trust
-anchor.
-
----
-
-## Security model
-
-[SECURITY.md](SECURITY.md) is the canonical threat model and citations. In
-short: enrollment verifies `tpm`/`packed` attestation to the pinned Microsoft
-TPM Root CA 2014 with a Windows Hello AAGUID (unattested keys require
-`--allow-unattested`); the RP ID and origin are compile-time constants
-(`wsl-webauthn-pam`), asserted byte-for-byte on the Linux
-side and never carried on the wire; and the module refuses to launch a bridge
-whose SHA-256 differs from the digest pinned at enrollment. One root-owned
-credential record is kept per Linux user; the signature counter is compared and,
-after each successful counter-maintaining assertion, advanced to the last seen
-value (advisory on Windows Hello, which reports a constant counter), with
-challenge freshness as the main gate. Windows shows `Passkey for
-wsl-webauthn-pam` (the RP ID, not a friendly name); the
-Linux-side `pam_conv` notice names the service and user — emitted even under
-`PAM_SILENT` when a terminal is attached, silenceable with the `quiet` argument.
-
-### Limits and accepted residual risk
-
-- **Scoped to a pinned RP ID, not a browser-grade origin.** The guarantee is
-  "bound to this pinned RP ID"; a native Win32 client is not origin-enforced the
-  way a browser is.
-- **A compromised Windows session can consent-phish.** It can initiate
-  ceremonies (subject to user verification) and replace the bridge `.exe`, but
-  cannot achieve silent root or forge an assertion for an enrolled credential.
-- **Consent blinding is mitigated, not eliminated.** The OS cannot prove which
-  process raised the ceremony.
-- **Not a roaming authenticator.** Machine loss or reset means re-enrollment.
-  Replaced or superseded Windows keys are orphaned but not removable (Windows
-  exposes no API to enumerate or delete non-resident credentials).
-- **No hardware side-channel defense.** TPM/platform behavior is trusted as-is;
-  compromised Linux root is out of scope by definition.
-
-### Enrollment and unattested keys
-
-A first-ever enrollment for an RP ID can return an unattested (`fmt: "none"`)
-credential. Under Strict the CLI discards it and re-runs one ceremony with a
-fresh challenge; only a strictly verified credential is persisted, and if the
-retry is still unattested, enrollment fails.
-
-`--allow-unattested` admits `self` and `none` for TPM-less machines (recorded
-`mode: "unattested-opt-in"`, `verified: false`); a `tpm`/`packed` attestation is
-still recorded as `strict`. It is never a silent fallback — only use it on
-machines you control.
-
----
-
-## Requirements
-
-- **Windows 10 1903+** (build 18362) with `webauthn.dll`. The client-data echo
-  field is used when `ASSERTION.dwVersion >= 6` and absent otherwise.
-- **WSL2 with interop enabled** (WSL1 untested), reachable from the process that
-  runs PAM — systemd services may not see the session leader.
-- **A Windows Hello gesture** (PIN, fingerprint, or face), TPM-backed for the
-  default policy.
-- **A Linux distro with PAM**, plus `pam-auth-update` for the packaged profile.
-  `libpam0g-dev` is needed to build the module and run the `pam_start` tests
-  (which require **libpam ≥ 1.4**).
-- **Stable Rust** to build from source (pinned by `rust-toolchain.toml`;
-  `rust-version = 1.88`, edition 2024 — 1.88 is required for let-chains).
-
----
-
-## Installation
-
-### One command
+## Quick start
 
 ```sh
 curl -fsSL https://github.com/kirin-xiao/wsl-webauthn-pam/releases/latest/download/bootstrap.sh | sudo bash
 ```
 
-This downloads the latest release, verifies the tarball against `SHA256SUMS`, and
-best-effort verifies the signed build-provenance attestation when `gh` is
-installed (a tooling failure there warns but does not abort — the checksum is the
-hard gate). It then installs everything, runs the Windows Hello enrollment
-ceremony, and enables the profile. On success it reports:
+This downloads the latest release, verifies the tarball against the published
+`SHA256SUMS` (the hard gate), best-effort verifies the signed
+build-provenance attestation when the `gh` CLI is installed, then provisions
+the module, bridge, config, and PAM profile, runs the Windows Hello enrollment
+ceremony, and enables the profile — only after a verified credential. On
+success it prints:
 
-```
+```text
 Done. `sudo` now uses Windows Hello.
+  If you decline the Hello prompt, sudo falls back to your password.
   Test it:  sudo -k; sudo true
+  Add another user later:  sudo /usr/local/bin/wsl-webauthn-pam enroll
 ```
 
-`bootstrap.sh` hands the installer the controlling terminal (when one exists), so
-the Windows Hello dialog and the installer's prompts work even though the script
-arrived on stdin. Pass installer flags after `-s --`, and pin a release with
-`--version`:
+Two Windows dialogs appear during enrollment: first a *save your passkey*
+confirmation, then your PIN or biometric. The dialog can open behind the
+terminal — the CLI announces each prompt and the bridge flashes its taskbar
+button. **Type your PIN into the Windows dialog, never the terminal.**
+
+Pass options through to the installer, or pin a release:
 
 ```sh
 curl -fsSL .../bootstrap.sh | sudo bash -s -- --allow-unattested
 curl -fsSL .../bootstrap.sh | sudo bash -s -- --version v0.1.0
 ```
 
-Prefer to read before you run? Download `bootstrap.sh`, inspect it, then run it
-(optionally verify its build provenance first, if you have `gh`):
+Prefer to read before you run? Security tooling should make that easy:
 
 ```sh
 curl -fsSLO https://github.com/kirin-xiao/wsl-webauthn-pam/releases/latest/download/bootstrap.sh
-gh attestation verify bootstrap.sh -R kirin-xiao/wsl-webauthn-pam
+gh attestation verify bootstrap.sh -R kirin-xiao/wsl-webauthn-pam   # optional
 less bootstrap.sh
 sudo bash bootstrap.sh
 ```
 
+## Requirements
+
+- **Windows 10 1903+** (build 18362) — anything that runs WSL2 today has
+  `webauthn.dll`.
+- **WSL2 with interop enabled** (WSL1 is untested). Note that systemd services
+  may not see the interop session leader, so Hello can work from an
+  interactive shell but not from a service.
+- **Windows Hello set up** — PIN, fingerprint, or face. TPM-backed for the
+  default enrollment policy.
+- **A Linux distro with PAM.** The packaged profile uses `pam-auth-update`
+  (Debian/Ubuntu family); on other distros the installer prints the exact
+  manual `/etc/pam.d` instructions instead.
+- **To build from source:** stable Rust (1.88+, edition 2024) and
+  `libpam0g-dev` on Debian/Ubuntu.
+
+## Other ways to install
+
 ### Two commands (pre-provision)
 
-To install without enrolling (for example, provisioning many machines and
-enrolling per user later), split the two phases:
+Provision first, enroll later — for fleet provisioning or enrolling each user
+individually:
 
 ```sh
 sudo wsl-webauthn-pam install --skip-enroll   # provision; profile left disabled
 sudo wsl-webauthn-pam enroll                  # enroll; enables the profile on success
 ```
 
-`enroll` requires `install` to have run first.
+`install` also supports `--dry-run`, `--yes`/`-y`, and `--non-interactive` for
+scripted provisioning, and `enroll --user <NAME>` for a user other than the
+invoking one. The profile is deliberately enabled **only after a credential is
+verified**; a skipped, declined, or failed enrollment leaves it disabled and
+prints the exact recovery commands.
 
 ### From source
 
 ```sh
 git clone https://github.com/kirin-xiao/wsl-webauthn-pam
 cd wsl-webauthn-pam
-make release                            # or: cargo build --release --locked
+make release                            # builds the Linux module + CLI and the Windows bridge
 tar xzf build/wsl-webauthn-pam-<version>-<arch>.tar.gz -C build
 sudo build/wsl-webauthn-pam-<version>-<arch>/wsl-webauthn-pam install
 ```
 
-Any of these copies the CLI to `/usr/local/bin/wsl-webauthn-pam`, so afterwards
-the short command works from any directory and survives deleting the unpacked
-tree. If `/usr/local/bin` is not on your `PATH`, use the absolute path or add it.
+`install` copies the CLI to `/usr/local/bin/wsl-webauthn-pam`, so the short
+command works from any directory afterwards. The bridge builds natively with
+`cargo.exe` on Windows (what CI ships) or cross-compiles on Linux with
+`rustup target add x86_64-pc-windows-gnu`.
 
-`install` (running as root) will:
+<details>
+<summary><strong>Manual installation (no installer)</strong></summary>
 
-1. Locate the Windows mount root from `/etc/wsl.conf` (`/mnt/c` by default;
-   override with `--win-mnt`), resolve `%LOCALAPPDATA%` via `cmd.exe`, copy the
-   bridge there, and record its SHA-256 pin.
-2. Install `pam_wsl_webauthn.so` into the module directory (detected via
-   `pam_unix.so`, or set with `--module-dir`; the `.so` and bridge are found in
-   the release layout, `target/`, or `build/`, overridable with
-   `--artifact-dir <DIR>` or `$WSL_WEBAUTHN_ARTIFACTS`).
-3. Write `/etc/wsl_webauthn/config` (`0600` root), create
-   `/etc/wsl_webauthn/credentials/` (`0700` root), and install the
-   `pam-auth-update` profile to `/usr/share/pam-configs/wsl-webauthn`
-   (`Default: no` — `install`/`enroll` enable it only after a credential is
-   verified).
-4. Install the CLI itself to `/usr/local/bin/wsl-webauthn-pam` (`0755` root).
-5. Offer to remove the legacy `wsl-hello` profile and rewrite stale
-   `pam_wsl_hello` references in `/etc/pam.d/*` (with confirmation and backup),
-   never importing the legacy PEM.
-6. Offer to set up Windows Hello as a **single** action (default yes): enroll the
-   invoking user and, only on success, run
-   `pam-auth-update --enable wsl-webauthn`. A failure leaves the profile
-   disabled and prints the exact recovery commands. `--skip-enroll` stops before
-   enrollment; `--yes` answers yes to every prompt; `--dry-run` previews without
-   writing; `--non-interactive` never reads stdin.
-
-If `pam-auth-update` is missing (non-Debian), `install` prints manual
-`/etc/pam.d` instructions instead, and cannot enable the profile for you.
-
-`enroll` prints a short notice before the ceremony and a line when the second dialog
-appears. The Windows Hello dialog can open behind the terminal, and the save dialog may
-be followed by a PIN prompt; the bridge makes a best-effort attempt to raise it (or
-flash its taskbar button). See Troubleshooting.
-
-### Manual installation (no installer)
-
-1. Copy `pam_wsl_webauthn.so` to the PAM security directory: e.g.
+1. Copy `pam_wsl_webauthn.so` to the PAM security directory, e.g.
    `/usr/lib/x86_64-linux-gnu/security/` (Debian/Ubuntu) or
    `/usr/lib64/security/` (RHEL/Fedora).
-2. Copy the bridge onto the Windows side (any path; the config pins it).
+2. Copy `WSLWebAuthnBridge.exe` anywhere onto the Windows side; the config
+   pins its path.
 3. Write `/etc/wsl_webauthn/config` as root, mode `0600`:
 
    ```toml
@@ -213,231 +153,282 @@ flash its taskbar button). See Troubleshooting.
    # timeout_secs = 60        # optional override
    ```
 
-4. `sudo install -d -m 0700 -o root -g root /etc/wsl_webauthn/credentials`
-5. Enroll: `sudo wsl-webauthn-pam enroll --no-enable` (the profile is added by
-   hand in the next step rather than via `pam-auth-update`)
-6. Add a line to the relevant service (e.g. `/etc/pam.d/sudo`):
+4. Create the credential store:
+   `sudo install -d -m 0700 -o root -g root /etc/wsl_webauthn/credentials`
+5. Enroll: `sudo wsl-webauthn-pam enroll --no-enable`
+6. Add the module to the relevant service (e.g. `/etc/pam.d/sudo`):
 
-   ```
+   ```text
    auth sufficient pam_wsl_webauthn.so
    ```
 
-   Or use the profile as shown above. `[success=end default=ignore]` is the
-   `pam-auth-update` idiom (expanded to a computed jump); `end` is not a literal
-   PAM action.
+   Or use the packaged `pam-config` profile with
+   `pam-auth-update --enable wsl-webauthn`. The profile's
+   `[success=end default=ignore]` control is the `pam-auth-update` idiom;
+   `pam-auth-update` expands it to a computed jump (`end` is not a literal
+   PAM action, so do not paste it raw into `/etc/pam.d`).
 
-### The lockout warning
+</details>
 
-**Keep at least one working `sudo`/`su` path that does not go through this
-module.** The module is **fail-closed**: any provisioning error (missing config,
-unreadable store, bridge transport failure, interop unavailable, pin mismatch,
-timeout) denies Hello for that PAM service and only falls through to the *next*
-method when the stack says so (under `sufficient`, or under
-`[success=end default=ignore]`). Keep a root shell or the local password
-available, and test with a non-critical service first.
+## How it works
 
-**If you do get locked out**, WSL has no virtual console (`Ctrl-Alt-F2`) to fall
-back to, so open a root shell from the Windows side:
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as You
+    participant P as sudo/PAM stack
+    participant M as pam_wsl_webauthn.so
+    participant B as WSLWebAuthnBridge.exe
+    participant H as Windows Hello
+
+    U->>P: sudo whoami
+    P->>M: authenticate "alice"
+    M->>M: load the credential record, mint a fresh 32-byte challenge
+    M->>B: spawn over WSL interop — framed stdio, no shell, no temp files
+    B->>H: WebAuthNAuthenticatorGetAssertion, user verification required
+    H->>U: passkey prompt — PIN, fingerprint, or face
+    U-->>H: gesture
+    H-->>B: assertion
+    B-->>M: relay authenticatorData, signature, credentialId
+    M->>M: verify rpIdHash, UP/UV flags, credential binding, signature
+    M-->>P: PAM_SUCCESS — every other path is fail-closed
+    P-->>U: done
+```
+
+Everything the bridge returns is treated as untrusted input. The bridge holds
+no keys and makes no decisions — a malicious bridge can fail, stall, or
+attempt consent phishing, but it cannot forge an accepted assertion.
+
+**What you see.** On `sudo`, the module prints a one-line cue naming the
+service and the Linux user being elevated (for example: *Windows Hello:
+authenticating 'sudo' for Linux user alice — a Windows passkey prompt is
+waiting; check the taskbar and do not type here*). The Windows dialog is
+titled *Sign in with a passkey* and shows **Passkey for wsl-webauthn-pam** —
+that is the pinned relying-party ID, not a configurable display name.
+
+**Decline and cancel.** Cancelling the prompt is an ordinary failure: `sudo`
+falls through to the password prompt (with a short delay), and everything
+behaves as if the module were not installed.
+
+**Enrollment.** `enroll` runs the matching make-credential ceremony with
+`attestation = DIRECT`, verifies the attestation chain to the pinned
+Microsoft TPM root, and only then writes a root-owned credential record. A
+first-ever enrollment can come back unattested; under the default policy it
+is discarded and retried once with a fresh challenge, and enrollment fails
+unless a strictly verified credential is produced.
+
+## Security
+
+The short version:
+
+- **Attested enrollment.** `tpm`/`packed` attestation must chain to the pinned
+  **Microsoft TPM Root CA 2014** with a Windows Hello AAGUID. A software key
+  is refused by default; `--allow-unattested` exists for TPM-less machines
+  you control, is recorded in the credential record, and is never a silent
+  fallback.
+- **Pinned RP ID and origin.** Compile-time constants, asserted byte-for-byte
+  on the Linux side, never carried on the wire.
+- **Pinned bridge.** The `.exe` is hash-checked on every launch, using the
+  same file descriptor it executes.
+- **Hardened store.** One root-owned credential record per Linux user
+  (`0700`/`0600`), symlink-refusing, swap-detecting, atomic-write, and
+  bounded-read.
+- **No surprises.** No telemetry, no accounts, and no network at
+  authentication time. The only network use is the release download you run
+  yourself.
+
+The full threat model — attacker capabilities, the verified-invariant list,
+and how each error path is fail-closed — lives in
+[SECURITY.md](SECURITY.md). Honest limits, in short:
+
+- A compromised Windows session already has Linux root via `wsl.exe -u root`
+  — a root shell that bypasses PAM, `sudo`, and `su` entirely — so this module
+  is not a boundary against it, and a passkey prompt an attacker can raise
+  gains it nothing. Against an adversary that cannot reach WSL interop, it adds
+  a passwordless path that does not lower the bar below the existing Linux
+  password and cannot forge an assertion for an enrolled credential.
+- The guarantee is scoped to a pinned RP ID, which is not a browser-grade
+  origin guarantee for a native client.
+- Not a roaming authenticator: machine loss or reset means re-enrollment.
+  Windows exposes no API to delete non-resident credentials, so replaced
+  Hello keys are orphaned but harmless.
+- Compromised Linux root and TPM hardware attacks are out of scope by
+  definition.
+
+### Don't lock yourself out
+
+The shipped profile uses a fail-through control: it inserts
+
+```text
+auth [success=end default=ignore]  pam_wsl_webauthn.so
+```
+
+so a Hello attempt that fails, times out, or never even gets a prompt
+(module missing, credential gone, bridge broken) is **ignored** and PAM
+falls through to the next method — normally your password. Under the
+shipped configuration the module adds no new way to lose password access;
+an account with no password or a hand-edited `required`/`requisite` line
+(which the installer refuses to produce) is the exception.
+
+Rely on the account's **local password** while you test. WSL has no virtual
+console (`Ctrl-Alt-F2`), but from a Windows terminal a root shell for the
+distro **bypasses PAM entirely** and does not depend on the Linux
+configuration:
 
 ```powershell
 wsl.exe -d <distro> -u root
 ```
 
 ```sh
-# then, inside that root shell:
-pam-auth-update --remove wsl-webauthn     # or: edit /etc/pam.d/* by hand
+pam-auth-update --remove wsl-webauthn   # or: edit /etc/pam.d/* by hand
 ```
-
-On a non-WSL Linux host, switch to another TTY/console (`Ctrl-Alt-F2`, or
-serial/SSH) and remove the module line.
-
----
 
 ## Using the CLI
 
-`wsl-webauthn-pam <COMMAND> [OPTIONS]`
+`wsl-webauthn-pam <COMMAND> [OPTIONS]` (installed at
+`/usr/local/bin/wsl-webauthn-pam`; `-h` prints the full usage). Operational
+failures print stable tokens you can script against — `error[not-found]`,
+`error[interop-unavailable]`, `error[bridge-integrity]`, … — and the exit
+code is `0` on success, `1` on operational failure, `2` on usage error.
 
-| Command | Purpose | Options |
-|---|---|---|
-| `enroll` | Enroll a Windows Hello credential (root); enables the profile on success | `--replace`; `--allow-unattested`; `--no-enable`; `--user <NAME>` (default `SUDO_USER` or current); `--bridge <PATH>`; `--win-mnt <PATH>` |
-| `unregister` | Remove one user's credential record (root, per-user only) | `--user <NAME>`; `--yes`, `-y` |
-| `probe` | Report interop / Hello availability and the bridge pin | `--bridge <PATH>`; `--win-mnt <PATH>` |
-| `status` | List enrolled users and the config summary | `--user <NAME>` for one full record; config and records need root |
-| `verify` | Self-test the crypto stack against a synthetic ceremony | — |
-| `install` | Provision the bridge, config, PAM module, profile and CLI (root) | `--artifact-dir <DIR>`; `--module-dir <DIR>`; `--win-mnt <PATH>`; `--allow-unattested`; `--skip-enroll`; `--dry-run`; `--yes`, `-y`; `--non-interactive` |
-| `uninstall` | Remove a credential or all components (root) | `--user <NAME>`; `--all` (also removes the CLI at `/usr/local/bin`); `--module-dir <DIR>`; `--win-mnt <PATH>`; `--yes`, `-y`; `--non-interactive` |
+| Command | What it does | Root? | Key options |
+|---|---|---|---|
+| `install` | Provision the bridge, config, module, profile, and CLI | yes | `--skip-enroll`, `--dry-run`, `--yes`, `--non-interactive`, `--allow-unattested`, `--artifact-dir`, `--module-dir`, `--win-mnt` |
+| `enroll` | Run the Windows Hello ceremony for one Linux user, then enable the profile | yes | `--replace`, `--allow-unattested`, `--no-enable`, `--user <NAME>` |
+| `unregister` | Remove one user's credential record | yes | `--user <NAME>`, `--yes` |
+| `uninstall` | Remove a credential or all components | yes | `--user <NAME>` or `--all` (also removes the CLI), `--yes`, `--non-interactive` |
+| `probe` | Report interop and Hello availability, check the bridge pin | no | `--bridge`, `--win-mnt` |
+| `status` | List enrolled users and the config summary | no (root for the records) | `--user <NAME>` for one full record |
+| `verify` | Self-test the crypto stack against a synthetic ceremony | no | — |
 
-`--bridge` and `--win-mnt` fall back to the config, then (`--win-mnt`) to
-`/mnt/c`. `--bridge` only supplies the bridge path; it does not initialize the
-store, so `install` must have run first (otherwise `enroll` fails with
-`error[not-found]` and guidance to run `install`). `--artifact-dir` falls back to
-`$WSL_WEBAUTHN_ARTIFACTS` or the current directory. A value beginning with `-`
-must use the `--flag=value` form; in the `--flag value` form a `-`-prefixed token
-is read as the next flag.
+A few real runs:
 
-Exit codes: `0` success; `1` operational failure (in `status` list mode this
-includes unreadable/corrupt credential records — re-run as root); `2` usage
-error. `enroll`, `unregister`, `install`, and `uninstall` require root; `probe`
-and `verify` run unprivileged; `status` runs unprivileged but prints
-`Config: unavailable (…); re-run as root` for the root-owned config and store.
+```console
+$ wsl-webauthn-pam verify
+verify: PASS
+  attestation: packed / StrictVerified
+  assertion:   verified (ES256)
+  negative control: tampered signature rejected
+  negative control: disallowed AAGUID rejected
 
----
-
-## Building from source
-
-```sh
-cargo build --release --workspace --locked
+$ sudo wsl-webauthn-pam probe
+Bridge:  /mnt/c/Users/kim/AppData/Local/Programs/wsl-webauthn-pam/WSLWebAuthnBridge.exe
+win_mnt: /mnt/c
+interop: OK
+api_version: 9
+Windows Hello: available
+pin:     OK (matches the enrolled bridge)
 ```
 
-Linking the `cdylib` PAM module against `libpam0g-dev` is the only build step
-that needs PAM development headers (Debian/Ubuntu:
-`sudo apt-get install -y libpam0g-dev`).
+`verify` runs the production verifier against a synthetic attestation and
+assertion — no Windows and no root needed — so `PASS` means the crypto core
+works end to end, with both negative controls (a tampered signature and a
+disallowed AAGUID) proven rejected along the way.
 
-### The Windows bridge
+### PAM module arguments
 
-Build it on Windows with **`cargo.exe`** (native MSVC — what CI ships), or
-cross-compile on Linux with the `x86_64-pc-windows-gnu` target (no admin
-needed):
-
-```sh
-rustup target add x86_64-pc-windows-gnu
-cargo build --release -p wsl-webauthn-bridge --target x86_64-pc-windows-gnu
-```
-
-`make bridge` picks `cargo.exe` when it is on `PATH` and otherwise falls back to
-the GNU cross target.
-
-### Make targets
-
-| Target | What it does |
+| Argument | Effect |
 |---|---|
-| `make` / `make all` | Linux module + CLI (release) and the Windows bridge |
-| `make bridge` | Bridge only (`cargo.exe`, else the host-matched GNU target) |
-| `make test` | `cargo test --workspace --locked` |
-| `make check` | `fmt` + `clippy` + `test` + `deny` + `machete` |
-| `make machete` | `cargo-machete`: fail on manifest dependencies no source uses |
-| `make pam-profile` | Validate the `pam-config` profile and its `pam-auth-update` expansion |
-| `make release` | Assemble `build/wsl-webauthn-pam-<version>-<arch>.tar.gz` + `build/SHA256SUMS` |
+| `quiet` | Never emit the terminal action cue |
+| `debug` | Verbose logging (never secrets) |
+| `timeout=<secs>` | Whole-ceremony deadline, clamped to `1..=600`; invalid values are logged and ignored |
 
-### Release artifact layout
+```text
+auth [success=end default=ignore] pam_wsl_webauthn.so quiet timeout=120
+```
 
-Tagging `v*` triggers the release workflow: one tarball per architecture
-containing `pam_wsl_webauthn.so`, the `wsl-webauthn-pam` CLI,
-`WSLWebAuthnBridge.exe`, `bootstrap.sh`, `pam-config`, and `README.md`, plus a
-top-level `SHA256SUMS` covering all tarballs and a top-level `bootstrap.sh` (so
-the `releases/latest/download/bootstrap.sh` URL works). `make release`
-reproduces the layout locally under `build/` (build-host arch only).
-
-Published on the [releases page](https://github.com/kirin-xiao/wsl-webauthn-pam/releases);
-verify downloads against `SHA256SUMS`. CI releases also carry a signed
-build-provenance attestation: verify with
-`gh attestation verify <file> -R kirin-xiao/wsl-webauthn-pam`.
-
----
+The same timeout can be set globally with `timeout_secs` in
+`/etc/wsl_webauthn/config` (written by `install`; a plain TOML file you can
+hand-edit).
 
 ## Troubleshooting
 
-**The module never seems to trigger, and `sudo` just asks for a password.**
-The module writes nothing to stdout; its only user-visible output is a one-line action
-cue sent through the PAM conversation. Under `PAM_SILENT` (as `sudo` sets) the cue
-requires a controlling terminal, and the `quiet` module argument suppresses it
-everywhere. Check the authentication log: `journalctl -t pam_wsl_webauthn` or your
-distro's `auth.log` (syslog facility `authpriv`). Add the `debug` module argument for
-`LOG_DEBUG` detail (never secrets).
+**`sudo` just asks for a password — the module never seems to trigger.**
+Check `sudo wsl-webauthn-pam status` first (profile enabled? credential
+present?), then the auth log: `journalctl -t pam_wsl_webauthn` or your
+distro's `auth.log` (facility `authpriv`). The `debug` module argument adds
+detail. The module writes nothing to stdout; its only terminal output is the
+one-line cue, which requires a controlling terminal under `sudo`'s silent
+mode and is suppressed entirely by `quiet`.
 
 **`install` finished but `sudo` still asks for a password.**
-Either the profile is not enabled, or the invoking user has no credential. Check with
-`sudo wsl-webauthn-pam status`, then enable the profile
-(`sudo pam-auth-update --enable wsl-webauthn`) and/or enroll
-(`sudo wsl-webauthn-pam enroll`). `install` and `enroll` enable the profile
-automatically only after a credential is verified; a skipped, declined, or failed
+Either the profile is not enabled or the invoking user has no credential —
+both are visible in `status`. Enable with
+`sudo pam-auth-update --enable wsl-webauthn` and enroll with
+`sudo wsl-webauthn-pam enroll`. Install and enroll enable the profile
+automatically **only after a verified credential**; a failed or declined
 enrollment leaves it disabled on purpose.
 
-**The Windows Hello prompt appears in the background.**
-The bridge passes the current foreground window as the prompt's owner and makes a
-best-effort attempt to raise the dialog when it appears (falling back to flashing its
-taskbar button). WSL focus handling can still leave it behind, especially when another
-app (e.g. a browser) is actively in front; watch the taskbar for the Windows Security
-icon and click it.
-The CLI announces the second (PIN) dialog and the module names the service, so you know
-a prompt is expected; type the PIN into the **dialog**, never the terminal. Because
-`sudo` authenticates in silent mode, the module emits its cue only when a terminal is
-attached; add the `quiet` module argument to silence it entirely.
+**The Windows prompt appears behind other windows.**
+The bridge parents the prompt to your current foreground window and
+best-effort raises it (falling back to a taskbar flash), but WSL focus
+handling can still lose. Watch the taskbar for the Windows Security icon.
+Type the PIN into the **dialog**, never the terminal — the cue and the CLI
+both tell you when a prompt is up.
 
-**Interop is unavailable.**
-WSL interop needs the `binfmt_misc` `WSLInterop` registration to be `enabled`.
-Systemd services often cannot reach the session leader, so Hello may work from an
-interactive shell but not from a service. The runner fails fast (no hang) when
-the registration is missing or disabled.
+**`interop-unavailable` — the bridge never starts.**
+WSL interop needs the `WSLInterop` `binfmt_misc` registration enabled.
+Systemd services often cannot reach the session leader, so Hello may work
+from an interactive shell but not from a service. The runner fails fast
+rather than hanging.
 
-**The prompt timed out.**
-The bridge passes an advisory 55 s timeout to `webauthn.dll` *and* runs its own
-watchdog that calls `WebAuthNCancelCurrentOperation` at 55 s. The Linux runner
-enforces a hard 60 s deadline for the whole child, then `SIGKILL`s the shim and
-best-effort `taskkill.exe`s the reported Windows PID within a 5 s budget, so
-total wall time can reach about `deadline + 5 s`. Override with the
-`timeout=<secs>` module argument or `timeout_secs` in the config. The module
-argument is clamped to `1..=600` seconds; a non-numeric or out-of-range value is
-logged at `LOG_ERR` and ignored. A watchdog fire is reported as `timeout`; a
-genuine user cancel remains `user_cancelled`.
+**The prompt times out.**
+Default deadline is 60 s (55 s advisory in the dialog plus a hard Linux-side
+deadline, with up to ~5 s of cleanup). Override with the `timeout=<secs>`
+module argument or `timeout_secs` in the config, clamped to `1..=600`. A
+watchdog expiry is reported as `timeout`; pressing *cancel* in the dialog is
+`user_cancelled` and falls through to the password.
 
-**The bridge pin fails after I replaced the `.exe`.**
-That is the pin doing its job. The pin is always enforced and there is no module
-argument to disable it: re-enroll, or, if you intend to trust the new binary,
-re-run `enroll --replace`.
-
----
+**`error[bridge-integrity]` — the bridge pin fails after I replaced the `.exe`.**
+That is the pin doing its job: the digest recorded at enrollment no longer
+matches. Re-enroll (`sudo wsl-webauthn-pam enroll --replace`) to trust the
+new binary. The pin is always enforced; there is no module argument to
+disable it. Note that upgrading in place changes the `.exe` bytes (it carries
+version metadata), so upgrades re-enroll.
 
 ## FAQ
 
 **Why WebAuthn instead of the old `KeyCredentialManager`?**
-`KeyCredentialManager` gives an RSA signing oracle with an unattested,
-attacker-influenceable public key and a blind, fixed prompt. WebAuthn gives
-attestation to a pinned TPM root, RP-scoping, a focused consent-bearing prompt,
-and no signing oracle — the key signs a WebAuthn assertion whose contents are
-fully verified.
+The legacy primitive was an RSA signing oracle with an unattested,
+attacker-influenceable public key and a blind, fixed prompt — a person proved
+"a gesture happened", nothing more. WebAuthn gives attestation to a pinned
+TPM root, RP-scoping, a consent-bearing prompt, and assertions whose contents
+are fully verified on the Linux side.
 
 **Is my old WSL-Hello-sudo configuration migrated?**
-**No.** Fresh enrollment is required and the legacy PEM is **never imported**.
-The installer detects a legacy install, warns, and offers to rewrite
-`/etc/pam.d/*` references from `pam_wsl_hello` to `pam_wsl_webauthn.so` **with
-confirmation and a backup** before removing the old module.
+No. Fresh enrollment is required and the legacy PEM is never imported. The
+installer detects a legacy install and offers to rewrite stale `/etc/pam.d`
+references (with confirmation and a backup) — it never carries the old key
+over.
 
-**Multi-user semantics: can several Linux users share one Windows account?**
-Yes, and that is the normal WSL case. Each Linux user has exactly **one
-credential record** of their own, bound for audit to the Windows account/SID
-that enrolled it. There is no runtime SID check: interop always runs as the
-distro-session owner, so the "wrong" Windows account simply yields no usable
-credential.
+**Several Linux users share one Windows account — does that work?**
+Yes, and that is the normal WSL case. Each Linux user enrolls once and has
+exactly one credential record of their own, bound for audit to the Windows
+account that enrolled it.
+
+**I installed it in one distro; what about my other distros?**
+Each distro is a separate Linux system with its own `/etc/pam.d`, so install
+and enroll once per distro.
 
 **Can I use this on a machine without a TPM?**
-Only with `--allow-unattested`, and only on a machine you control. Without a TPM
-there is no attestation, so the software key is accepted on trust (see
-[Enrollment and unattested keys](#enrollment-and-unattested-keys)).
+Only with `--allow-unattested`, and only on a machine you control. Without a
+TPM there is no attestation, so the software key is accepted on trust and
+the record says so.
 
 **Does it modify `sudoers`?**
-No. It works through the PAM stack; enabling it means adding the module (or the
-`pam-auth-update` profile) to the relevant PAM service such as
-`/etc/pam.d/sudo`.
+No. Everything goes through the PAM stack.
 
----
+## Prior art
 
-## Repository layout
-
-| Path | Purpose |
-|---|---|
-| `crates/wsl-webauthn-protocol` | Shared constants + wire types + framing (no OS deps) |
-| `crates/wsl-webauthn-verifier` | Security core: pure-Rust CBOR/COSE + assertion/attestation verification |
-| `crates/wsl-webauthn-store` | Root-owned, symlink-hardened credential store and config parsing |
-| `crates/wsl-webauthn-runner` | Spawns the bridge over WSL interop with bounded IO + deadlines |
-| `crates/wsl-webauthn-bridge` | `WSLWebAuthnBridge.exe` (Windows) |
-| `crates/wsl-webauthn-pam` | `pam_wsl_webauthn.so` (Linux `cdylib`) |
-| `crates/wsl-webauthn-cli` | `wsl-webauthn-pam` (`enroll`/`probe`/`install`/…) |
-| `pam-config` | The `pam-auth-update` profile (`Default: no`) |
-| `SPIKE.md` | Empirical findings from the real Windows host |
-| `tests/vectors` | Vector provenance (no binary third-party vectors committed) |
-
----
+This project would not exist without
+[WSL-Hello-sudo](https://github.com/nullpo-head/WSL-Hello-sudo), which proved
+the reusable-Hello-gesture idea and was loved for it. `wsl-webauthn-pam` is an
+independent rewrite, not a drop-in upgrade: the trust model, the protocol, the
+installer, and the credential store are all new, and re-enrollment is required.
+The legacy project's structural weaknesses — unauthenticated enrollment of an
+attacker-influenceable public key, a blind consent dialog, and a shell-based
+installer — are what the WebAuthn ceremony, Linux-side verification, and the
+pinned-bridge design exist to fix.
 
 ## Development
 
@@ -445,10 +436,11 @@ No. It works through the PAM stack; enabling it means adding the module (or the
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
-cargo deny check           # requires: cargo install cargo-deny
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Security issues: [SECURITY.md](SECURITY.md).
+Build and PR gates, fuzzing, the cross-compiled Windows bridge, and the
+repository layout are covered in [CONTRIBUTING.md](CONTRIBUTING.md). Security
+issues: [SECURITY.md](SECURITY.md).
 
 ## License
 

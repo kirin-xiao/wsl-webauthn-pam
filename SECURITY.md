@@ -16,7 +16,7 @@ We will acknowledge the report and coordinate a fix and disclosure. Please allow
 
 ## Design principle: all trust is Linux-side
 
-The Windows bridge (`WSLWebAuthnBridge.exe`) loads `webauthn.dll`, runs the ceremony, and relays bytes; it makes no security decision and holds no trust. Every cryptographic and policy decision is made by the root-owned Linux side in the pure-Rust verifier and the PAM module (`crates/wsl-webauthn-verifier/src/lib.rs`, `crates/wsl-webauthn-pam/src/logic.rs`). A compromised bridge can only fail, stall, or attempt consent phishing — it cannot forge an accepted assertion.
+The Windows bridge (`WSLWebAuthnBridge.exe`) loads `webauthn.dll`, runs the ceremony, and relays bytes; it makes no security decision and holds no trust. Every cryptographic and policy decision is made by the root-owned Linux side in the pure-Rust verifier and the PAM module (`crates/wsl-webauthn-verifier/src/lib.rs`, `crates/wsl-webauthn-pam/src/logic.rs`). A compromised bridge can only fail, stall, or attempt consent phishing — it cannot forge an accepted assertion. This is about not trusting the helper, not about creating a privilege boundary: WSL places no privilege boundary between the Windows session and Linux root (see [Attacker with a compromised Windows session](#2-attacker-with-a-compromised-windows-session)).
 
 ---
 
@@ -32,14 +32,16 @@ The Windows bridge (`WSLWebAuthnBridge.exe`) loads `webauthn.dll`, runs the cere
 
 #### 2. Attacker with a compromised Windows session
 
+This attacker already has Linux root. `wsl.exe -u root` opens a root shell that bypasses PAM, `sudo`, and `su` entirely, and WSL interop is bidirectional — a Linux process can run a Windows binary as the Windows user, which can in turn invoke `wsl.exe -u root`. The module is therefore **not a boundary** against a compromised Windows session, and against this attacker its cryptography and hardening are moot: none of it is needed to gain root.
+
 *CAN:* initiate ceremonies (subject to Windows user verification) and thus attempt **consent phishing**; replace the bridge executable on DrvFs.
 
-*CANNOT:*
+For an adversary that cannot reach WSL interop — a Linux-local attacker with code execution but no path to spawn Windows processes (for example, a confined service without the interop session leader, or a remote attacker with Linux RCE but no Windows execution) — the following hold:
 
-- **Forge an assertion for an enrolled credential.** The signature is verified on the Linux side against the enrolled public key over a Linux-minted challenge; a replaced bridge has no private key. The bridge pin also refuses to launch a changed `.exe`; there is no module argument that disables it.
+- **Cannot forge an assertion for an enrolled credential.** The signature is verified on the Linux side against the enrolled public key over a Linux-minted challenge; a replaced bridge has no private key. The bridge pin also refuses to launch a changed `.exe`; there is no module argument that disables it.
   <!-- INVARIANT: PAM-BRIDGE-PIN-FAIL-CLOSED -->
-- **Silently raise privilege.** A successful ceremony is checked against `rpIdHash`, UP/UV, the enrolled credential id, and the signature.
-- **Enroll a software key under the default policy.** Strict attestation chains to the pinned Microsoft TPM root and requires a Windows Hello AAGUID; an unattested key is refused after the double-enroll retry.
+- **Cannot raise privilege without a fully verified assertion.** A successful ceremony is checked against `rpIdHash`, UP/UV, the enrolled credential id, and the signature.
+- **Cannot enroll a software key under the default policy.** Strict attestation chains to the pinned Microsoft TPM root and requires a Windows Hello AAGUID; an unattested key is refused after the double-enroll retry.
 
 Consent phishing — making the user approve a ceremony they did not intend — is accepted residual risk (see [residual risk](#accepted-residual-risk)).
 
@@ -54,6 +56,7 @@ Consent phishing — making the user approve a ceremony they did not intend — 
 ### Out of scope
 
 - **Compromised Linux root.** Root can rewrite the trust store, the module, and sudoers.
+- **Compromised Windows session.** It already implies Linux root via `wsl.exe -u root`; the module is not a boundary against it (see [attacker capabilities](#2-attacker-with-a-compromised-windows-session)).
 - **Compromised TPM / platform.** Platform behavior is trusted as-is.
 - **Physical/OS-level attacks on Windows** below the WebAuthn boundary.
 
@@ -142,15 +145,15 @@ From `crates/wsl-webauthn-pam/src/lib.rs`:
 
 There is exactly one path to `PAM_SUCCESS`: a fully verified assertion. Every failure path also requests `pam_fail_delay(pamh, 2_000_000)` (2 s) to blunt consent spam. No attempt counter is persisted across processes; the PAM stack owns retry policy.
 
-> **Fall-through caveat.** `PAM_USER_UNKNOWN`/`PAM_AUTHINFO_UNAVAIL` fall through to the next method only when the PAM stack is configured to allow it (`sufficient`, or `[success=end default=ignore]`). Under a required-only stack the denial is final. Keep a working fallback (see the README lockout warning).
+> **Fall-through caveat.** `PAM_USER_UNKNOWN`/`PAM_AUTHINFO_UNAVAIL` fall through to the next method only when the PAM stack is configured to allow it (`sufficient`, or `[success=end default=ignore]`). Under a required-only stack the denial is final. The shipped profile is fail-through; keep the account's local password working while the module is enabled (see [README → Don't lock yourself out](README.md#dont-lock-yourself-out)).
 
 ---
 
 ## Accepted residual risk
 
-The user-facing wording is in the [README](README.md#limits-and-accepted-residual-risk).
+The user-facing wording is in the [README](README.md#security).
 
-- **Compromised Windows session.** Ceremony initiation is possible (subject to user verification) and the bridge can be replaced, but attestation + UV + Linux-side verification mean this does **not** yield silent root and does **not** let a replaced bridge forge an assertion; it does allow **consent phishing**.
+- **Compromised Windows session.** This attacker already has Linux root via `wsl.exe -u root`, so the module is not a boundary against them. Ceremony initiation is possible (subject to user verification) and the bridge can be replaced, but attestation + UV + Linux-side verification mean an adversary that cannot reach WSL interop cannot forge an assertion or raise privilege without a verified ceremony; what remains is **consent phishing**.
 - **Compromised Linux root.** Out of scope by definition.
 - **Consent blinding is mitigated, not eliminated.** Neither WebAuthn nor a custom PAM notice can make the OS prove *which process* raised the ceremony.
 - **Not a roaming authenticator.** Machine loss/reset ⇒ re-enrollment by design. Windows cannot enumerate/delete non-resident platform credentials, so old keys from `--replace`/re-enrollment are orphaned (inert without their credential ID, which only the Linux store holds).

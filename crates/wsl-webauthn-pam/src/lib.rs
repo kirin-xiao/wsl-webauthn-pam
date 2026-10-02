@@ -88,10 +88,12 @@
 //!
 //! # Lockout guidance
 //!
-//! Enrolling this module makes Windows Hello a *requirement* for the services it is
-//! added to. Always keep at least one working `sudo`/`su` path (a second TTY, a root
-//! shell, or the local password) before enabling it, and test with a non-critical
-//! service first. See the installer's lockout warning and `SECURITY.md`.
+//! With the shipped `[success=end default=ignore]` control, Windows Hello is the
+//! *first* method for each service the module is added to. That control is
+//! fail-through: a failed or absent Hello attempt falls back to the next PAM
+//! method, normally the local password. Keep the account's password working, and
+//! test with a non-critical service first. See the installer's lockout warning and
+//! `SECURITY.md`.
 //!
 //! # Wire facts that shape this module
 //!

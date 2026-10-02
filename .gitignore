@@ -16,4 +16,6 @@ tests/vectors/local/
 *.rs.bk
 .idea/
 .vscode/
+# Local working notes (README-rewrite culled content, future WIKI material)
+/.notes/
 /release/
