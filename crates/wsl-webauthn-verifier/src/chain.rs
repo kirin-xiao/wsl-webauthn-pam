@@ -200,16 +200,27 @@ pub(crate) fn verify_chain(
         return Err(VerifyError::CertificateVersionNotV3);
     }
 
-    // BasicConstraints: CA=false on the leaf, CA=true on everything above it.
+    // BasicConstraints: CA=false on the leaf, CA=true on everything above it. Each
+    // CA's `pathLenConstraint`, when present, bounds the number of non-self-issued
+    // intermediate CA certificates that may follow it (RFC 5280 §4.2.1.9): the root
+    // in particular MUST NOT have more than one intermediate below it. The leaf is
+    // not a CA, so it does not count against any constraint.
     let leaf_bc = basic_constraints(leaf)?;
     if leaf_bc.ca {
         return Err(VerifyError::CertificateLeafIsCa);
     }
-    for cert in &parsed[1..] {
+    for (index, cert) in parsed[1..].iter().enumerate() {
         let bc = basic_constraints(cert)?;
         if !bc.ca {
             return Err(VerifyError::CertificateIntermediateNotCa);
         }
+        // Certificates below this CA toward the leaf (`parsed[..index + 1]`) are the
+        // ones pathLenConstraint counts.
+        enforce_path_len(&bc, &parsed[..index + 1])?;
+    }
+    if let Some(root) = &external_root {
+        let bc = basic_constraints(root)?;
+        enforce_path_len(&bc, &parsed[1..])?;
     }
 
     // Leaf Subject OU must be exactly "Authenticator Attestation".
@@ -267,7 +278,15 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Check that `now` lies within `[not_before, not_after]`.
+/// Check that `now` lies within the certificate's validity period.
+///
+/// Both bounds are **inclusive**, matching RFC 5280 §4.1.2.5 (the validity period
+/// includes `notBefore` and `notAfter`). This is a deliberate choice: certificate
+/// validity times have one-second granularity, so an exclusive `notBefore` would
+/// reject a certificate during the remainder of the second in which it was issued
+/// (the synthesized fixtures and any short-lived certificate are affected), while
+/// adding no security. The window is never widened beyond the certificate's own
+/// bounds.
 fn check_validity(cert: &Certificate, now: SystemTime) -> Result<(), VerifyError> {
     let validity = &cert.tbs_certificate.validity;
     let not_before = validity.not_before.to_system_time();
@@ -279,6 +298,42 @@ fn check_validity(cert: &Certificate, now: SystemTime) -> Result<(), VerifyError
         return Err(VerifyError::CertificateExpired);
     }
     Ok(())
+}
+
+/// Enforce a CA certificate's `pathLenConstraint` against the CA certificates below
+/// it toward the leaf.
+///
+/// RFC 5280 §4.2.1.9 counts only **non-self-issued** intermediate CA certificates,
+/// so a self-issued certificate (one whose subject equals its issuer) is skipped.
+/// `below_toward_leaf` is the slice of certificates from the leaf up to and including
+/// this CA (`parsed[..index + 1]`), in leaf-first order; non-CA entries — the leaf,
+/// and any certificate that already failed the CA check — are likewise skipped.
+fn enforce_path_len(
+    bc: &BasicConstraints,
+    below_toward_leaf: &[Certificate],
+) -> Result<(), VerifyError> {
+    let Some(limit) = bc.path_len_constraint else {
+        return Ok(());
+    };
+    let mut count: usize = 0;
+    for below in below_toward_leaf {
+        if is_self_issued(below) {
+            continue;
+        }
+        if basic_constraints(below).is_ok_and(|below_bc| below_bc.ca) {
+            count += 1;
+        }
+    }
+    if count > usize::from(limit) {
+        return Err(VerifyError::CertificatePathLenExceeded);
+    }
+    Ok(())
+}
+
+/// Whether a certificate is self-issued (subject equals issuer), which RFC 5280
+/// excludes from `pathLenConstraint` accounting.
+fn is_self_issued(cert: &Certificate) -> bool {
+    cert.tbs_certificate.subject == cert.tbs_certificate.issuer
 }
 
 /// Extract and parse the BasicConstraints extension, which must be present.

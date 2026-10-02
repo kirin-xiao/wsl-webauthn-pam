@@ -215,6 +215,11 @@ pub enum VerifyError {
     #[error("certificate is missing the BasicConstraints extension")]
     CertificateMissingBasicConstraints,
 
+    /// A CA certificate's `pathLenConstraint` was exceeded by the number of
+    /// non-self-issued intermediate CA certificates below it in the path.
+    #[error("certificate chain exceeds a CA certificate's pathLenConstraint")]
+    CertificatePathLenExceeded,
+
     /// The leaf Subject OU was not `Authenticator Attestation`.
     #[error("leaf certificate Subject OU is not \"Authenticator Attestation\"")]
     CertificateSubjectOuMismatch,
