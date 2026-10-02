@@ -1922,26 +1922,16 @@ fn friendly_bridge_error(error: wsl_webauthn_protocol::BridgeError) -> &'static 
     }
 }
 
-/// Render a runner transport error, disambiguating a signal-killed bridge (L8-11).
+/// Render a runner transport error, surfacing a signal-killed bridge (L8-11).
 ///
-/// `RunnerError::BridgeFailed { code: None }` means the child was terminated by a signal,
-/// but its `Display` renders a bare "status None" with no signal number. The runner type
-/// is out of this crate's scope, so the CLI can only add the interpretation.
-///
-/// **Runner-side follow-up (needed for the real fix):** replace
-/// `RunnerError::BridgeFailed { code: Option<i32>, message: String }`
-/// (crates/wsl-webauthn-runner/src/lib.rs, `bridge_failed` at ~line 916) with a
-/// `reason: ExitReason` field, `enum ExitReason { Code(i32), Signal(i32) }`, populated
-/// from `std::os::unix::process::ExitStatusExt::signal()` instead of `status.code()`
-/// (sites ~lines 506 and 682). Its `Display`/`bridge_exit_meaning` should then render
-/// "terminated by signal 9 (SIGKILL)" and a `BridgeFailed` test should `abort()` a fake
-/// bridge and assert the message names the signal. Until then this wrapper at least stops
-/// the CLI from presenting the ambiguity as a plain missing exit code.
+/// `RunnerError::BridgeFailed` now carries an [`ExitReason`](wsl_webauthn_runner::ExitReason),
+/// whose `Display` already names the signal ("signal 9 (SIGKILL)"). For a signal death the
+/// CLI appends the remediation hint; a normal exit code renders verbatim.
 fn render_runner_error(error: &wsl_webauthn_runner::RunnerError) -> String {
-    use wsl_webauthn_runner::RunnerError;
+    use wsl_webauthn_runner::{ExitReason, RunnerError};
     match error {
         RunnerError::BridgeFailed {
-            code: None,
+            reason: ExitReason::Signal(_),
             message,
         } => format!(
             "{message} (the bridge child was terminated by a signal before it could exit; \
@@ -3042,10 +3032,11 @@ mod tests {
 
     #[test]
     fn runner_bridge_failed_signal_death_is_explained() {
+        use wsl_webauthn_runner::ExitReason;
         let signal = wsl_webauthn_runner::RunnerError::BridgeFailed {
-            code: None,
-            message: "bridge exited with status None: bridge terminated by signal before \
-                      writing a response"
+            reason: ExitReason::Signal(9),
+            message: "bridge terminated by signal 9 (SIGKILL): terminated by a signal before \
+                 writing a response"
                 .to_string(),
         };
         let rendered = render_runner_error(&signal);
@@ -3053,15 +3044,17 @@ mod tests {
             rendered.contains("terminated by a signal"),
             "a signal death must be disambiguated from a missing exit code: {rendered}"
         );
+        // The runner's own message already names the signal.
+        assert!(rendered.contains("SIGKILL"), "{rendered}");
 
         // A real exit code is rendered verbatim (no signal note).
         let coded = wsl_webauthn_runner::RunnerError::BridgeFailed {
-            code: Some(3),
-            message: "bridge exited with status Some(3): malformed response".to_string(),
+            reason: ExitReason::Code(3),
+            message: "bridge exited with status 3: malformed response".to_string(),
         };
         assert_eq!(
             render_runner_error(&coded),
-            "bridge exited with status Some(3): malformed response"
+            "bridge exited with status 3: malformed response"
         );
     }
 
