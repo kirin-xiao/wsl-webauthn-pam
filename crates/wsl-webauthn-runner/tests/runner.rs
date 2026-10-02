@@ -739,3 +739,34 @@ fn decode_probe_helper() {
 fn response_cap_constant_matches_protocol() {
     assert_eq!(MAX_RESPONSE_BYTES, 64 * 1024);
 }
+
+// ---------------------------------------------------------------------------
+// L9-9: concurrency (runner-side proxy for concurrent PAM calls)
+// ---------------------------------------------------------------------------
+
+/// Several runner instances driven from separate threads at once must all succeed. This
+/// exercises the per-thread SIGPIPE mask and independent deadline/poll loops, the
+/// runner-side half of the concurrent-PAM-call gap (a real multi-`pam_handle_t` test is
+/// the PAM crate's).
+#[test]
+fn concurrent_probes_are_independent() {
+    let dir = cwd_dir();
+    let dir = dir.path().to_path_buf();
+    let mut handles = Vec::new();
+    for i in 0..8 {
+        let dir = dir.clone();
+        handles.push(std::thread::spawn(move || {
+            let r = Runner::without_interop_check(FAKE, &dir)
+                .taskkill_program("/bin/true")
+                .args(["ok", "payload=32"]);
+            let resp = r.probe(Duration::from_secs(5)).expect("probe");
+            assert!(
+                matches!(resp, RunnerResponse::Probe { .. }),
+                "thread {i}: {resp:?}"
+            );
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("thread panicked");
+    }
+}
