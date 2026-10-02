@@ -362,12 +362,6 @@ pub(crate) fn geteuid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-/// Whether a path exists as a symlink (used by tests and diagnostics).
-#[allow(dead_code)]
-pub(crate) fn is_symlink(path: &Path) -> bool {
-    lstat(path).map(Stat::is_symlink).unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
