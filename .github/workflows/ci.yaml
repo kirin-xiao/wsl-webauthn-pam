@@ -170,8 +170,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # libpam0g-dev supplies the headers and `-lpam` the C host links against;
-      # the runner also loads WSLInterop as a binfmt handler already.
+      # libpam0g-dev supplies the headers and `-lpam` the C host links against.
+      # (The WSLInterop registration the module's runner pre-flight reads is
+      # planted inside the test's mount namespace, not the runner's.)
       - name: Install libpam0g-dev
         run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
 
