@@ -869,7 +869,7 @@ impl BridgeConfig {
 
 /// Resolve the bridge path and Windows mount root from flags, then the config file.
 ///
-/// The config file is written by the installer (Wave C); until then `enroll` requires
+/// The config file is written by the installer; until then `enroll` requires
 /// the config **or** an explicit `--bridge`. `probe`/`status` degrade gracefully.
 fn resolve_bridge(
     bridge_flag: Option<PathBuf>,
@@ -906,7 +906,7 @@ fn resolve_bridge_with_store(
         None => {
             let detail = config_error.clone().unwrap_or_else(|| {
                 format!(
-                    "{} is missing (written by `install`, Wave C)",
+                    "{} is missing (run `install` to create it)",
                     store.config_path().display()
                 )
             });
@@ -1354,7 +1354,8 @@ fn uuid_string(aaguid: &[u8; 16]) -> String {
         if matches!(i, 4 | 6 | 8 | 10) {
             out.push('-');
         }
-        let _ = write!(out, "{byte:02x}");
+        // Writing to a `String` is infallible; the `Result` cannot actually be `Err`.
+        write!(out, "{byte:02x}").expect("writing to a String cannot fail");
     }
     out
 }
@@ -1485,7 +1486,7 @@ fn status_with_store(store: &Store, user: Option<String>) -> anyhow::Result<i32>
         }
         Err(StoreError::ConfigMissing { .. }) => {
             println!(
-                "Config: missing ({}); run `install` (Wave C)",
+                "Config: missing ({}); run `install`",
                 store.config_path().display()
             );
         }

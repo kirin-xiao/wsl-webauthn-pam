@@ -165,18 +165,6 @@ pub(crate) fn open_dir(path: &Path) -> io::Result<Fd> {
     Ok(Fd(fd))
 }
 
-/// `close(2)`.
-///
-/// Private to this module: the only caller is [`Fd`]'s `Drop`, so a descriptor it owns
-/// can never be closed out from under the guard.
-fn close(fd: RawFd) {
-    // SAFETY: `fd` is an owned descriptor; closing twice is caller error, and all
-    // callers close exactly once.
-    unsafe {
-        libc::close(fd);
-    }
-}
-
 /// RAII guard closing a raw fd exactly once.
 ///
 /// The inner descriptor is **private**. Callers cannot reach in with `fd.0`, re-wrap the
@@ -195,7 +183,11 @@ impl Fd {
 
 impl Drop for Fd {
     fn drop(&mut self) {
-        close(self.0);
+        // SAFETY: `self.0` is an owned descriptor; this is the sole close, so the
+        // "close exactly once" guarantee holds.
+        unsafe {
+            libc::close(self.0);
+        }
     }
 }
 

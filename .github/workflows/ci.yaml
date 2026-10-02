@@ -37,7 +37,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Fail fast if any toolchain tries to touch the network for index updates.
+  # Keep index-update retries low (the default is 3): a flaky network should surface
+  # quickly instead of masking a real dependency problem.
   CARGO_NET_RETRY: "2"
 
 jobs:

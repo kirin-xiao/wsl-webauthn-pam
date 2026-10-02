@@ -157,6 +157,7 @@ impl Config {
     ///
     /// `bridge_path`/`win_mnt` are rendered with `to_string_lossy`, mirroring the
     /// installer; non-UTF-8 paths are not representable in a TOML basic string.
+    #[must_use]
     pub fn to_toml(&self) -> String {
         // Serialize a writer type rather than `Self` because `toml` cannot round-trip a
         // `PathBuf` field (`PathBuf` serializes as a map, which is not a TOML string).

@@ -62,10 +62,10 @@ pub const SYSTEM_INTEROP_PATH: &str = "/proc/sys/fs/binfmt_misc/WSLInterop";
 /// `timeout_ms` sent to the bridge for a `probe` (plan §3).
 pub const BRIDGE_PROBE_TIMEOUT_MS: u32 = 3_000;
 
-/// Default `timeout_ms` for `enroll` (mirrors the protocol constant, plan §3).
+/// Default `timeout_ms` for `enroll`, a re-export of the protocol constant (plan §3).
 pub const BRIDGE_ENROLL_TIMEOUT_MS: u32 = wsl_webauthn_protocol::BRIDGE_ENROLL_TIMEOUT_MS;
 
-/// Default `timeout_ms` for `assert` (mirrors the protocol constant, plan §3).
+/// Default `timeout_ms` for `assert`, a re-export of the protocol constant (plan §3).
 pub const BRIDGE_ASSERT_TIMEOUT_MS: u32 = wsl_webauthn_protocol::BRIDGE_AUTH_TIMEOUT_MS;
 
 /// Maximum bytes of the child's stderr we retain (bounded capture).
@@ -608,7 +608,12 @@ impl Runner {
         // bound it by the deadline: a bridge/child that never reads stdin must never be
         // able to hang the PAM stack past its deadline.
         {
-            let stdin = guard.child_mut().stdin.take().expect("stdin was piped");
+            // `Stdio::piped()` is requested just above, so these handles always exist.
+            let stdin = guard
+                .child_mut()
+                .stdin
+                .take()
+                .expect("stdin was piped above");
             if let Err(e) = self.write_frame(stdin.as_raw_fd(), &frame, deadline) {
                 let status = guard.try_wait().ok().flatten();
                 guard.kill_and_reap();
@@ -620,8 +625,16 @@ impl Runner {
             // `stdin` is dropped here, closing the read side of the child's pipe.
         }
 
-        let stdout = guard.child_mut().stdout.take().expect("stdout was piped");
-        let stderr = guard.child_mut().stderr.take().expect("stderr was piped");
+        let stdout = guard
+            .child_mut()
+            .stdout
+            .take()
+            .expect("stdout was piped above");
+        let stderr = guard
+            .child_mut()
+            .stderr
+            .take()
+            .expect("stderr was piped above");
         self.pump(guard, stdout, stderr, deadline)
     }
 
@@ -725,12 +738,11 @@ impl Runner {
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => {
+                Err(_) => {
                     // EPIPE (child exited), EIO, or any other write error: abandon
                     // the write without failing. If the child produced a complete
                     // response it is still honored; otherwise the read path fails
                     // closed (EOF/no frame → Transport, or Timeout).
-                    let _ = e;
                     return Ok(());
                 }
             }
@@ -1445,8 +1457,16 @@ impl InteropCommand {
             source,
         })?;
         let mut guard = ChildGuard::new(child);
-        let stdout = guard.child_mut().stdout.take().expect("stdout was piped");
-        let stderr = guard.child_mut().stderr.take().expect("stderr was piped");
+        let stdout = guard
+            .child_mut()
+            .stdout
+            .take()
+            .expect("stdout was piped above");
+        let stderr = guard
+            .child_mut()
+            .stderr
+            .take()
+            .expect("stderr was piped above");
         match drive_child(
             guard,
             stdout,
