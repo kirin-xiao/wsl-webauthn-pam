@@ -55,6 +55,12 @@ Linux side.
 - The `pam_conv` notice is emitted during `sudo` (which authenticates with
   `PAM_SILENT`) when a controlling terminal is present, and suppressed for scripted
   callers or with the `quiet` module argument.
+- The PAM module now advances the stored signature counter after a successful assertion
+  from a counter-maintaining authenticator, so WebAuthn §7.2 clone detection compares
+  against the last seen count instead of the enrollment-time count. The conditional
+  write cannot resurrect an `unregister`ed record or clobber a newer enrollment, is
+  skipped for constant-zero authenticators (the common case), and can never fail an
+  authentication.
 
 ### Fixed
 

@@ -13,6 +13,13 @@
 //! There is exactly one way to return [`PAM_SUCCESS`]: a fully verified assertion.
 //! Every other path returns a specific failure code from the crate root's mapping
 //! table. No error is swallowed into success.
+//!
+//! After the success decision, the state machine may perform one **best-effort,
+//! advisory** write: advancing the stored signature counter when the authenticator
+//! reports a higher value than the record holds. That write is conditional on the
+//! record being unchanged since it was loaded, and any failure to persist it is logged
+//! and ignored — it can never turn a verified assertion into a failure, nor a failed
+//! one into a success.
 
 use std::path::Path;
 use std::time::Duration;
@@ -21,7 +28,7 @@ use wsl_webauthn_protocol::{
     BridgeError, ClientDataKind, ORIGIN, RP_ID, b64u_decode, b64u_encode, build_client_data,
 };
 use wsl_webauthn_runner::{AssertParams, RunnerError, RunnerResponse};
-use wsl_webauthn_store::{Config, CredentialRecord, StoreError};
+use wsl_webauthn_store::{Config, CredentialRecord, FileIdentity, StoreError};
 use wsl_webauthn_verifier::{AssertionCheck, VerifyError, verify_assertion};
 
 use crate::args::ModuleArgs;
@@ -37,9 +44,9 @@ pub const FAIL_DELAY_USEC: u32 = 2_000_000;
 
 /// The result of one authentication attempt.
 ///
-/// The observed signature counter is only debug-logged, so it is not part of the type;
-/// the PAM code is the failure's `code` (or `PAM_SUCCESS` for `Success`), mapped by
-/// [`run`].
+/// The observed signature counter is consumed by the post-success counter write-back, so
+/// it is not part of the type; the PAM code is the failure's `code` (or `PAM_SUCCESS` for
+/// `Success`), mapped by [`run`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthOutcome {
     /// A verified assertion. This is the only success variant.
@@ -61,8 +68,23 @@ pub enum AuthOutcome {
 pub trait Deps {
     /// Load `/etc/wsl_webauthn/config`.
     fn load_config(&self) -> Result<Config, StoreError>;
-    /// Load the credential record for `username`.
-    fn load_record(&self, username: &str) -> Result<CredentialRecord, StoreError>;
+    /// Load the credential record for `username`, together with the filesystem identity
+    /// of the file it was read from.
+    ///
+    /// The identity is threaded into [`Deps::save_record`] so a post-auth counter
+    /// write-back cannot resurrect a record removed mid-authentication or clobber a newer
+    /// enrollment (see [`wsl_webauthn_store::Store::update_if_unchanged`]).
+    fn load_record(&self, username: &str) -> Result<(CredentialRecord, FileIdentity), StoreError>;
+    /// Conditionally persist `record`, but only if the on-disk record is still the one
+    /// `load_record` returned for `expected`.
+    ///
+    /// Called after a successful authentication to advance the stored signature counter.
+    /// It is **advisory**: errors are logged and do not change the authentication outcome.
+    fn save_record(
+        &self,
+        record: &CredentialRecord,
+        expected: FileIdentity,
+    ) -> Result<(), StoreError>;
     /// SHA-256 of the file at `path`, opened `O_NOFOLLOW` (no symlink following).
     ///
     /// The pin is a real integrity control, so the digest must come from a descriptor
@@ -133,8 +155,15 @@ impl Deps for SystemDeps {
     fn load_config(&self) -> Result<Config, StoreError> {
         wsl_webauthn_store::Store::system().load_config()
     }
-    fn load_record(&self, username: &str) -> Result<CredentialRecord, StoreError> {
-        wsl_webauthn_store::Store::system().load(username)
+    fn load_record(&self, username: &str) -> Result<(CredentialRecord, FileIdentity), StoreError> {
+        wsl_webauthn_store::Store::system().load_with_identity(username)
+    }
+    fn save_record(
+        &self,
+        record: &CredentialRecord,
+        expected: FileIdentity,
+    ) -> Result<(), StoreError> {
+        wsl_webauthn_store::Store::system().update_if_unchanged(record, expected)
     }
     fn sha256_file(&self, path: &Path) -> Result<[u8; 32], String> {
         sha256_file_nofollow(path)
@@ -412,7 +441,7 @@ pub fn authenticate<S: PamSeam, D: Deps>(
     };
 
     // --- 3. Credential record -------------------------------------------
-    let record = match deps.load_record(&username) {
+    let (record, record_identity) = match deps.load_record(&username) {
         Ok(r) => r,
         Err(StoreError::NotFound { .. }) => {
             return fail(PAM_USER_UNKNOWN, "no credential enrolled for user");
@@ -629,13 +658,32 @@ pub fn authenticate<S: PamSeam, D: Deps>(
             };
             match verify_assertion(&check) {
                 Ok(outcome) => {
-                    // The PAM module does NOT persist the counter: the record stays
-                    // authoritative for enrollment-time data, and the counter is
-                    // advisory (Windows Hello reports zero).
                     logger::debug(&format!(
                         "assertion verified (observed sign_count {})",
                         outcome.sign_count
                     ));
+                    // Advance the stored counter so the next assertion's clone check is
+                    // against the last seen value. Windows Hello reports a constant zero,
+                    // so the common case writes nothing. This is advisory and after the
+                    // decision: any failure is logged and the authentication still
+                    // succeeds. The write is conditional on the record being unchanged
+                    // since load, so it cannot resurrect a removed credential or clobber a
+                    // newer enrollment.
+                    if outcome.sign_count > record.sign_count {
+                        let mut updated = record.clone();
+                        updated.sign_count = outcome.sign_count;
+                        if let Err(e) = deps.save_record(&updated, record_identity) {
+                            logger::auth(
+                                LOG_WARNING,
+                                &format!(
+                                    "could not persist sign_count {} for user {username}: {} \
+                                     (advisory; authentication still succeeded)",
+                                    outcome.sign_count,
+                                    e.kind_str()
+                                ),
+                            );
+                        }
+                    }
                     logger::auth(
                         LOG_INFO,
                         &format!(

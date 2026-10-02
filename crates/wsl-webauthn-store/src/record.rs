@@ -67,7 +67,8 @@ pub struct CredentialRecord {
     pub windows_identity: Option<WindowsIdentity>,
     /// Enrollment time, RFC 3339 in UTC.
     pub enrolled_at: String,
-    /// Signature counter captured at enrollment (assertions update the caller's view).
+    /// Signature counter; captured at enrollment and advanced by the PAM module after a
+    /// verified assertion from a counter-maintaining authenticator.
     pub sign_count: u32,
     /// Absolute path of the pinned bridge executable at enrollment.
     pub bridge_path: String,

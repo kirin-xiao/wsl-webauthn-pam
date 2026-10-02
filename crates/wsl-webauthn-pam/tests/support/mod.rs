@@ -27,8 +27,8 @@ use sha2::{Digest as _, Sha256};
 use wsl_webauthn_protocol::{ClientDataKind, Response, b64u_encode, build_client_data};
 use wsl_webauthn_runner::{AssertParams, Runner, RunnerError, RunnerResponse};
 use wsl_webauthn_store::{
-    AttestationRecord, Config, CredentialRecord, MODE_STRICT, Store, StoreError, current_euid,
-    validate_username,
+    AttestationRecord, Config, CredentialRecord, FileIdentity, MODE_STRICT, Store, StoreError,
+    current_euid, validate_username,
 };
 
 use pam_wsl_webauthn::logic::Deps;
@@ -245,6 +245,15 @@ pub struct TestDeps {
     pub panic: bool,
     /// Cap on the runner deadline (keeps timeout tests fast).
     pub deadline_cap: Option<Duration>,
+    /// Every `save_record` call this fake observed, as `(sign_count, expected)`.
+    pub saved_records: std::cell::RefCell<Vec<(u32, FileIdentity)>>,
+    /// When set, `save_record` fails with this kind of store error (drives the
+    /// "persistence failure still succeeds" path). Uses `RecordChanged`.
+    pub save_error: bool,
+    /// When set, `save_record` first rotates the on-disk record (simulating
+    /// `enroll --replace` winning the race) before attempting the conditional update, so
+    /// the real store returns `RecordChanged` end-to-end through the state machine.
+    pub rotate_before_save: bool,
 }
 
 /// A fixed config reply.
@@ -311,10 +320,40 @@ impl Deps for TestDeps {
         }
     }
 
-    fn load_record(&self, username: &str) -> Result<CredentialRecord, StoreError> {
+    fn load_record(&self, username: &str) -> Result<(CredentialRecord, FileIdentity), StoreError> {
         match &self.store {
-            Some(s) => s.load(username),
-            None => self.record.resolve(),
+            Some(s) => s.load_with_identity(username),
+            None => Ok((self.record.resolve()?, FileIdentity::default())),
+        }
+    }
+
+    fn save_record(
+        &self,
+        record: &CredentialRecord,
+        expected: FileIdentity,
+    ) -> Result<(), StoreError> {
+        self.saved_records
+            .borrow_mut()
+            .push((record.sign_count, expected));
+        if self.save_error {
+            return Err(StoreError::RecordChanged {
+                path: PathBuf::from("/etc/wsl_webauthn/credentials/user.json"),
+            });
+        }
+        if self.rotate_before_save
+            && let Some(store) = &self.store
+        {
+            // Simulate `enroll --replace` completing between load and save: the record is
+            // replaced with a fresh inode and enrollment-time fields, so the identity
+            // captured at load is stale.
+            let mut rotated = record.clone();
+            rotated.credential_id = "cm90YXRlZC1yYWNl".to_string();
+            rotated.sign_count = 0;
+            store.save_atomic(&rotated, true).expect("rotate");
+        }
+        match &self.store {
+            Some(s) => s.update_if_unchanged(record, expected),
+            None => Ok(()),
         }
     }
 
@@ -698,6 +737,9 @@ impl Fixture {
             },
             panic: false,
             deadline_cap: Some(Duration::from_secs(5)),
+            saved_records: std::cell::RefCell::new(Vec::new()),
+            save_error: false,
+            rotate_before_save: false,
         }
     }
 }

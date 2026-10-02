@@ -222,6 +222,17 @@ pub enum StoreError {
         /// The username argument.
         argument_user: String,
     },
+    /// A conditional update found the record was replaced or removed since it was read.
+    ///
+    /// Distinct from [`StoreError::PathChanged`], which flags a suspicious mid-read swap:
+    /// this is the benign outcome of two logins racing an enrollment/re-enrollment, or of
+    /// an `unregister` completing during an in-flight authentication. The update is
+    /// refused rather than clobbering the newer (or removed) credential.
+    #[error("record changed since it was read: {path}")]
+    RecordChanged {
+        /// The record path.
+        path: PathBuf,
+    },
     /// The config file is absent (`/etc/wsl_webauthn/config`).
     #[error("config file missing: {path}")]
     ConfigMissing {
@@ -275,6 +286,7 @@ impl StoreError {
             StoreError::TooLarge { .. } => "too_large",
             StoreError::PathChanged { .. } => "path_changed",
             StoreError::RecordUserMismatch { .. } => "record_user_mismatch",
+            StoreError::RecordChanged { .. } => "record_changed",
             StoreError::ConfigMissing { .. } => "config_missing",
             StoreError::Config { .. } => "config_invalid",
             StoreError::Encode { .. } => "encode",
@@ -292,6 +304,21 @@ pub struct Store {
     owner_uid: u32,
 }
 
+/// The filesystem identity (`st_dev`, `st_ino`) of a credential record file.
+///
+/// Captured from the `fstat` of the descriptor the record bytes were actually read from
+/// (see [`Store::load_with_identity`]), so a conditional update can refuse to clobber a
+/// record that was replaced or removed since. This is an opaque comparison token, not a
+/// path.
+///
+/// The `Default` (zero) identity is never produced by a real load; it exists so test
+/// doubles that synthesize a record without a backing file can still name a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FileIdentity {
+    dev: u64,
+    ino: u64,
+}
+
 /// Borrowed arguments to the shared atomic temp-file install path.
 struct Install<'a> {
     fd: sys::Fd,
@@ -303,6 +330,10 @@ struct Install<'a> {
     mode: u32,
     /// Directory being fsynced (for the error message only).
     dir_path: &'a Path,
+    /// When set, the install proceeds only if the target still resolves to this identity
+    /// (a conditional update); a mismatch or a vanished target is
+    /// [`StoreError::RecordChanged`].
+    expected_identity: Option<FileIdentity>,
 }
 
 impl Store {
@@ -481,13 +512,17 @@ impl Store {
     }
 
     /// Open, `fstat`-validate, and read a hardened file with a size cap.
+    ///
+    /// Returns the bytes together with the `fstat` identity of the descriptor they were
+    /// read from, so a caller that will later conditionally update the file can detect a
+    /// replacement/removal (see [`Store::load_with_identity`]).
     fn read_secure_file(
         &self,
         path: &Path,
         mode: u32,
         cap: usize,
         missing: impl FnOnce(PathBuf) -> StoreError,
-    ) -> Result<Vec<u8>, StoreError> {
+    ) -> Result<(Vec<u8>, sys::Stat), StoreError> {
         let before = match sys::lstat(path) {
             Ok(st) => st,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -529,7 +564,7 @@ impl Store {
                 path: path.to_path_buf(),
                 cap,
             }),
-            Some(bytes) => Ok(bytes),
+            Some(bytes) => Ok((bytes, after)),
         }
     }
 
@@ -538,12 +573,25 @@ impl Store {
     /// A missing record is [`StoreError::NotFound`] (PAM maps it to
     /// `PAM_USER_UNKNOWN`).
     pub fn load(&self, username: &str) -> Result<CredentialRecord, StoreError> {
+        self.load_with_identity(username).map(|(record, _)| record)
+    }
+
+    /// Load the credential record together with the filesystem identity of the file it was
+    /// read from.
+    ///
+    /// The identity is captured from the `fstat` of the very descriptor the bytes came
+    /// from, so it can be handed to [`Store::update_if_unchanged`] to refuse a conditional
+    /// write if the record was replaced or removed in the meantime.
+    pub fn load_with_identity(
+        &self,
+        username: &str,
+    ) -> Result<(CredentialRecord, FileIdentity), StoreError> {
         validate_username(username)?;
         self.check_base()?;
         let _dir_fd = self.open_checked_dir(&self.credentials_dir(), DIR_MODE)?;
 
         let path = self.record_path(username);
-        let bytes = self.read_secure_file(&path, FILE_MODE, MAX_RECORD_BYTES, |p| {
+        let (bytes, stat) = self.read_secure_file(&path, FILE_MODE, MAX_RECORD_BYTES, |p| {
             StoreError::NotFound { path: p }
         })?;
         let record: CredentialRecord =
@@ -586,7 +634,81 @@ impl Store {
             path: path.clone(),
             message: format!("cose_public_key is not valid base64url: {e}"),
         })?;
-        Ok(record)
+        Ok((
+            record,
+            FileIdentity {
+                dev: stat.dev,
+                ino: stat.ino,
+            },
+        ))
+    }
+
+    /// Conditionally overwrite an existing credential record.
+    ///
+    /// Installs `record` only if the target still resolves (via `fstatat` relative to the
+    /// held, identity-checked `credentials` directory, without following a final symlink)
+    /// to `expected` — the identity [`Store::load_with_identity`] returned for that record.
+    /// If the record was replaced (e.g. `enroll --replace` during an in-flight
+    /// authentication) or removed (`unregister`), the write is refused as
+    /// [`StoreError::RecordChanged`] instead of resurrecting a deleted credential or
+    /// undoing a newer enrollment.
+    ///
+    /// The write itself follows [`Store::save_atomic`]'s atomic discipline
+    /// (`mkstemp`→`0600`→`fsync`→`rename`→`fsync(dir)`, temp removed on error). The
+    /// `(dev, ino)` compared immediately before the `rename` is the identity captured at
+    /// load time, so the guarded interval is the whole load→check span. The residual is
+    /// the few instructions between the `fstatat` and the `rename`, plus the theoretical
+    /// reuse of `expected`'s inode number by an enrollment that completes inside the
+    /// load→check window; closing that fully would need an inode-generation field or a
+    /// held lock, and it is accepted because the store is root-owned `0700` and the only
+    /// actors are root.
+    pub fn update_if_unchanged(
+        &self,
+        record: &CredentialRecord,
+        expected: FileIdentity,
+    ) -> Result<(), StoreError> {
+        validate_username(&record.linux_user)?;
+        record.validate().map_err(|e| StoreError::Encode {
+            message: e.to_string(),
+        })?;
+        self.check_base()?;
+        // A conditional update to a store whose `credentials` directory has gone is a
+        // changed/removed record, not a reason to recreate directories as a side effect
+        // of an advisory write. (A missing *base* is reported as-is by `check_base` above.)
+        let dir_fd = match self.open_checked_dir(&self.credentials_dir(), DIR_MODE) {
+            Ok(fd) => fd,
+            Err(StoreError::NotFound { .. }) => {
+                return Err(StoreError::RecordChanged {
+                    path: self.record_path(&record.linux_user),
+                });
+            }
+            Err(e) => return Err(e),
+        };
+
+        let dir = self.credentials_dir();
+        let target = self.record_path(&record.linux_user);
+        let json = serde_json::to_vec(record).map_err(|e| StoreError::Encode {
+            message: e.to_string(),
+        })?;
+
+        let (fd, temp_path) = sys::mkstemp_in(&dir).map_err(|e| self.io(&dir, e))?;
+        let temp = PathBuf::from(temp_path);
+        let result = self.write_and_install(&Install {
+            fd,
+            temp: &temp,
+            target: &target,
+            contents: &json,
+            replace: true,
+            dir_fd: &dir_fd,
+            mode: FILE_MODE,
+            dir_path: &dir,
+            expected_identity: Some(expected),
+        });
+        if result.is_err() {
+            // Best-effort cleanup of the temp file on every failure path.
+            let _ = sys::remove_file(&temp);
+        }
+        result
     }
 
     /// Validate that this store can accept a [`Store::save_atomic`] write, without
@@ -654,6 +776,7 @@ impl Store {
             dir_fd: &dir_fd,
             mode: FILE_MODE,
             dir_path: &dir,
+            expected_identity: None,
         });
         if result.is_err() {
             // Best-effort cleanup of the temp file on every failure path.
@@ -669,6 +792,9 @@ impl Store {
         // `Install` holds the only owned `Fd`; dropping it closes the descriptor exactly
         // once.
         if install.replace {
+            if let Some(expected) = install.expected_identity {
+                self.ensure_record_unchanged(install, expected)?;
+            }
             sys::rename(install.temp, install.target).map_err(|e| self.io(install.target, e))?;
         } else {
             match sys::link(install.temp, install.target) {
@@ -687,6 +813,52 @@ impl Store {
         // Persist the directory entry on every success path; the handle was
         // identity-checked before the temp file existed.
         sys::fsync(install.dir_fd.raw()).map_err(|e| self.io(install.dir_path, e))?;
+        Ok(())
+    }
+
+    /// Refuse a conditional install when the target no longer resolves to `expected`.
+    ///
+    /// Runs immediately before the replacing `rename`, `fstatat`ing the single-component
+    /// name relative to the held, identity-checked `credentials` directory. A missing
+    /// target or a different `(dev, ino)` is [`StoreError::RecordChanged`]; a symlink or
+    /// non-regular file is refused as [`StoreError::SymlinkedPath`] /
+    /// [`StoreError::NotRegularFile`] respectively. All three refuse the install, so the
+    /// caller cannot resurrect a removed record or undo a newer enrollment.
+    fn ensure_record_unchanged(
+        &self,
+        install: &Install<'_>,
+        expected: FileIdentity,
+    ) -> Result<(), StoreError> {
+        let Some(file_name) = install.target.file_name() else {
+            return Err(StoreError::RecordChanged {
+                path: install.target.to_path_buf(),
+            });
+        };
+        let st = match sys::fstatat_nofollow(install.dir_fd.raw(), file_name) {
+            Ok(st) => st,
+            // The record vanished (e.g. `unregister` won the race): never recreate it.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(StoreError::RecordChanged {
+                    path: install.target.to_path_buf(),
+                });
+            }
+            Err(e) => return Err(self.io(install.target, e)),
+        };
+        if st.is_symlink() {
+            return Err(StoreError::SymlinkedPath {
+                path: install.target.to_path_buf(),
+            });
+        }
+        if !st.is_file() {
+            return Err(StoreError::NotRegularFile {
+                path: install.target.to_path_buf(),
+            });
+        }
+        if st.dev != expected.dev || st.ino != expected.ino {
+            return Err(StoreError::RecordChanged {
+                path: install.target.to_path_buf(),
+            });
+        }
         Ok(())
     }
 
@@ -794,9 +966,10 @@ impl Store {
     /// A missing file is [`StoreError::ConfigMissing`].
     pub fn load_config(&self) -> Result<Config, StoreError> {
         let path = self.config_path();
-        let bytes = self.read_secure_file(&path, CONFIG_MODE, MAX_CONFIG_BYTES, |p| {
-            StoreError::ConfigMissing { path: p }
-        })?;
+        let (bytes, _identity) =
+            self.read_secure_file(&path, CONFIG_MODE, MAX_CONFIG_BYTES, |p| {
+                StoreError::ConfigMissing { path: p }
+            })?;
         let raw: record::RawConfig =
             toml::from_str(std::str::from_utf8(&bytes).map_err(|e| StoreError::Config {
                 path: path.clone(),
@@ -861,6 +1034,7 @@ impl Store {
             dir_fd: &base_fd,
             mode: CONFIG_MODE,
             dir_path: &self.base,
+            expected_identity: None,
         });
         if result.is_err() {
             let _ = sys::remove_file(&temp);

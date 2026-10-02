@@ -21,6 +21,16 @@
 //! 5. Verify the response with `wsl-webauthn-verifier` (echo consistency, credential
 //!    id, then the full cryptographic assertion with the stored sign counter).
 //!
+//! # Counter write-back
+//!
+//! After a verified assertion, if the authenticator reported a signature counter higher
+//! than the enrolled record's, the module advances the stored value so the next clone
+//! check compares against the last seen count. The write is conditional on the record
+//! being unchanged since load (it can neither resurrect an `unregister`ed record nor
+//! overwrite a newer enrollment) and is advisory: a persistence failure is logged and
+//! the authentication still succeeds. Windows Hello reports a constant zero counter, so
+//! the common case writes nothing.
+//!
 //! # Mapping table (fail-closed)
 //!
 //! This is the contract of the module; every row is covered by a test.
@@ -94,9 +104,10 @@
 //! * The runner's deadline includes a 5 s `taskkill` budget, so total wall time can
 //!   reach `deadline + 5 s`; the default 60 s deadline leaves the bridge's 55 s
 //!   advisory timeout a 5 s margin.
-//! * The PAM module does **not** write the credential store. The signature counter is
-//!   advisory and Windows Hello reports zero, so the observed value is debug-logged
-//!   rather than persisted.
+//! * The PAM module treats the credential store as **read-only for authentication
+//!   decisions**. On a read-only `/etc`, authentication still works and clone detection
+//!   stays at the enrollment-time count; each counter-maintaining success then logs one
+//!   advisory `LOG_WARNING` ("could not persist sign_count …").
 
 #![warn(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]

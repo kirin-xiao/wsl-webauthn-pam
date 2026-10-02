@@ -47,9 +47,10 @@ TPM Root CA 2014 with a Windows Hello AAGUID (unattested keys require
 (`wsl-webauthn-pam`), asserted byte-for-byte on the Linux
 side and never carried on the wire; and the module refuses to launch a bridge
 whose SHA-256 differs from the digest pinned at enrollment. One root-owned
-credential record is kept per Linux user; the signature counter is compared
-(advisory on Windows Hello, which reports a constant counter), with challenge
-freshness as the main gate. Windows shows `Passkey for
+credential record is kept per Linux user; the signature counter is compared and,
+after each successful counter-maintaining assertion, advanced to the last seen
+value (advisory on Windows Hello, which reports a constant counter), with
+challenge freshness as the main gate. Windows shows `Passkey for
 wsl-webauthn-pam` (the RP ID, not a friendly name); the
 Linux-side `pam_conv` notice names the service and user — emitted even under
 `PAM_SILENT` when a terminal is attached, silenceable with the `quiet` argument.

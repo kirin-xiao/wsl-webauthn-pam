@@ -192,7 +192,7 @@ STABLE ERROR TOKENS:
     prose. Current tokens:
       config-missing, config-invalid, not-found, already-exists, record-corrupt,
       invalid-username, symlink, not-regular-file, insecure-store, too-large,
-      path-changed, record-user-mismatch, encode, io,
+      path-changed, record-changed, record-user-mismatch, encode, io,
       bridge-missing, interop-unavailable, spawn, bridge-failed, transport, timeout,
       verify-rejected, error
 
@@ -301,6 +301,7 @@ fn store_error_code(error: &StoreError) -> &'static str {
         StoreError::TooLarge { .. } => "too-large",
         StoreError::PathChanged { .. } => "path-changed",
         StoreError::RecordUserMismatch { .. } => "record-user-mismatch",
+        StoreError::RecordChanged { .. } => "record-changed",
         StoreError::ConfigMissing { .. } => "config-missing",
         StoreError::Config { .. } => "config-invalid",
         StoreError::Encode { .. } => "encode",

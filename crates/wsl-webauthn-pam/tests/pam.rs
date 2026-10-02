@@ -91,6 +91,124 @@ fn run_captures_audit_lines_without_touching_syslog() {
     );
 }
 
+/// A counter-maintaining authenticator's higher observed count is persisted, so the next
+/// assertion is checked against the last seen value rather than the enrollment count.
+#[test]
+fn success_persists_an_advanced_counter() {
+    let fixture = Fixture::new();
+    // Enroll with count 0, sign the assertion with count 2.
+    let record = fixture.record("alice", 0);
+    let store = fixture.enrolled_store(&record);
+    let bundle = build_assertion_with(
+        &fixture.key,
+        fixture.challenge,
+        &fixture.credential_id,
+        2,
+        wsl_webauthn_protocol::RP_ID,
+        0x01 | 0x04,
+    );
+    let mut seam = FakeSeam::for_user("alice");
+    let deps = fixture.deps(store.clone(), vec![script_success(&bundle, false)]);
+    assert_eq!(run_basic(&mut seam, &deps, 0, &[]), PAM_SUCCESS);
+    assert_eq!(
+        deps.saved_records.borrow().as_slice().len(),
+        1,
+        "the advanced counter must be persisted exactly once"
+    );
+    assert_eq!(deps.saved_records.borrow()[0].0, 2, "persisted count");
+    assert_eq!(
+        store.load("alice").unwrap().sign_count,
+        2,
+        "the store must hold the advanced count"
+    );
+}
+
+/// End-to-end: a record rotated (`enroll --replace`) between load and the counter
+/// write-back must be refused by the real store, the authentication must still succeed,
+/// and the newer credential must survive untouched.
+#[test]
+fn rotated_record_during_auth_is_not_clobbered() {
+    let fixture = Fixture::new();
+    let record = fixture.record("alice", 0);
+    let store = fixture.enrolled_store(&record);
+    let bundle = build_assertion_with(
+        &fixture.key,
+        fixture.challenge,
+        &fixture.credential_id,
+        2,
+        wsl_webauthn_protocol::RP_ID,
+        0x01 | 0x04,
+    );
+    let mut seam = FakeSeam::for_user("alice");
+    let mut deps = fixture.deps(store.clone(), vec![script_success(&bundle, false)]);
+    deps.rotate_before_save = true;
+    assert_eq!(run_basic(&mut seam, &deps, 0, &[]), PAM_SUCCESS);
+    // The simulated re-enrollment's credential must be the one that survives.
+    let on_disk = store.load("alice").unwrap();
+    assert_eq!(on_disk.credential_id, "cm90YXRlZC1yYWNl");
+    assert_eq!(
+        on_disk.sign_count, 0,
+        "the stale write must not have landed"
+    );
+}
+
+/// A constant-zero authenticator (Windows Hello) writes nothing.
+#[test]
+fn success_with_unchanged_counter_writes_nothing() {
+    let (_f, mut seam, deps) = happy();
+    assert_eq!(run_basic(&mut seam, &deps, 0, &[]), PAM_SUCCESS);
+    assert!(
+        deps.saved_records.borrow().is_empty(),
+        "an unchanged counter must not be written back"
+    );
+}
+
+/// The counter write-back is advisory: a persistence failure is logged and the
+/// authentication still succeeds, and the log carries only the stable error *kind* (never
+/// the record path, which embeds the username).
+#[test]
+fn persistence_failure_still_succeeds() {
+    use pam_wsl_webauthn::logger::{begin_capture, captured};
+
+    let fixture = Fixture::new();
+    let record = fixture.record("alice", 0);
+    let store = fixture.enrolled_store(&record);
+    let bundle = build_assertion_with(
+        &fixture.key,
+        fixture.challenge,
+        &fixture.credential_id,
+        1,
+        wsl_webauthn_protocol::RP_ID,
+        0x01 | 0x04,
+    );
+    let mut seam = FakeSeam::for_user("alice");
+    let mut deps = fixture.deps(store, vec![script_success(&bundle, false)]);
+    deps.save_error = true;
+    install_capture();
+    begin_capture();
+    assert_eq!(run_basic(&mut seam, &deps, 0, &[]), PAM_SUCCESS);
+    assert!(seam.fail_delays.is_empty(), "a success must not fail-delay");
+    // The attempt was made (and failed) — proving the failure path was exercised.
+    assert_eq!(deps.saved_records.borrow().len(), 1);
+    let records = captured();
+    let warning = records
+        .iter()
+        .map(|(_, msg)| msg)
+        .find(|msg| msg.contains("could not persist sign_count"))
+        .expect("the advisory persistence failure must be logged");
+    assert!(
+        warning.contains("record_changed"),
+        "the stable kind must be logged: {warning}"
+    );
+    // The username and success line already appear in the audit log; the store *path*
+    // (which the full `Display` would add) must not.
+    assert!(!warning.contains(".json"), "path leaf leaked: {warning}");
+    assert!(
+        !warning.contains("/etc/wsl_webauthn"),
+        "store layout leaked: {warning}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Username → PAM_USER_UNKNOWN
 // ---------------------------------------------------------------------------

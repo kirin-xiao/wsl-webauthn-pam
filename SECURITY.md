@@ -86,7 +86,7 @@ Consent phishing — making the user approve a ceremony they did not intend — 
   <!-- INVARIANT: COSE-ALG-ALLOWLIST, COSE-P256-UNCOMPRESSED-ON-CURVE, COSE-RSA-MODULUS-SIZE, COSE-RSA-EXPONENT, COSE-ED25519-X-LENGTH, COSE-KTY-ALG-CONSISTENCY -->
 - Signature: ES256 (DER), RS256 (PKCS#1 v1.5), EdDSA (`verify_strict`) over `authenticatorData ‖ SHA-256(clientDataJSON)`.
   <!-- INVARIANT: ASSERTION-SIGNED-MESSAGE-DEFINITION -->
-- Signature-counter clone signal per WebAuthn §7.2 step 22 (advisory; Windows Hello reports a constant counter and the store is not written back).
+- Signature-counter clone signal per WebAuthn §7.2 step 22 (advisory; Windows Hello reports a constant counter). After a verified assertion, when the authenticator reported a strictly higher counter than the record holds, the module conditionally advances the stored value to the last seen count. The write is conditional on the record being unchanged since load (it can neither resurrect an `unregister`ed record nor clobber a newer enrollment) and is non-fatal: a persistence failure is logged and the authentication still succeeds.
   <!-- INVARIANT: ASSERTION-COUNTER-POLICY -->
 
 ### Verified invariants (attestation)
@@ -98,6 +98,8 @@ Consent phishing — making the user approve a ceremony they did not intend — 
 - AAGUID allow-list: the authData AAGUID must be one of `STRICT_AAGUIDS` on **every** attestation path, checked once before the format/policy dispatch, so self and `none` (admitted under `AllowUnattested`) cannot bypass it. Assertions neither enforce an AAGUID allow-list nor compare an AAGUID.
   <!-- INVARIANT: AAGUID-ALLOWLIST-EVERY-ATTESTATION-PATH -->
 - Self/`none` attestation: admitted **only** under explicit `AttestationPolicy::AllowUnattested`, never a silent fallback. The policy is permissive, not prescriptive: a fully verified `tpm`/`packed` attestation is still recorded `mode: "strict"`, `verified: true` when `--allow-unattested` was passed.
+
+**`attestation.mode` is enrollment-time audit metadata, not an authentication-time policy.** The record's `attestation.mode` (`"strict"` or `"unattested-opt-in"`) and `attestation.verified` are written by root through the verified enrollment path and are read only for operator reporting. At authentication time the module does **not** re-apply an attestation policy from these fields: the gate is the signature over a fresh challenge under the enrolled public key, together with the RP-ID/origin and bridge-hash pins and root ownership of the record. A record stamped `mode: "unattested-opt-in"` reflects a conscious `--allow-unattested` enrollment; an attacker who could write a record could equally stamp it `"strict"`, so re-checking the label would add no security. There is no `strict-only` module argument: uniform strictness is chosen at the enrollment path (`--allow-unattested` is the only relaxation), not through PAM arguments.
 
 The verifier is `#![forbid(unsafe_code)]` and non-panicking on every parse path.
 

@@ -223,6 +223,93 @@ fn save_creates_credentials_dir_0700() {
 }
 
 #[test]
+fn update_if_unchanged_advances_the_record() {
+    let (_d, store) = fresh();
+    let rec = sample_record("alice");
+    store.save_atomic(&rec, false).unwrap();
+
+    let (loaded, identity) = store.load_with_identity("alice").unwrap();
+    assert_eq!(loaded.sign_count, 0);
+    let mut updated = loaded;
+    updated.sign_count = 7;
+    store
+        .update_if_unchanged(&updated, identity)
+        .expect("update");
+
+    let reloaded = store.load("alice").unwrap();
+    assert_eq!(reloaded.sign_count, 7);
+    assert!(no_temp_files(&store.credentials_dir()));
+}
+
+/// The resurrection guard: a record replaced (new inode) since load must not be
+/// clobbered by the stale update. `enroll --replace` during an in-flight authentication
+/// is the motivating case.
+#[test]
+fn update_if_unchanged_refuses_a_replaced_record() {
+    let (_d, store) = fresh();
+    store.save_atomic(&sample_record("alice"), false).unwrap();
+    let (loaded, identity) = store.load_with_identity("alice").unwrap();
+
+    // Root re-enrolls: the record now has a different inode and different contents.
+    let mut rotated = sample_record("alice");
+    rotated.credential_id = "cm90YXRlZA".into();
+    store.save_atomic(&rotated, true).expect("rotate");
+
+    let mut stale = loaded;
+    stale.sign_count = 9;
+    assert!(matches!(
+        store.update_if_unchanged(&stale, identity),
+        Err(StoreError::RecordChanged { .. })
+    ));
+    // The rotated credential must survive untouched.
+    assert_eq!(store.load("alice").unwrap().credential_id, "cm90YXRlZA");
+    assert!(no_temp_files(&store.credentials_dir()));
+}
+
+/// An `unregister` that wins the race must not be undone: a vanished record is
+/// `RecordChanged`, and the file stays gone.
+#[test]
+fn update_if_unchanged_refuses_a_removed_record() {
+    let (_d, store) = fresh();
+    store.save_atomic(&sample_record("alice"), false).unwrap();
+    let (loaded, identity) = store.load_with_identity("alice").unwrap();
+
+    assert!(store.remove("alice").unwrap());
+    let mut stale = loaded;
+    stale.sign_count = 3;
+    assert!(matches!(
+        store.update_if_unchanged(&stale, identity),
+        Err(StoreError::RecordChanged { .. })
+    ));
+    assert!(matches!(
+        store.load("alice"),
+        Err(StoreError::NotFound { .. })
+    ));
+    assert!(no_temp_files(&store.credentials_dir()));
+}
+
+/// If the `credentials` directory itself is gone, the advisory update is refused with
+/// `RecordChanged` and no directory is recreated.
+#[test]
+fn update_if_unchanged_refuses_a_removed_credentials_dir() {
+    let (_d, store) = fresh();
+    store.save_atomic(&sample_record("alice"), false).unwrap();
+    let (loaded, identity) = store.load_with_identity("alice").unwrap();
+
+    fs::remove_dir_all(store.credentials_dir()).unwrap();
+    let mut stale = loaded;
+    stale.sign_count = 4;
+    assert!(matches!(
+        store.update_if_unchanged(&stale, identity),
+        Err(StoreError::RecordChanged { .. })
+    ));
+    assert!(
+        !store.credentials_dir().exists(),
+        "the advisory update must not recreate the credentials directory"
+    );
+}
+
+#[test]
 fn save_writes_record_0600() {
     let (_d, store) = fresh();
     store.save_atomic(&sample_record("alice"), false).unwrap();
@@ -1049,6 +1136,10 @@ fn kind_str_is_stable_distinct_and_non_identifying() {
                 argument_user: "bob".into(),
             },
             "record_user_mismatch",
+        ),
+        (
+            StoreError::RecordChanged { path: path.clone() },
+            "record_changed",
         ),
         (
             StoreError::ConfigMissing { path: path.clone() },
