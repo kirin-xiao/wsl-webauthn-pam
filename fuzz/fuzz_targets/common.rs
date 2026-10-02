@@ -1,11 +1,19 @@
-//! Shared helpers for the fuzz targets.
+//! Shared helpers and fail-open oracles for the fuzz targets.
 //!
-//! The targets only care that the verifier never panics; inputs are arbitrary bytes
-//! and both `Ok` and `Err` are acceptable outcomes.
+//! Arbitrary inputs may still legitimately return either `Ok` or `Err` — the primary
+//! contract is "never panic". The parser targets additionally run seeded oracles that
+//! assert a spurious `Ok` (accepting malformed or semantically-wrong input) is caught
+//! rather than discarded (L14-10). See the per-oracle comments below.
 
 #![allow(dead_code)]
 
 use ciborium::value::Value;
+use sha2::{Digest as _, Sha256};
+use wsl_webauthn_verifier::testing;
+
+/// First input byte that triggers the seeded fail-open oracle branch. A committed
+/// seed beginning with this byte keeps the branch on the warm corpus.
+pub const ORACLE_MARKER: u8 = 0xAB;
 
 /// The deterministic synthetic ES256 signing key backing [`synthetic_cose_key`].
 ///
@@ -84,4 +92,232 @@ pub fn independent_now() -> std::time::SystemTime {
 pub fn split(data: &[u8]) -> (&[u8], &[u8]) {
     let mid = data.len() / 2;
     data.split_at(mid)
+}
+
+// ---------------------------------------------------------------------------
+// Fail-open oracles (L14-10)
+//
+// Each oracle seeds a known-good structure, asserts it is accepted, then applies a
+// corruption that *must* be rejected. They are run from a rare marker branch in the
+// corresponding fuzz target and from a committed seed (`*.oracle` files in
+// `fuzz/corpus/<target>/`) so the branch is reached at least once in CI and locally.
+// ---------------------------------------------------------------------------
+
+/// `SHA-256(RP_ID)`, the `rpIdHash` a structurally valid `authenticatorData` needs.
+pub fn rp_id_hash() -> [u8; 32] {
+    Sha256::digest(wsl_webauthn_protocol::RP_ID.as_bytes()).into()
+}
+
+/// Encode a CBOR map with the given members in order.
+fn cbor_map(items: Vec<(Value, Value)>) -> Vec<u8> {
+    let mut out = Vec::new();
+    ciborium::into_writer(&Value::Map(items), &mut out).expect("CBOR encode");
+    out
+}
+
+/// Encode a TPM `TPM2B_*`: a big-endian u16 length followed by the bytes.
+fn tpm2b(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + bytes.len());
+    out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+    out.extend_from_slice(bytes);
+    out
+}
+
+/// Build a structurally valid bare `TPMT_PUBLIC` for an RSA key with a declared
+/// `keyBits` (which `verify` requires to equal the modulus bit length).
+fn rsa_pub_area(modulus: &[u8], key_bits: u16) -> Vec<u8> {
+    const TPM_ALG_RSA: u16 = 0x0001;
+    const TPM_ALG_SHA256: u16 = 0x000b;
+    let mut out = Vec::new();
+    out.extend_from_slice(&TPM_ALG_RSA.to_be_bytes());
+    out.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes());
+    out.extend_from_slice(&0x0004_0432u32.to_be_bytes()); // objectAttributes
+    out.extend_from_slice(&tpm2b(&[0u8; 32])); // authPolicy
+    out.extend_from_slice(&0x0010u16.to_be_bytes()); // symmetric NULL
+    out.extend_from_slice(&0x0010u16.to_be_bytes()); // scheme NULL
+    out.extend_from_slice(&key_bits.to_be_bytes());
+    out.extend_from_slice(&65537u32.to_be_bytes()); // exponent
+    out.extend_from_slice(&tpm2b(modulus));
+    out
+}
+
+/// Fail-open oracle for the COSE_Key target.
+///
+/// An ES256 key must parse (the oracle is not vacuous); one appended byte must be
+/// rejected (`decode_exact` requires exactly one CBOR item), and every single-byte
+/// corruption must be rejected (a byte the parser does not bind would let a spurious
+/// `Ok` escape).
+///
+/// Note: `cose::parse` does *not* enforce CBOR canonicality (an indefinite-length map
+/// is accepted by `decode_exact`); canonicality is enforced where the key is sliced
+/// out of `authenticatorData` instead, so it is deliberately not asserted here.
+pub fn cose_key_oracle() {
+    let good = synthetic_cose_key();
+    assert!(
+        testing::parse_cose_key(&good),
+        "a valid ES256 COSE key must parse"
+    );
+
+    let mut trailing = good.clone();
+    trailing.push(0x00);
+    assert!(
+        !testing::parse_cose_key(&trailing),
+        "a COSE key with one appended byte must be rejected"
+    );
+
+    for i in 0..good.len() {
+        let mut mutated = good.clone();
+        mutated[i] ^= 0x01;
+        assert!(
+            !testing::parse_cose_key(&mutated),
+            "COSE key byte {i} corruption must be rejected"
+        );
+    }
+}
+
+/// Fail-open oracle for the `authenticatorData` prefix target.
+///
+/// A valid 37-byte prefix must parse; every strict truncation below 37 bytes must be
+/// rejected; one appended byte must still parse as a prefix (the parser reports a
+/// valid prefix even with a trailing payload, which is the documented contract).
+pub fn authenticator_data_oracle() {
+    let mut good = Vec::with_capacity(37);
+    good.extend_from_slice(&rp_id_hash());
+    good.push(0x05); // UP | UV
+    good.extend_from_slice(&0u32.to_be_bytes());
+    assert!(
+        testing::parse_authenticator_data(&good),
+        "a valid authenticatorData prefix must parse"
+    );
+
+    for cut in 0..37usize {
+        assert!(
+            !testing::parse_authenticator_data(&good[..cut]),
+            "authenticatorData truncated to {cut} bytes must be rejected"
+        );
+    }
+
+    let mut trailing = good.clone();
+    trailing.push(0x00);
+    assert!(
+        testing::parse_authenticator_data(&trailing),
+        "the prefix parser reports a valid prefix regardless of trailing payload"
+    );
+}
+
+/// Fail-open oracle for the attestation-object target.
+///
+/// The `testing` seam is a prefix/membership parser (it does not enforce a single
+/// CBOR item), so the realistic invariant is: a structurally complete object parses,
+/// and dropping any required member (`fmt`/`authData`/`attStmt`) or using a non-map
+/// must be rejected. The full exact-decode behaviour is covered by the `attestation`
+/// target's independent oracle.
+pub fn attestation_object_oracle() {
+    let good = cbor_map(vec![
+        (Value::from("fmt"), Value::from("none")),
+        (Value::from("attStmt"), Value::Map(vec![])),
+        (Value::from("authData"), Value::Bytes(vec![0u8; 37])),
+    ]);
+    assert!(
+        testing::parse_attestation_object(&good),
+        "a structurally complete attestation object must parse"
+    );
+
+    let without_fmt = cbor_map(vec![
+        (Value::from("attStmt"), Value::Map(vec![])),
+        (Value::from("authData"), Value::Bytes(vec![0u8; 37])),
+    ]);
+    let without_auth_data = cbor_map(vec![
+        (Value::from("fmt"), Value::from("none")),
+        (Value::from("attStmt"), Value::Map(vec![])),
+    ]);
+    let without_att_stmt = cbor_map(vec![
+        (Value::from("fmt"), Value::from("none")),
+        (Value::from("authData"), Value::Bytes(vec![0u8; 37])),
+    ]);
+    for (name, missing) in [
+        ("fmt", without_fmt),
+        ("authData", without_auth_data),
+        ("attStmt", without_att_stmt),
+    ] {
+        assert!(
+            !testing::parse_attestation_object(&missing),
+            "an attestation object missing {name} must be rejected"
+        );
+    }
+
+    let mut encoded_array = Vec::new();
+    ciborium::into_writer(&Value::Array(vec![Value::from(1i64)]), &mut encoded_array).unwrap();
+    assert!(
+        !testing::parse_attestation_object(&encoded_array),
+        "a CBOR array is not an attestation object"
+    );
+    assert!(
+        !testing::parse_attestation_object(&[]),
+        "empty input is not an attestation object"
+    );
+}
+
+/// Fail-open oracle for the TPM target.
+///
+/// A valid `certInfo` must parse and every strict truncation must be rejected; a
+/// valid `pubArea` must parse and every strict truncation must be rejected. Because
+/// both parsers require the whole buffer to be consumed, any accepted input is
+/// exactly one structure — so an appended byte is rejected too. This is the strongest
+/// fail-open signal reachable from the structural parse seam.
+///
+/// The declared-`keyBits`-vs-modulus semantic invariant (L1-4) lives in `tpm::verify`,
+/// which is *not* reachable from `testing::parse_tpm_pub_area`; `parse_pub_area`
+/// correctly accepts a well-formed `pubArea` regardless of whether its fields agree.
+/// Asserting the invariant here would fail, so it is left to the full-verifier
+/// `attestation` target and the `negative_tpm_pub_area_key_bits_mismatch` unit test
+/// rather than faked.
+pub fn tpm_oracle() {
+    // certInfo: magic || type || qualifiedSigner || extraData || clockInfo ||
+    //           firmwareVersion || name || qualifiedName.
+    let name = tpm2b(&[0x22u8; 48]);
+    let mut cert_info = Vec::new();
+    cert_info.extend_from_slice(&0xff54_4347u32.to_be_bytes()); // TPM_GENERATED
+    cert_info.extend_from_slice(&0x8017u16.to_be_bytes()); // TPM_ST_ATTEST_CERTIFY
+    cert_info.extend_from_slice(&tpm2b(&[])); // qualifiedSigner
+    cert_info.extend_from_slice(&tpm2b(&[0x33u8; 32])); // extraData
+    cert_info.extend_from_slice(&0u64.to_be_bytes()); // clock
+    cert_info.extend_from_slice(&0u32.to_be_bytes()); // resetCount
+    cert_info.extend_from_slice(&0u32.to_be_bytes()); // restartCount
+    cert_info.push(0); // safe
+    cert_info.extend_from_slice(&0u64.to_be_bytes()); // firmwareVersion
+    cert_info.extend_from_slice(&name); // TPMS_CERTIFY_INFO.name
+    cert_info.extend_from_slice(&name); // qualifiedName
+    assert!(
+        testing::parse_tpm_cert_info(&cert_info),
+        "a valid TPM certInfo must parse"
+    );
+    for cut in 0..cert_info.len() {
+        assert!(
+            !testing::parse_tpm_cert_info(&cert_info[..cut]),
+            "certInfo truncated to {cut} bytes must be rejected"
+        );
+    }
+
+    // pubArea: a 2048-bit RSA modulus with a matching declared keyBits.
+    let modulus = [0xC1u8; 256];
+    let consistent = rsa_pub_area(&modulus, 2048);
+    assert!(
+        testing::parse_tpm_pub_area(&consistent),
+        "a valid TPM pubArea must parse"
+    );
+    for cut in 0..consistent.len() {
+        assert!(
+            !testing::parse_tpm_pub_area(&consistent[..cut]),
+            "pubArea truncated to {cut} bytes must be rejected"
+        );
+    }
+
+    // An accepted structure is self-delimiting: an appended byte must be rejected.
+    let mut with_trailing = consistent.clone();
+    with_trailing.push(0x00);
+    assert!(
+        !testing::parse_tpm_pub_area(&with_trailing),
+        "a pubArea with one appended byte must be rejected"
+    );
 }
