@@ -22,7 +22,7 @@ use wsl_webauthn_protocol::{
 };
 use wsl_webauthn_runner::{AssertParams, RunnerError, RunnerResponse};
 use wsl_webauthn_store::{Config, CredentialRecord, StoreError};
-use wsl_webauthn_verifier::{AssertionCheck, verify_assertion};
+use wsl_webauthn_verifier::{AssertionCheck, VerifyError, verify_assertion};
 
 use crate::args::ModuleArgs;
 use crate::bindings::{
@@ -36,13 +36,15 @@ use crate::seam::PamSeam;
 pub const FAIL_DELAY_USEC: u32 = 2_000_000;
 
 /// The result of one authentication attempt.
+///
+/// There is no PAM-code accessor and no counter on the success arm: the PAM code is
+/// the failure's `code` (or `PAM_SUCCESS` for `Success`), mapped by [`run`], and the
+/// observed signature counter is only debug-logged. Keeping the counter out of the
+/// type avoids a field that no consumer reads (L16-2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthOutcome {
-    /// A verified assertion.
-    Success {
-        /// The authenticator's asserted signature counter (logged, not persisted here).
-        sign_count: u32,
-    },
+    /// A verified assertion. This is the only success variant.
+    Success,
     /// A failure with the PAM code to return to libpam.
     Failure {
         /// The PAM return code.
@@ -51,16 +53,6 @@ pub enum AuthOutcome {
         /// carries it together with the PAM code and its name.
         reason: String,
     },
-}
-
-impl AuthOutcome {
-    /// The PAM code this outcome maps to.
-    pub fn code(&self) -> i32 {
-        match self {
-            AuthOutcome::Success { .. } => PAM_SUCCESS,
-            AuthOutcome::Failure { code, .. } => *code,
-        }
-    }
 }
 
 /// Everything the state machine needs from beyond the seam.
@@ -72,8 +64,21 @@ pub trait Deps {
     fn load_config(&self) -> Result<Config, StoreError>;
     /// Load the credential record for `username`.
     fn load_record(&self, username: &str) -> Result<CredentialRecord, StoreError>;
-    /// SHA-256 of the file at `path`.
+    /// SHA-256 of the file at `path`, opened `O_NOFOLLOW` (no symlink following).
+    ///
+    /// The pin is a real integrity control, so the digest must come from a descriptor
+    /// opened with the hardening flags rather than a path-following `open`.
     fn sha256_file(&self, path: &Path) -> Result<[u8; 32], String>;
+    /// Whether `path` is a trustworthy bridge executable location: not a symlink, and
+    /// (unless `win_mnt` itself is a WSL DrvFs mount) owned by root and not
+    /// group/other-writable, with every parent up to `win_mnt` held to the same rule.
+    ///
+    /// DrvFs (`/mnt/c`, 9p) reports Windows-derived uid/mode that the Windows ACL does
+    /// not honour, so enforcing the POSIX ownership/mode rule there would reject every
+    /// legitimate bridge; on such a mount the check is reduced to "regular file, not a
+    /// symlink" and the SHA-256 pin remains the integrity control. Anywhere else a
+    /// user-writable directory is refused (L2-4).
+    fn bridge_path_is_trusted(&self, path: &Path, win_mnt: &Path) -> Result<(), String>;
     /// Fill `dest` with cryptographically secure random bytes.
     ///
     /// Entropy exhaustion is an operational condition, not a bug: implementations
@@ -116,7 +121,10 @@ impl Deps for SystemDeps {
         wsl_webauthn_store::Store::system().load(username)
     }
     fn sha256_file(&self, path: &Path) -> Result<[u8; 32], String> {
-        sha256_file(path)
+        sha256_file_nofollow(path)
+    }
+    fn bridge_path_is_trusted(&self, path: &Path, win_mnt: &Path) -> Result<(), String> {
+        bridge_path_is_trusted(path, win_mnt)
     }
     fn fill_random(&self, dest: &mut [u8]) -> Result<(), String> {
         use rand::RngCore as _;
@@ -153,13 +161,34 @@ impl Deps for SystemDeps {
     fn panic_probe(&self) {}
 }
 
-/// Hash a file with SHA-256, streaming so an arbitrarily large bridge executable is
-/// never held in memory.
-fn sha256_file(path: &Path) -> Result<[u8; 32], String> {
+/// Hash a file with SHA-256 from an `O_NOFOLLOW` descriptor, streaming so an
+/// arbitrarily large bridge executable is never held in memory.
+///
+/// `O_NOFOLLOW` closes the "hash a symlink target, then spawn the link" gap: a symlink
+/// at the configured path is refused rather than silently followed (L2-2). The runner
+/// spawns by path *after* this hash, so this narrows — but does not by itself close —
+/// the check-then-use window; see [`bridge_path_is_trusted`].
+pub fn sha256_file_nofollow(path: &Path) -> Result<[u8; 32], String> {
     use sha2::{Digest as _, Sha256};
     use std::io::Read as _;
 
-    let file = std::fs::File::open(path).map_err(|e| format!("open {path:?}: {e}"))?;
+    /// Upper bound on the bytes this module will read from the bridge path. The real
+    /// bridge is ~2 MB; a value this far above it is a sanity guard against hashing an
+    /// attacker-planted huge/special file (L10-2), not a functional limit.
+    const MAX_BRIDGE_BYTES: u64 = 64 * 1024 * 1024;
+
+    let file = crate::sys::open_readonly_nofollow(path)
+        .map_err(|e| format!("open {path:?} (O_NOFOLLOW): {e}"))?;
+    let len = file
+        .metadata()
+        .map_err(|e| format!("stat {path:?}: {e}"))?
+        .len();
+    if len > MAX_BRIDGE_BYTES {
+        return Err(format!(
+            "{path:?} is {len} bytes, above the {MAX_BRIDGE_BYTES}-byte bridge sanity cap"
+        ));
+    }
+
     let mut reader = std::io::BufReader::new(file);
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
@@ -176,6 +205,64 @@ fn sha256_file(path: &Path) -> Result<[u8; 32], String> {
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);
     Ok(out)
+}
+
+/// Refuse a bridge path that a non-root writer could swap.
+///
+/// The leaf must be a regular file that is not a symlink; outside a DrvFs mount it
+/// must additionally not be group/other-writable, and every parent component below
+/// `win_mnt` (the configured trust anchor, itself already pinned by the store/config)
+/// must be a real directory owned by root and not group/other-writable. When `win_mnt`
+/// is DrvFs the POSIX owner/mode rule is unenforceable (DrvFs synthesizes them), so
+/// only the symlink/regular-file part applies and the SHA-256 pin carries the
+/// integrity load.
+pub fn bridge_path_is_trusted(path: &Path, win_mnt: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("bridge path {path:?} is not usable: {e}"))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "bridge path {path:?} is a symlink; refusing to launch a mutable target"
+        ));
+    }
+    if !meta.is_file() {
+        return Err(format!("bridge path {path:?} is not a regular file"));
+    }
+
+    if crate::sys::is_drvfs(win_mnt) {
+        return Ok(());
+    }
+
+    if meta.mode() & 0o022 != 0 {
+        return Err(format!(
+            "bridge executable {path:?} is group/other-writable (mode {:o}); refusing to launch",
+            meta.mode() & 0o7777
+        ));
+    }
+
+    // Reject a path that is not physically under win_mnt (e.g. via `..`).
+    let rel = path.strip_prefix(win_mnt).map_err(|_| {
+        format!("bridge path {path:?} is outside the configured win_mnt {win_mnt:?}")
+    })?;
+    let mut dir = win_mnt.to_path_buf();
+    for component in rel.parent().unwrap_or_else(|| Path::new("")).components() {
+        dir.push(component);
+        let m = std::fs::symlink_metadata(&dir)
+            .map_err(|e| format!("bridge parent {dir:?} is not usable: {e}"))?;
+        if m.file_type().is_symlink() || !m.is_dir() {
+            return Err(format!("bridge parent {dir:?} is not a directory"));
+        }
+        if m.uid() != 0 || m.mode() & 0o022 != 0 {
+            return Err(format!(
+                "bridge parent {dir:?} is writable by group/other or not root-owned \
+                 (uid {}, mode {:o}); refusing to launch",
+                m.uid(),
+                m.mode() & 0o7777
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Map a bridge ceremony error to a PAM code (plan §8 mapping table).
@@ -250,6 +337,17 @@ fn failure_message(code: i32, reason: &str) -> String {
         "authentication failed: {}({code}): {reason}",
         pam_code_name(code)
     )
+}
+
+/// Map a `VerifyError` to a PAM code (plan §8 mapping table).
+///
+/// Every current variant is an authentication decision → `PAM_AUTH_ERR`; the function
+/// exists so the mapping is one auditable place and every variant is table-tested
+/// (L8-7). A future variant that is *not* an authentication decision (say, an
+/// unsupported algorithm we choose to treat as a service condition) must be added here
+/// deliberately rather than falling through an undocumented catch-all.
+fn pam_code_for_verify(_error: &VerifyError) -> i32 {
+    PAM_AUTH_ERR
 }
 
 /// Log and construct a failure outcome.
@@ -343,38 +441,41 @@ pub fn authenticate<S: PamSeam, D: Deps>(
             record.bridge_path, config.bridge_path
         ));
     }
-    if args.noverifypin {
-        logger::auth(
-            LOG_ERR,
-            "noverifypin: bridge executable SHA-256 pin check DISABLED by configuration",
+    // The pin is always enforced (L2-4 removed the `noverifypin` argument). Before
+    // hashing, refuse a path a non-root writer could swap: with the pin disabled there
+    // would be no integrity control at all, and even with it the runner spawns by name
+    // after this hash, so the path must be trustworthy in its own right (L2-2/L2-4).
+    if let Err(e) = deps.bridge_path_is_trusted(bridge_path, &config.win_mnt) {
+        return fail(
+            PAM_AUTHINFO_UNAVAIL,
+            format!("bridge executable path is not trusted: {e}"),
         );
-    } else {
-        let expected = match decode_hex32(&record.bridge_sha256) {
-            Some(v) => v,
-            None => {
-                return fail(
-                    PAM_AUTHINFO_UNAVAIL,
-                    "recorded bridge_sha256 is not a 32-byte lowercase hex digest",
-                );
-            }
-        };
-        match deps.sha256_file(bridge_path) {
-            Ok(actual) if actual == expected => {}
-            Ok(_) => {
-                return fail(
-                    PAM_AUTHINFO_UNAVAIL,
-                    format!(
-                        "bridge executable {bridge_path:?} failed its SHA-256 pin check \
-                         (possible tampering); refusing to launch"
-                    ),
-                );
-            }
-            Err(e) => {
-                return fail(
-                    PAM_AUTHINFO_UNAVAIL,
-                    format!("bridge executable {bridge_path:?} unreadable for pin check: {e}"),
-                );
-            }
+    }
+    let expected = match decode_hex32(&record.bridge_sha256) {
+        Some(v) => v,
+        None => {
+            return fail(
+                PAM_AUTHINFO_UNAVAIL,
+                "recorded bridge_sha256 is not a 32-byte lowercase hex digest",
+            );
+        }
+    };
+    match deps.sha256_file(bridge_path) {
+        Ok(actual) if actual == expected => {}
+        Ok(_) => {
+            return fail(
+                PAM_AUTHINFO_UNAVAIL,
+                format!(
+                    "bridge executable {bridge_path:?} failed its SHA-256 pin check \
+                     (possible tampering); refusing to launch"
+                ),
+            );
+        }
+        Err(e) => {
+            return fail(
+                PAM_AUTHINFO_UNAVAIL,
+                format!("bridge executable {bridge_path:?} unreadable for pin check: {e}"),
+            );
         }
     }
 
@@ -501,11 +602,12 @@ pub fn authenticate<S: PamSeam, D: Deps>(
                             outcome.sign_count
                         ),
                     );
-                    AuthOutcome::Success {
-                        sign_count: outcome.sign_count,
-                    }
+                    AuthOutcome::Success
                 }
-                Err(e) => fail(PAM_AUTH_ERR, format!("assertion verification failed: {e}")),
+                Err(e) => fail(
+                    pam_code_for_verify(&e),
+                    format!("assertion verification failed: {e}"),
+                ),
             }
         }
         RunnerResponse::Error(error) => {
@@ -553,7 +655,7 @@ pub fn run<S: PamSeam, D: Deps>(seam: &mut S, deps: &D, flags: i32, raw_args: &[
     };
 
     match outcome {
-        AuthOutcome::Success { .. } => PAM_SUCCESS,
+        AuthOutcome::Success => PAM_SUCCESS,
         AuthOutcome::Failure { code, .. } => {
             seam.fail_delay(FAIL_DELAY_USEC);
             code
@@ -607,6 +709,131 @@ mod tests {
         ] {
             assert_eq!(bridge_error_code(e), PAM_AUTHINFO_UNAVAIL, "{e:?}");
         }
+    }
+
+    /// One of every [`VerifyError`] variant, so the mapping and reason shape are
+    /// exhaustive today. A new variant forces a deliberate addition here.
+    fn all_verify_errors() -> Vec<VerifyError> {
+        vec![
+            VerifyError::MalformedClientData { reason: "r" },
+            VerifyError::ClientDataFieldMissing,
+            VerifyError::ClientDataTypeMismatch,
+            VerifyError::ChallengeMismatch,
+            VerifyError::OriginMismatch,
+            VerifyError::MalformedAuthenticatorData { reason: "r" },
+            VerifyError::RpIdHashMismatch,
+            VerifyError::UserPresenceRequired,
+            VerifyError::UserVerificationRequired,
+            VerifyError::CounterRegression {
+                stored: 5,
+                observed: 0,
+            },
+            VerifyError::MalformedAttestationObject { reason: "r" },
+            VerifyError::MissingAttestationField,
+            VerifyError::UnsupportedAttestationFormat {
+                format: "f".to_string(),
+            },
+            VerifyError::InvalidAttestationStatement,
+            VerifyError::AttestationNotAllowed,
+            VerifyError::MalformedCoseKey { reason: "r" },
+            VerifyError::CoseKeyCompressedPoint,
+            VerifyError::CosePointNotOnCurve,
+            VerifyError::CoseKeyModulusSize { bits: 1024 },
+            VerifyError::CoseKeyExponentNotAllowed,
+            VerifyError::UnsupportedKeyType { kty: 99 },
+            VerifyError::UnsupportedAlgorithm { alg: -9999 },
+            VerifyError::AlgorithmMismatch,
+            VerifyError::EmptyCredentialId,
+            VerifyError::CredentialIdMismatch,
+            VerifyError::MalformedSignature { reason: "r" },
+            VerifyError::SignatureInvalid,
+            VerifyError::MalformedCertificate { reason: "r" },
+            VerifyError::CertificateChainEmpty,
+            VerifyError::CertificateChainAnchorNotFound,
+            VerifyError::CertificateChainSignatureInvalid,
+            VerifyError::CertificateChainIssuerMismatch,
+            VerifyError::CertificateVersionNotV3,
+            VerifyError::CertificateLeafIsCa,
+            VerifyError::CertificateIntermediateNotCa,
+            VerifyError::CertificateMissingBasicConstraints,
+            VerifyError::CertificateSubjectOuMismatch,
+            VerifyError::CertificateExpired,
+            VerifyError::CertificateNotYetValid,
+            VerifyError::CertificateAaguidExtensionMissing,
+            VerifyError::CertificateAaguidMalformed,
+            VerifyError::CertificateAaguidMismatch,
+            VerifyError::AaguidNotAllowed,
+            VerifyError::UnsupportedCertificateAlgorithm,
+            VerifyError::TpmVersionUnsupported {
+                ver: "1.0".to_string(),
+            },
+            VerifyError::MalformedTpmCertInfo { reason: "r" },
+            VerifyError::MalformedTpmPubArea { reason: "r" },
+            VerifyError::TpmCertInfoMagic,
+            VerifyError::TpmCertInfoType,
+            VerifyError::TpmCertInfoExtraDataMismatch,
+            VerifyError::TpmCertInfoNameMismatch,
+            VerifyError::TpmNameAlgUnsupported { name_alg: 0x000b },
+            VerifyError::TpmPubAreaKeyMismatch,
+            VerifyError::TpmPubAreaKeyBitsMismatch {
+                declared: 2048,
+                actual: 1024,
+            },
+            VerifyError::TpmAlgorithmUnsupported { alg: -9999 },
+            VerifyError::TpmAikSubjectNotEmpty,
+            VerifyError::TpmAikEkuMissing,
+            VerifyError::TpmAikKeyUsageForbidsSignature,
+            VerifyError::Internal { reason: "r" },
+        ]
+    }
+
+    /// L8-7: every `VerifyError` maps to `PAM_AUTH_ERR`, and the call-site reason and
+    /// audit line carry both the event label and the error's own display text.
+    #[test]
+    fn every_verify_error_maps_to_pam_auth_err_with_a_stable_reason() {
+        let errors = all_verify_errors();
+        // A guard against silently dropping variants from the fixture.
+        assert!(errors.len() >= 59, "expected the full variant set");
+        for e in errors {
+            assert_eq!(pam_code_for_verify(&e), PAM_AUTH_ERR, "{e:?}");
+
+            // The reason shape the state machine emits for a verify failure.
+            let reason = format!("assertion verification failed: {e}");
+            assert!(
+                reason.starts_with("assertion verification failed: "),
+                "{reason}"
+            );
+            // The syslog line names the code and includes the error's display text.
+            let msg = failure_message(pam_code_for_verify(&e), &reason);
+            assert!(msg.contains("PAM_AUTH_ERR"), "{msg}");
+            assert!(msg.contains(&e.to_string()), "{msg}");
+        }
+    }
+
+    /// L10-2: the bridge hasher streams (never `fs::read`-ing the whole executable) and
+    /// returns a digest identical to a one-shot hash of the same bytes.
+    #[test]
+    fn sha256_file_nofollow_streams_and_matches_a_known_digest() {
+        use std::io::Write as _;
+        // Kept small: the process temp dir can be a tiny tmpfs in constrained CI. The
+        // behaviour under test is digest correctness and O_NOFOLLOW, not file size.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("bridge.exe");
+        let bytes = vec![0x5au8; 8 * 1024];
+        std::fs::File::create(&path)
+            .and_then(|mut f| f.write_all(&bytes))
+            .expect("write");
+        let expected: [u8; 32] = {
+            use sha2::{Digest as _, Sha256};
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&Sha256::digest(&bytes));
+            out
+        };
+        assert_eq!(sha256_file_nofollow(&path).unwrap(), expected);
+        // A symlink at the path is refused rather than followed.
+        let link = dir.path().join("link.exe");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(sha256_file_nofollow(&link).is_err());
     }
 
     #[test]

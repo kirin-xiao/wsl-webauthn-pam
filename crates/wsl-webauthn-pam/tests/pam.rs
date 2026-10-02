@@ -206,13 +206,54 @@ fn pin_unreadable_is_authinfo_unavail() {
     assert_eq!(run_basic(&mut seam, &deps, 0, &[]), PAM_AUTHINFO_UNAVAIL);
 }
 
+/// L2-4: the pin can no longer be disabled from the argument surface, and an
+/// untrusted (group/other-writable or symlinked) bridge path is refused before the
+/// hash. The production check is exercised against a tempdir it will accept.
 #[test]
-fn noverifypin_bypasses_a_pin_mismatch() {
+fn untrusted_bridge_path_is_authinfo_unavail() {
+    let (_f, mut seam, mut deps) = happy();
+    deps.trust = TrustBehavior::Untrusted;
+    assert_eq!(run_basic(&mut seam, &deps, 0, &[]), PAM_AUTHINFO_UNAVAIL);
+}
+
+/// A stray `noverifypin` token is now an unknown argument: it must not re-enable a
+/// pin-check bypass. With the pin intentionally mismatched, the run must still fail.
+#[test]
+fn noverifypin_token_no_longer_bypasses_a_pin_mismatch() {
     let (_f, mut seam, mut deps) = happy();
     deps.sha256 = Sha256Behavior::Fixed([0u8; 32]);
     assert_eq!(
         run_basic(&mut seam, &deps, 0, &["noverifypin"]),
-        PAM_SUCCESS
+        PAM_AUTHINFO_UNAVAIL
+    );
+}
+
+/// The production trust check accepts a regular, non-symlinked bridge file inside a
+/// root-owned win_mnt, and rejects a symlink at the bridge path.
+#[test]
+fn production_trust_check_accepts_regular_file_and_rejects_symlink() {
+    use pam_wsl_webauthn::logic::bridge_path_is_trusted;
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let real = dir.path().join("Bridge.exe");
+    std::fs::write(&real, b"exe").unwrap();
+    assert!(
+        bridge_path_is_trusted(&real, dir.path()).is_ok(),
+        "a regular file under win_mnt is trusted by the production check"
+    );
+
+    let link = dir.path().join("Link.exe");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert!(
+        bridge_path_is_trusted(&link, dir.path()).is_err(),
+        "a symlinked bridge path must be refused"
+    );
+
+    // A group/other-writable regular file is refused on a non-DrvFs mount.
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(
+        bridge_path_is_trusted(&real, dir.path()).is_err(),
+        "a group/other-writable bridge must be refused"
     );
 }
 
@@ -415,6 +456,34 @@ fn credential_id_mismatch_is_auth_err() {
     assert_eq!(run_basic(&mut seam, &deps, 0, &[]), PAM_AUTH_ERR);
 }
 
+/// L2-11: a `Probe`/`Enroll` response arriving where an `Assert` was requested is an
+/// unexpected variant and must fail closed with `PAM_AUTH_ERR` — never authenticate.
+#[test]
+fn unexpected_response_variant_is_auth_err() {
+    for script in [script_probe(), script_enroll()] {
+        let (_f, mut seam, mut deps) = happy();
+        deps.runner.args = vec![script.clone()];
+        assert_eq!(
+            run_basic(&mut seam, &deps, 0, &[]),
+            PAM_AUTH_ERR,
+            "script {script}"
+        );
+    }
+}
+
+/// L2-11: a record with the correct `rp_id` but a mismatched `origin` is refused
+/// before the bridge runs (defence in depth). Only the `rp_id` mismatch was tested.
+#[test]
+fn record_origin_mismatch_is_authinfo_unavail() {
+    let fixture = Fixture::new();
+    let mut record = fixture.record("alice", 0);
+    record.origin = "https://evil.example".to_string();
+    let store = fixture.enrolled_store(&record);
+    let mut seam = FakeSeam::for_user("alice");
+    let deps = fixture.deps(store, vec![fixture.success_script(false)]);
+    assert_eq!(run_basic(&mut seam, &deps, 0, &[]), PAM_AUTHINFO_UNAVAIL);
+}
+
 // ---------------------------------------------------------------------------
 // Panic containment
 // ---------------------------------------------------------------------------
@@ -446,7 +515,7 @@ fn entropy_failure_outcome_is_authinfo_unavail() {
             assert_eq!(code, PAM_AUTHINFO_UNAVAIL);
             assert!(reason.contains("entropy"), "reason: {reason}");
         }
-        AuthOutcome::Success { .. } => panic!("entropy failure must not authenticate"),
+        AuthOutcome::Success => panic!("entropy failure must not authenticate"),
     }
 }
 
