@@ -14,6 +14,7 @@ name: CI
 #   windows-gnu ubuntu: cross-build WSLWebAuthnBridge.exe for x86_64-pc-windows-gnu
 #   aarch64     ubuntu-24.04-arm: native release build (really links the cdylib)
 #   cargo-deny  supply-chain: advisories / bans / licenses / sources
+#   machete     lint for genuinely unused manifest dependencies
 #   actionlint  lint the workflow YAML itself
 #   pam-profile SR-21 / acceptance 5: real pam-auth-update expansion guard
 #   fuzz-smoke  nightly cargo-fuzz smoke (pinned 0.13.2, locked, artifacts on failure)
@@ -248,6 +249,23 @@ jobs:
           command: check
           arguments: --all-features --locked
           log-level: warn
+
+  # L5-5 = L7-3 = L16-12: a manifest may declare a dependency no source/target
+  # in the crate actually uses (this caught thiserror/pam, serde/runner+bridge,
+  # base64/store). cargo check/build never notices, so gate it explicitly.
+  # The action fetches the *latest* cargo-machete release, so the version is not
+  # pinned by SHA; the job is a low-risk lint and does not execute our code.
+  machete:
+    name: unused dependencies (cargo-machete)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+
+      - name: cargo-machete
+        uses: bnjbvr/cargo-machete@ac30a525c0a8d163a92d727b3ff079ee3f6ecb08 # v0.9.2
 
   actionlint:
     name: actionlint (workflows)

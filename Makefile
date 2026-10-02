@@ -20,7 +20,7 @@ ACTIONLINT ?= $(HOME)/.local/bin/actionlint
 
 WORKFLOWS := .github/workflows/ci.yaml .github/workflows/release.yaml
 
-.PHONY: all bridge test check fmt clippy deny pam-profile crlf lint-actions release clean
+.PHONY: all bridge test check fmt clippy deny machete pam-profile crlf lint-actions release clean
 
 # Default: Linux module + CLI (linked against libpam0g-dev) and the Windows exe.
 all:
@@ -41,7 +41,7 @@ test:
 	$(CARGO) test --workspace --locked
 
 # Local pre-flight: everything CI gates on, best-effort for tools not installed.
-check: fmt clippy test crlf deny
+check: fmt clippy test crlf deny machete
 	@echo ">> check complete"
 
 fmt:
@@ -55,6 +55,14 @@ deny:
 		cargo-deny check; \
 	else \
 		echo ">> cargo-deny not installed; skipping (cargo install cargo-deny)"; \
+	fi
+
+# L5-5: catch manifest dependencies no crate source actually uses.
+machete:
+	@if command -v cargo-machete >/dev/null 2>&1; then \
+		cargo-machete; \
+	else \
+		echo ">> cargo-machete not installed; skipping (cargo install cargo-machete)"; \
 	fi
 
 pam-profile:

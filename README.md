@@ -452,7 +452,8 @@ directly, which is required for enrollment and authentication.)
 | `make` / `make all` | Linux module + CLI (release) and the Windows bridge |
 | `make bridge` | Bridge only (`cargo.exe`, else `x86_64-pc-windows-gnu`) |
 | `make test` | `cargo test --workspace --locked` |
-| `make check` | `fmt` + `clippy` + `test` + `deny` |
+| `make check` | `fmt` + `clippy` + `test` + `deny` + `machete` |
+| `make machete` | `cargo-machete`: fail on manifest dependencies no source uses |
 | `make pam-profile` | Validate the `pam-config` profile and its `pam-auth-update` expansion |
 | `make release` | Assemble `build/release/` + a per-arch tarball + `SHA256SUMS` |
 
