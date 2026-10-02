@@ -60,13 +60,13 @@ use wsl_webauthn_protocol::{
 pub const SYSTEM_INTEROP_PATH: &str = "/proc/sys/fs/binfmt_misc/WSLInterop";
 
 /// `timeout_ms` sent to the bridge for a `probe` (plan §3).
-pub const DEFAULT_PROBE_TIMEOUT_MS: u32 = 3_000;
+pub const BRIDGE_PROBE_TIMEOUT_MS: u32 = 3_000;
 
 /// Default `timeout_ms` for `enroll` (mirrors the protocol constant, plan §3).
-pub const DEFAULT_ENROLL_TIMEOUT_MS: u32 = wsl_webauthn_protocol::BRIDGE_ENROLL_TIMEOUT_MS;
+pub const BRIDGE_ENROLL_TIMEOUT_MS: u32 = wsl_webauthn_protocol::BRIDGE_ENROLL_TIMEOUT_MS;
 
 /// Default `timeout_ms` for `assert` (mirrors the protocol constant, plan §3).
-pub const DEFAULT_ASSERT_TIMEOUT_MS: u32 = wsl_webauthn_protocol::BRIDGE_AUTH_TIMEOUT_MS;
+pub const BRIDGE_ASSERT_TIMEOUT_MS: u32 = wsl_webauthn_protocol::BRIDGE_AUTH_TIMEOUT_MS;
 
 /// Maximum bytes of the child's stderr we retain (bounded capture).
 pub const MAX_STDERR_BYTES: usize = 4 * 1024;
@@ -496,11 +496,11 @@ impl Runner {
 
     /// Probe for a user-verifying platform authenticator.
     ///
-    /// Uses [`DEFAULT_PROBE_TIMEOUT_MS`] as the bridge `timeout_ms`.
+    /// Uses [`BRIDGE_PROBE_TIMEOUT_MS`] as the bridge `timeout_ms`.
     pub fn probe(&self, deadline: Duration) -> Result<RunnerResponse, RunnerError> {
         self.run(
             Request::Probe {
-                timeout_ms: DEFAULT_PROBE_TIMEOUT_MS,
+                timeout_ms: BRIDGE_PROBE_TIMEOUT_MS,
             },
             deadline,
         )
@@ -921,7 +921,7 @@ impl EnrollParams {
             user_name: user_name.into(),
             user_display_name: user_display_name.into(),
             algs: vec![-7, -257],
-            timeout_ms: DEFAULT_ENROLL_TIMEOUT_MS,
+            timeout_ms: BRIDGE_ENROLL_TIMEOUT_MS,
         }
     }
 
@@ -958,7 +958,7 @@ impl AssertParams {
         AssertParams {
             client_data_json: client_data_json.into(),
             allow_credentials,
-            timeout_ms: DEFAULT_ASSERT_TIMEOUT_MS,
+            timeout_ms: BRIDGE_ASSERT_TIMEOUT_MS,
         }
     }
 
