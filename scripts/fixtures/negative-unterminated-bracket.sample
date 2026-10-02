@@ -1,0 +1,3 @@
+# NEGATIVE FIXTURE: a bracket control token with no closing `]`.
+auth	[success=1 default=ignore	pam_wsl_webauthn.so
+auth	[success=1 default=ignore]	pam_unix.so nullok try_first_pass

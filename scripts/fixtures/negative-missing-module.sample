@@ -1,0 +1,5 @@
+# NEGATIVE FIXTURE: a well-formed stack with no pam_wsl_webauthn.so line at all,
+# i.e. the profile silently failed to install/enable.
+auth	[success=1 default=ignore]	pam_unix.so nullok try_first_pass
+auth	requisite			pam_deny.so
+auth	required			pam_permit.so

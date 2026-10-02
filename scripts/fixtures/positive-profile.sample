@@ -1,0 +1,6 @@
+Name: WSL WebAuthn authentication
+Default: no
+Priority: 260
+Auth-Type: Primary
+Auth:
+        [success=end default=ignore]    pam_wsl_webauthn.so
