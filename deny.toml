@@ -1,6 +1,12 @@
 # cargo-deny configuration (plan §11).
 # Run: cargo deny check
-
+#
+# NOTE: the CI `cargo-deny` job (see .github/workflows/ci.yaml) invokes the action
+# with `--all-features`, which overrides the `[graph]` defaults below. A bare local
+# `cargo deny check` uses these `false` values instead. The gate itself is not made
+# looser by either value: keeping `all-features = false` here means a feature-enabled
+# graph is only checked when CI (or a local run) explicitly asks for it, so dropping
+# `--all-features` from CI is a visible edit there rather than a silent config change.
 [graph]
 all-features = false
 no-default-features = false

@@ -186,14 +186,20 @@ PATH (when running under sudo, secure_path can hide the Windows mount; use the a
 
 /// How a bridge process terminated.
 ///
-/// Distinguishes a normal exit code from death by an unmasked signal, so a transport
-/// failure names the actual cause instead of an ambiguous `None` status.
+/// Distinguishes a normal exit code from death by an unmasked signal (and an
+/// unclassifiable `wait` status), so a transport failure names the actual cause instead
+/// of an ambiguous `None` status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitReason {
     /// Exited normally with this code (`0..=255`).
     Code(i32),
     /// Killed by this signal number (e.g. `9` = `SIGKILL`).
     Signal(i32),
+    /// `wait` reported neither an exit code nor a terminating signal.
+    ///
+    /// This is not expected for a normally reaped child, but it is modeled explicitly so
+    /// diagnostics never fabricate a misleading `signal 0`.
+    Unknown,
 }
 
 impl ExitReason {
@@ -202,8 +208,12 @@ impl ExitReason {
         use std::os::unix::process::ExitStatusExt;
         match status.code() {
             Some(code) => ExitReason::Code(code),
-            // No exit code means the child was terminated by a signal.
-            None => ExitReason::Signal(status.signal().unwrap_or(0)),
+            // No exit code means the child was terminated by a signal. If `wait` reports
+            // neither a code nor a signal, say so instead of inventing `Signal(0)`.
+            None => match status.signal() {
+                Some(signal) => ExitReason::Signal(signal),
+                None => ExitReason::Unknown,
+            },
         }
     }
 
@@ -211,15 +221,15 @@ impl ExitReason {
     pub fn code(self) -> Option<i32> {
         match self {
             ExitReason::Code(code) => Some(code),
-            ExitReason::Signal(_) => None,
+            ExitReason::Signal(_) | ExitReason::Unknown => None,
         }
     }
 
     /// The terminating signal, if any.
     pub fn signal(self) -> Option<i32> {
         match self {
-            ExitReason::Code(_) => None,
             ExitReason::Signal(sig) => Some(sig),
+            ExitReason::Code(_) | ExitReason::Unknown => None,
         }
     }
 }
@@ -231,6 +241,7 @@ impl std::fmt::Display for ExitReason {
             ExitReason::Signal(signal) => {
                 write!(f, "signal {signal} ({})", signal_name(*signal))
             }
+            ExitReason::Unknown => write!(f, "unknown termination status"),
         }
     }
 }
@@ -1033,6 +1044,7 @@ fn bridge_exit_meaning(reason: ExitReason) -> &'static str {
         }
         ExitReason::Code(_) => "unrecognized bridge transport failure",
         ExitReason::Signal(_) => "terminated by a signal before writing a response",
+        ExitReason::Unknown => "terminated without an exit code or signal",
     }
 }
 
@@ -1047,6 +1059,7 @@ fn bridge_failed(status: &ExitStatus, err_buf: &[u8]) -> RunnerError {
                 signal_name(signal)
             )
         }
+        ExitReason::Unknown => "bridge terminated without an exit code or signal".to_string(),
     };
     let mut message = format!("{label}: {}", bridge_exit_meaning(reason));
     if let Some(tail) = stderr_tail(err_buf, STDERR_DIAGNOSTIC_BYTES) {
