@@ -246,10 +246,16 @@ directory):
 ```sh
 git clone https://github.com/kirin-xiao/wsl-webauthn-pam
 cd wsl-webauthn-pam
-make                                    # or: cargo build --release --locked
-sudo ./build/release/install.sh         # after `make release`, or:
-sudo wsl-webauthn-pam install           # if the CLI is on PATH
+make release                            # or: cargo build --release --locked
+tar xzf build/wsl-webauthn-pam-<version>-<arch>.tar.gz -C build
+sudo ./build/wsl-webauthn-pam-<version>-<arch>/install.sh
 ```
+
+`make release` stages the release artifacts under
+`build/wsl-webauthn-pam-<version>-<arch>/` (the `make all` target alone leaves
+them in `target/`). The shim runs the CLI from its own directory, so it must be
+invoked from inside the unpacked/staged directory (or from the release layout).
+Alternatively, if the CLI is on `PATH`: `sudo wsl-webauthn-pam install`.
 
 `install` (running as root) will:
 
@@ -450,33 +456,37 @@ directly, which is required for enrollment and authentication.)
 | Target | What it does |
 |---|---|
 | `make` / `make all` | Linux module + CLI (release) and the Windows bridge |
-| `make bridge` | Bridge only (`cargo.exe`, else `x86_64-pc-windows-gnu`) |
+| `make bridge` | Bridge only (`cargo.exe`, else the host-matched GNU target) |
 | `make test` | `cargo test --workspace --locked` |
-| `make check` | `fmt` + `clippy` + `test` + `deny` |
+| `make check` | `fmt` + `clippy` + `test` + `deny` + `machete` |
+| `make machete` | `cargo-machete`: fail on manifest dependencies no source uses |
 | `make pam-profile` | Validate the `pam-config` profile and its `pam-auth-update` expansion |
-| `make release` | Assemble `build/release/` + a per-arch tarball + `SHA256SUMS` |
+| `make release` | Assemble `build/wsl-webauthn-pam-<version>-<arch>.tar.gz` + `build/SHA256SUMS` |
 
 ### Release artifact layout
 
 Tagging `v*` triggers the release workflow. Each architecture produces one
-tarball, alongside a top-level `SHA256SUMS` covering every tarball:
+tarball, alongside a top-level `SHA256SUMS` covering every tarball; `make
+release` reproduces the same layout locally under `build/`:
 
 ```
 wsl-webauthn-pam-<version>-<arch>.tar.gz      # arch ∈ {x86_64, aarch64}
-├── pam_wsl_webauthn.so        # Linux PAM module
-├── wsl-webauthn-pam           # CLI
-├── WSLWebAuthnBridge.exe      # matching-arch Windows bridge
-├── install.sh
-├── pam-config
-└── README.md
+└── wsl-webauthn-pam-<version>-<arch>/        # single top-level directory
+    ├── pam_wsl_webauthn.so        # Linux PAM module
+    ├── wsl-webauthn-pam           # CLI
+    ├── WSLWebAuthnBridge.exe      # matching-arch Windows bridge
+    ├── install.sh
+    ├── pam-config
+    └── README.md
 
 SHA256SUMS                     # separate release asset: checksums for all tarballs
 ```
 
 Published on the [releases page](https://github.com/kirin-xiao/wsl-webauthn-pam/releases).
-Verify downloads against `SHA256SUMS`. (`make release` assembles the same
-contents under `build/` and additionally writes a `SHA256SUMS` file next to the
-tarball.)
+Verify downloads against `SHA256SUMS`. `make release` stages the files under
+`build/wsl-webauthn-pam-<version>-<arch>/`, tars that directory, and writes
+`build/SHA256SUMS` over the tarball — identical to the CI layout (only the arch
+matching the build host is produced locally).
 
 Releases produced by CI also carry a signed build-provenance attestation (the
 release binaries are stripped with thin LTO). Verify a download with

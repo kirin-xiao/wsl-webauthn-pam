@@ -24,7 +24,6 @@ wsl-webauthn-store = { path = "../wsl-webauthn-store" }
 wsl-webauthn-runner = { path = "../wsl-webauthn-runner" }
 wsl-webauthn-verifier = { path = "../wsl-webauthn-verifier" }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
 libc = { workspace = true }
 rand = { workspace = true }
 # Bridge executable pin: SHA-256 of the configured `bridge_path` (plan D11).

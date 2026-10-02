@@ -25,6 +25,22 @@ infrastructure, so correctness and fail-closed behavior matter more than speed.
 
   `cmd`/`powershell` users can instead build natively with `cargo.exe` (MSVC).
 
+- **Fuzzing** (`fuzz/`, a separate cargo-fuzz workspace) needs nightly. Because
+  `rust-toolchain.toml` pins stable, `cargo fuzz` and its child `cargo` would
+  otherwise use stable and fail on `-Zsanitizer`. Install a matching nightly and
+  export `RUSTUP_TOOLCHAIN` for the whole invocation (this env var overrides the
+  toolchain file for cargo-fuzz *and* every process it spawns):
+
+  ```sh
+  rustup toolchain install nightly-2026-09-30
+  export RUSTUP_TOOLCHAIN=nightly-2026-09-30   # same pin CI uses (ci.yaml fuzz-smoke)
+  cargo install cargo-fuzz --version 0.13.2 --locked
+  cd fuzz && cargo fuzz run assertion
+  ```
+
+  Reproducibility relies on the committed `fuzz/Cargo.lock` (cargo-fuzz 0.13.2
+  has no `--locked` pass-through).
+
 ## Gates
 
 Before opening a pull request, make sure all of these are green:

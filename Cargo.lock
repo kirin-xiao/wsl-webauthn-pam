@@ -1061,7 +1061,6 @@ checksum = "f17a85883d4e6d00e8a97c586de764dabcc06133f7f1d55dce5cdc070ad7fe59"
 name = "wsl-webauthn-bridge"
 version = "0.1.0"
 dependencies = [
- "serde",
  "serde_json",
  "wsl-webauthn-protocol",
 ]
@@ -1095,7 +1094,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
- "thiserror",
  "wsl-webauthn-protocol",
  "wsl-webauthn-runner",
  "wsl-webauthn-store",
@@ -1117,7 +1115,6 @@ name = "wsl-webauthn-runner"
 version = "0.1.0"
 dependencies = [
  "libc",
- "serde",
  "serde_json",
  "tempfile",
  "thiserror",
@@ -1128,7 +1125,6 @@ dependencies = [
 name = "wsl-webauthn-store"
 version = "0.1.0"
 dependencies = [
- "base64",
  "libc",
  "serde",
  "serde_json",

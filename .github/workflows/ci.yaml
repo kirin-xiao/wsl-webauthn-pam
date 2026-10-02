@@ -14,6 +14,7 @@ name: CI
 #   windows-gnu ubuntu: cross-build WSLWebAuthnBridge.exe for x86_64-pc-windows-gnu
 #   aarch64     ubuntu-24.04-arm: native release build (really links the cdylib)
 #   cargo-deny  supply-chain: advisories / bans / licenses / sources
+#   machete     lint for genuinely unused manifest dependencies
 #   actionlint  lint the workflow YAML itself
 #   pam-profile SR-21 / acceptance 5: real pam-auth-update expansion guard
 #   fuzz-smoke  nightly cargo-fuzz smoke (pinned 0.13.2, locked, artifacts on failure)
@@ -249,6 +250,26 @@ jobs:
           arguments: --all-features --locked
           log-level: warn
 
+  # L5-5 = L7-3 = L16-12: a manifest may declare a dependency no source/target
+  # in the crate actually uses (this caught thiserror/pam, serde/runner+bridge,
+  # base64/store). cargo check/build never notices, so gate it explicitly.
+  machete:
+    name: unused dependencies (cargo-machete)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+
+      # Pin cargo-machete by version (like cargo-fuzz below) rather than using
+      # its action, whose entrypoint downloads the moving "latest" release.
+      - name: Install cargo-machete
+        run: cargo install cargo-machete --version 0.9.2 --locked
+
+      - name: cargo-machete
+        run: cargo machete
+
   actionlint:
     name: actionlint (workflows)
     runs-on: ubuntu-latest
@@ -307,6 +328,13 @@ jobs:
     # `-Zsanitizer only accepted on nightly`. RUSTUP_TOOLCHAIN wins over
     # toolchain files for every process in the job (cargo-fuzz + its children).
     #
+    # L5-9: the fuzz toolchain is pinned to a *dated* nightly so the compiler
+    # (and therefore the sanitizer behaviour) does not drift under us; the same
+    # value is passed to dtolnay/rust-toolchain below. A local `cargo fuzz`
+    # invocation without this env var silently uses the stable toolchain from
+    # rust-toolchain.toml — export RUSTUP_TOOLCHAIN=<this nightly> when fuzzing
+    # locally (documented in CONTRIBUTING.md).
+    #
     # cargo-fuzz 0.13.2 has no `--locked` pass-through to its child `cargo`, so
     # reproducibility is enforced by the committed `fuzz/Cargo.lock` plus
     # CARGO_NET_OFFLINE=1 on the build/run steps. The dependency graph is
@@ -316,7 +344,7 @@ jobs:
     # download the fuzz workspace's deps (libfuzzer-sys, rsa, p256, …) since
     # `cargo install cargo-fuzz` above only fetches cargo-fuzz's own.
     env:
-      RUSTUP_TOOLCHAIN: nightly
+      RUSTUP_TOOLCHAIN: nightly-2026-09-30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -336,6 +364,9 @@ jobs:
       - name: Install nightly Rust
         if: steps.detect.outputs.present == 'true'
         uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly branch
+        with:
+          # L5-9: same dated nightly as RUSTUP_TOOLCHAIN above.
+          toolchain: nightly-2026-09-30
 
       - name: Cache
         if: steps.detect.outputs.present == 'true'

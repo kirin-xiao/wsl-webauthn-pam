@@ -35,31 +35,45 @@ ignore = [
 [licenses]
 version = 2
 confidence-threshold = 0.93
+# `cargo deny check licenses` must be warning-free: every entry here is a license
+# actually present in the resolved graph (`cargo deny list`). Do NOT pre-authorize
+# a license for a dependency that does not exist yet — that silently widens the
+# license gate and makes a genuinely new/unexpected license indistinguishable from
+# an old allowance. Add a license here only when a real crates.io dep needs it.
 allow = [
     # Project license.
     "MIT",
     # Dominant dual-license of the Rust ecosystem + common crypto crates.
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
     "BSD-2-Clause",
     "BSD-3-Clause",
-    "ISC",
-    "0BSD",
-    "Zlib",
     # Unicode data used by identifier/proptest tooling.
     "Unicode-3.0",
-    # Pre-vetted permissive / weak-copyleft licenses expected from the Wave A
-    # dependency tree. Kept here so a legitimate transitive dep does not stall
-    # CI; MPL-2.0 is file-level copyleft and only acceptable for unmodified
-    # third-party crates (we vendor none of it ourselves).
-    "MPL-2.0",
-    "CDLA-Permissive-2.0",
+    # `memchr` (via a dependency of serde_json/bstr) is dual MIT/Unlicense.
+    "Unlicense",
 ]
 # Crypto crates pull a few Apache-2.0/MIT dual-licensed helpers; nothing exotic.
+# Use `exceptions` for a one-off license that only one crate carries rather than
+# adding it to the global `allow` list.
 exceptions = []
 
 [bans]
 multiple-versions = "warn"
+# L5-8 = L15-13: the resolved graph carries a few duplicate crate versions. They
+# are documented skips rather than an upstream dedupe we cannot safely perform:
+#   * `winnow` 0.7 + 1.0 are both pulled by `toml` 0.9, which is mid-transition
+#     between its old and new parser and pins each internally. We cannot choose
+#     one without forking/patching `toml`.
+#   * `syn` 2 + 3 are build-time-only proc-macro deps (der_derive/curve25519 vs
+#     serde_derive); they never link into a shipped binary.
+#   * the dev-only `rand` 0.8+0.9 / `getrandom` 0.2+0.3 split is entirely inside
+#     `proptest`'s dev-dependency tree — we do not control those version pins.
+# `skip` allows all versions of these crates to coexist without a warning; a
+# duplicate of any *other* crate still warns. `skip-tree` exempts proptest's
+# dev-only subtree the same way.
+#
 # Wildcard version requirements (e.g. `serde = "*"`) are denied outright; only
 # *path* dependencies are exempted via `allow-wildcard-paths`. The workspace
 # crates depend on each other through `path = "../…"` deps and are all
@@ -71,11 +85,15 @@ multiple-versions = "warn"
 wildcards = "deny"
 allow-wildcard-paths = true
 deny = []
-skip = []
-skip-tree = []
+skip = [{ name = "winnow" }, { name = "syn" }]
+skip-tree = [{ name = "proptest" }]
 
 [sources]
 unknown-registry = "deny"
+# L5-10: every dependency resolves from the crates.io registry (no git sources in
+# either lockfile). The previous `allow-git = ["https://github.com/"]` matched
+# nothing and pre-authorized *any* github.com repo; if a git dependency is ever
+# introduced, it should be listed explicitly as a pinned revision then, not
+# blanket-allowed. `unknown-git = "deny"` rejects anything unlisted.
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = ["https://github.com/"]

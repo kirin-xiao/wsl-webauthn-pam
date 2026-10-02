@@ -22,7 +22,6 @@ bench = false
 
 [dependencies]
 wsl-webauthn-protocol = { path = "../wsl-webauthn-protocol" }
-serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 libc = { workspace = true }
