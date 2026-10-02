@@ -4,7 +4,6 @@
 //! to contain `unsafe` (see the crate-root `deny(unsafe_code)`). It exposes safe
 //! wrappers so the authentication logic itself stays entirely safe:
 //!
-//! * `open(2)` with `O_NOFOLLOW` — a bridge hash must never follow a symlink.
 //! * `statfs(2)` — detect a WSL DrvFs/9p mount, where POSIX ownership/mode are not
 //!   authoritative.
 //!
@@ -15,31 +14,13 @@
 #![allow(unsafe_code)]
 
 use std::ffi::{CString, c_char, c_int};
-use std::fs::File;
 use std::io;
-use std::os::fd::FromRawFd as _;
 use std::path::Path;
 
 /// Convert a path to a NUL-terminated C string.
 fn cpath(path: &Path) -> io::Result<CString> {
     CString::new(path.as_os_str().as_encoded_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))
-}
-
-/// Open `path` read-only, refusing a final symlink.
-///
-/// `O_NOFOLLOW` makes a symlink at the bridge path fail with `ELOOP` instead of
-/// silently hashing its target.
-pub(crate) fn open_readonly_nofollow(path: &Path) -> io::Result<File> {
-    let c = cpath(path)?;
-    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NOCTTY | libc::O_CLOEXEC;
-    // SAFETY: `c` is a valid NUL-terminated path; `open` returns an owned fd or -1.
-    let fd = unsafe { libc::open(c.as_ptr(), flags) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `fd` is a fresh owned descriptor from `open`, transferred exactly once.
-    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 /// `statfs(2)` superblock magic for `path`, if it can be statted.

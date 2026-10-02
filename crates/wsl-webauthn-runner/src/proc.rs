@@ -28,7 +28,15 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// A bridge executable opened once and held, so hash→spawn cannot be raced.
+use sha2::{Digest as _, Sha256};
+
+/// Upper bound on the bytes hashed from the bridge descriptor.
+///
+/// The real bridge is ~2 MB; a value this far above it is a sanity guard against
+/// hashing an attacker-planted huge/special file, not a functional limit.
+const MAX_BRIDGE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// A bridge executable opened once and held, so the hash and the spawn cannot be raced.
 ///
 /// The bridge path is opened `O_RDONLY|O_NOFOLLOW|O_CLOEXEC`; the path itself is never
 /// executed. Instead the descriptor is `F_DUPFD_CLOEXEC`'d to the lowest free descriptor
@@ -73,6 +81,16 @@ impl TrustedFile {
         }
         // SAFETY: `fd` is a fresh owned descriptor from `open`, so `File` may own it.
         let file = unsafe { File::from_raw_fd(fd) };
+        // The runner is the pin authority, so refuse anything that is not a regular file:
+        // hashing a character/block device would have no bound and could never reach EOF.
+        // (`probe --bridge` reaches the runner directly, bypassing the PAM path check.)
+        let meta = file.metadata()?;
+        if !meta.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bridge is not a regular file",
+            ));
+        }
         let (dev, ino) = stat_identity(file.as_raw_fd())?;
 
         // `F_DUPFD_CLOEXEC` returns the lowest free descriptor at/above 3. `FD_CLOEXEC`
@@ -118,6 +136,60 @@ impl TrustedFile {
     /// `(st_dev, st_ino)` of the held descriptor.
     pub(crate) fn identity(&self) -> (u64, u64) {
         (self.dev, self.ino)
+    }
+
+    /// SHA-256 of the bytes behind the held descriptor, read with `pread` from offset 0.
+    ///
+    /// This is the authoritative bridge pin: the digest is computed from the *same* open
+    /// file description the child will exec, so a path swap between the hash and the
+    /// spawn cannot change the hashed image. `pread` never advances the shared file
+    /// offset, so hashing cannot perturb a later `execve` that reads the inherited
+    /// descriptor.
+    pub(crate) fn sha256(&self) -> io::Result<[u8; 32]> {
+        let len = self.len()?;
+        if len > MAX_BRIDGE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{len} bytes is above the {MAX_BRIDGE_BYTES}-byte bridge sanity cap"),
+            ));
+        }
+
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 64 * 1024];
+        let mut offset: libc::off_t = 0;
+        loop {
+            let n = pread(self.inherit.as_raw_fd(), &mut buf, offset)?;
+            if n == 0 {
+                break;
+            }
+            // Enforce the cap as a hard ceiling, not just the initial `fstat` size: a file
+            // that grows while being hashed must not push the read past the bound.
+            if offset as u64 + n as u64 > MAX_BRIDGE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "bridge grew past the {MAX_BRIDGE_BYTES}-byte sanity cap while hashing"
+                    ),
+                ));
+            }
+            hasher.update(&buf[..n]);
+            offset += n as libc::off_t;
+        }
+        let digest = hasher.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&digest);
+        Ok(out)
+    }
+
+    /// Length of the held file, from `fstat`.
+    fn len(&self) -> io::Result<u64> {
+        // SAFETY: `fstat` writes into our local `stat` and only reads the fd.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::fstat(self.inherit.as_raw_fd(), &mut st) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(st.st_size as u64)
     }
 
     /// Path to the held descriptor, suitable for `Command::new` (`/proc/self/fd/N`).
@@ -207,6 +279,26 @@ pub(crate) fn poll(fds: &mut [libc::pollfd], timeout_ms: i32) -> io::Result<usiz
 pub(crate) fn read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     // SAFETY: `fd` is an owned descriptor and `buf` is a valid writable slice.
     let rc = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(rc as usize)
+}
+
+/// `pread(2)` once at an explicit offset, returning bytes read (`0` = EOF).
+///
+/// Unlike [`read`], this never mutates the descriptor's shared file offset, so hashing
+/// the held bridge descriptor cannot perturb a later `execve` of that descriptor.
+pub(crate) fn pread(fd: RawFd, buf: &mut [u8], offset: libc::off_t) -> io::Result<usize> {
+    // SAFETY: `fd` is an owned descriptor and `buf` is a valid writable slice.
+    let rc = unsafe {
+        libc::pread(
+            fd,
+            buf.as_mut_ptr().cast::<libc::c_void>(),
+            buf.len(),
+            offset,
+        )
+    };
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -429,5 +521,44 @@ mod tests {
         assert_eq!(err.raw_os_error(), Some(libc::ESTALE), "{err:?}");
         // Avoid a double-close of the same fd when `trusted` drops.
         std::mem::forget(trusted);
+    }
+
+    /// Hashing the held descriptor must not advance its shared file offset, and the
+    /// digest must match the known contents.
+    #[test]
+    fn held_fd_sha256_matches_and_does_not_advance_offset() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("tool");
+        write_exe(&path, "echo original");
+
+        let trusted = TrustedFile::open(&path).expect("open bridge");
+        // Put the offset somewhere non-zero so a `read`-based hash would move it.
+        // SAFETY: `lseek` only repositions the owned descriptor.
+        let seeked = unsafe { libc::lseek(trusted.inherit_fd(), 3, libc::SEEK_SET) };
+        assert_eq!(seeked, 3, "lseek failed: {}", io::Error::last_os_error());
+
+        let expected = {
+            let mut hasher = Sha256::new();
+            hasher.update(b"#!/bin/sh\necho original\n");
+            let d = hasher.finalize();
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&d);
+            a
+        };
+        assert_eq!(trusted.sha256().expect("sha256 held fd"), expected);
+
+        // SAFETY: `lseek(SEEK_CUR)` only reads the current offset.
+        let after = unsafe { libc::lseek(trusted.inherit_fd(), 0, libc::SEEK_CUR) };
+        assert_eq!(after, 3, "hashing must not move the shared file offset");
+    }
+
+    /// A non-regular file (e.g. `/dev/null`) is refused at open: hashing it has no EOF
+    /// bound and no exec meaning.
+    #[test]
+    fn non_regular_bridge_is_refused() {
+        match TrustedFile::open(Path::new("/dev/null")) {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e:?}"),
+            Ok(_) => panic!("a device node must be refused"),
+        }
     }
 }

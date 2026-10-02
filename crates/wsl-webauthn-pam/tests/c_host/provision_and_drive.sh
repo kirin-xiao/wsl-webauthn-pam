@@ -70,9 +70,9 @@ printf 'enabled\n' > /proc/sys/fs/binfmt_misc/WSLInterop
 #
 # `/tmp` is *shared* with the host and with any concurrent test, so a naive
 # `cp` into it races: two namespaces truncate-and-rewrite the same file while the
-# module is hashing it, and the pin check intermittently sees a partial file and
-# fails closed. Mount a private tmpfs over the bridge directory (visible only in
-# this mount namespace) so every run gets its own race-free copy.
+# runner is hashing and exec'ing it, and the pin check intermittently sees a
+# partial file and fails closed. Mount a private tmpfs over the bridge directory
+# (visible only in this mount namespace) so every run gets its own race-free copy.
 mkdir -p /tmp/wslwt-test
 mount -t tmpfs none /tmp/wslwt-test
 cp "$BRIDGE" /tmp/wslwt-test/bridge

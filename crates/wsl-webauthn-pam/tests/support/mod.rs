@@ -178,16 +178,6 @@ impl PamSeam for FakeSeam {
 // Scripted dependencies
 // ---------------------------------------------------------------------------
 
-/// How [`TestDeps::sha256_file`] behaves.
-pub enum Sha256Behavior {
-    /// Hash the real file through the production `O_NOFOLLOW` hasher.
-    OfFile,
-    /// Return this digest regardless of the file (a pin mismatch).
-    Fixed([u8; 32]),
-    /// Fail as if the file were unreadable.
-    Err(String),
-}
-
 /// How [`TestDeps::bridge_path_is_trusted`] behaves.
 pub enum TrustBehavior {
     /// Delegate to the production ownership/mode/symlink check.
@@ -197,6 +187,17 @@ pub enum TrustBehavior {
     Trusted,
     /// Refuse every path (drives the untrusted-path mapping).
     Untrusted,
+}
+
+/// How the fake runner handles the pin forwarded by the module.
+///
+/// The production runner hashes the held descriptor it executes, so the PAM fake accepts
+/// the forwarded expected digest and (optionally) records it for assertions.
+pub enum RunnerPinBehavior {
+    /// Return whatever digest the module forwarded (always matches).
+    Accept,
+    /// Simulate a pin mismatch: the fake reports `RunnerError::BridgeIntegrity`.
+    Mismatch,
 }
 
 /// How the runner is driven.
@@ -209,6 +210,10 @@ pub struct RunnerBehavior {
     pub args: Vec<String>,
     /// Which transport behaviour to exercise.
     pub mode: RunnerMode,
+    /// How the forwarded pin is treated.
+    pub pin: RunnerPinBehavior,
+    /// The last `expected_sha256` the module forwarded, for wiring assertions.
+    pub seen_expected_sha256: std::cell::RefCell<Option<[u8; 32]>>,
 }
 
 /// Runner transport modes.
@@ -230,8 +235,6 @@ pub struct TestDeps {
     pub config: ConfigReply,
     /// Fixed record reply (used when `store` is `None`).
     pub record: RecordReply,
-    /// Bridge-pin hashing behaviour.
-    pub sha256: Sha256Behavior,
     /// Bridge-path trust behaviour.
     pub trust: TrustBehavior,
     /// Bytes returned by `fill_random` (copied, repeated if needed).
@@ -357,14 +360,6 @@ impl Deps for TestDeps {
         }
     }
 
-    fn sha256_file(&self, path: &Path) -> Result<[u8; 32], String> {
-        match &self.sha256 {
-            Sha256Behavior::OfFile => hash_file(path),
-            Sha256Behavior::Fixed(d) => Ok(*d),
-            Sha256Behavior::Err(e) => Err(e.clone()),
-        }
-    }
-
     fn bridge_path_is_trusted(&self, path: &Path, win_mnt: &Path) -> Result<(), String> {
         match &self.trust {
             TrustBehavior::Real => pam_wsl_webauthn::logic::bridge_path_is_trusted(path, win_mnt),
@@ -387,9 +382,17 @@ impl Deps for TestDeps {
         &self,
         bridge: &Path,
         win_mnt: &Path,
+        expected_sha256: [u8; 32],
         params: AssertParams,
         deadline: Duration,
     ) -> Result<RunnerResponse, RunnerError> {
+        *self.runner.seen_expected_sha256.borrow_mut() = Some(expected_sha256);
+        if matches!(self.runner.pin, RunnerPinBehavior::Mismatch) {
+            return Err(RunnerError::BridgeIntegrity {
+                path: bridge.to_path_buf(),
+                detail: "test-forced SHA-256 pin mismatch (possible tampering)".to_string(),
+            });
+        }
         let deadline = match self.deadline_cap {
             Some(cap) => cap.min(deadline),
             None => deadline,
@@ -413,9 +416,13 @@ impl Deps for TestDeps {
     }
 }
 
-/// SHA-256 a file, mirroring the hardened O_NOFOLLOW hasher used in production.
+/// SHA-256 a file; test helper for computing an expected pin.
 pub fn hash_file(path: &Path) -> Result<[u8; 32], String> {
-    pam_wsl_webauthn::logic::sha256_file_nofollow(path)
+    let bytes = std::fs::read(path).map_err(|e| format!("read {path:?}: {e}"))?;
+    let digest = Sha256::digest(&bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -725,7 +732,6 @@ impl Fixture {
             store: Some(store),
             config: ConfigReply::Missing,
             record: RecordReply::NotFound,
-            sha256: Sha256Behavior::OfFile,
             trust: TrustBehavior::Trusted,
             random: self.challenge,
             random_error: None,
@@ -734,6 +740,8 @@ impl Fixture {
                 win_mnt: self.tmp.path().to_path_buf(),
                 args,
                 mode: RunnerMode::Real,
+                pin: RunnerPinBehavior::Accept,
+                seen_expected_sha256: std::cell::RefCell::new(None),
             },
             panic: false,
             deadline_cap: Some(Duration::from_secs(5)),

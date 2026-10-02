@@ -69,7 +69,7 @@ Consent phishing — making the user approve a ceremony they did not intend — 
 <!-- INVARIANT: CHAIN-PINNED-ROOT -->
 <!-- INVARIANT: CHAIN-PATHLEN -->
 | AAGUID allow-list | `08987058-cadc-4b81-b6e1-30de50dcbe96` (software TPM), `9ddd1817-af5a-4672-a2b9-3e3dd95000a9` (hardware TPM) | `STRICT_AAGUIDS` |
-| Bridge binary | SHA-256 recorded at enrollment, re-checked on every authentication | credential record `bridge_sha256`; `logic.rs` pin step |
+| Bridge binary | SHA-256 recorded at enrollment, re-checked on every authentication | credential record `bridge_sha256`; runner checks the held descriptor it executes (`Runner::expected_sha256`, `proc::TrustedFile::sha256`) |
 | COSE algorithms | `{-7 ES256, -257 RS256, -8 EdDSA}` | `crates/wsl-webauthn-verifier/src/cose.rs` |
 
 `verify_attestation` always uses the pinned fingerprint; the bundled root certificate is trusted **only** after its bytes hash to that pin (`crates/wsl-webauthn-verifier/src/ms_root.rs`). A test-only seam (`verify_attestation_with_anchor`, under the `test-anchor` feature) substitutes a synthetic root for tests; downstream crates never enable it.

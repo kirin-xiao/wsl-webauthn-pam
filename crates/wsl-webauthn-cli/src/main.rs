@@ -315,6 +315,7 @@ fn runner_error_code(error: &wsl_webauthn_runner::RunnerError) -> &'static str {
     match error {
         RunnerError::BridgeMissing { .. } => "bridge-missing",
         RunnerError::InteropUnavailable { .. } => "interop-unavailable",
+        RunnerError::BridgeIntegrity { .. } => "bridge-integrity",
         RunnerError::RequestTooLarge { .. } => "too-large",
         RunnerError::Spawn { .. } => "spawn",
         RunnerError::BridgeFailed { .. } => "bridge-failed",
@@ -1030,34 +1031,35 @@ fn cmd_enroll(
         );
     }
 
-    // Pin the bridge before the ceremony so the recorded hash corresponds to the exe
-    // that will actually be launched.
-    let bridge_sha256 = fsutil::sha256_hex_file(&config.bridge)
-        .with_context(|| format!("hashing bridge {}", config.bridge.display()))?;
-
+    // The record's pin comes from the accepted enrollment ceremony's exchange: the
+    // runner returns the digest of the descriptor it executed, binding the recorded pin
+    // to the bytes that actually ran.
     let runner = Runner::new(&config.bridge, &config.win_mnt);
     let store = Store::system();
 
     // 1. Probe first: a clear message is better than a mysterious ceremony failure.
-    match runner.probe(PROBE_DEADLINE) {
-        Ok(RunnerResponse::Probe {
-            uv_platform_available,
-            api_version,
-        }) => {
-            println!("  probe:   Windows Hello available (api_version {api_version})");
-            if !uv_platform_available {
-                bail!(
-                    "no user-verifying platform authenticator is available; enroll Windows Hello \
-                     in Windows Settings first"
-                );
+    let probe_exchange = match runner.probe_with_diagnostics(PROBE_DEADLINE) {
+        Ok(exchange) => match &exchange.response {
+            RunnerResponse::Probe {
+                uv_platform_available,
+                api_version,
+            } => {
+                println!("  probe:   Windows Hello available (api_version {api_version})");
+                if !uv_platform_available {
+                    bail!(
+                        "no user-verifying platform authenticator is available; enroll Windows Hello \
+                         in Windows Settings first"
+                    );
+                }
+                exchange
             }
-        }
-        Ok(RunnerResponse::Error(err)) => {
-            bail!("probe failed: {} ({err:?})", friendly_bridge_error(err));
-        }
-        Ok(other) => bail!("unexpected probe response: {other:?}"),
+            RunnerResponse::Error(err) => {
+                bail!("probe failed: {} ({err:?})", friendly_bridge_error(*err));
+            }
+            other => bail!("unexpected probe response: {other:?}"),
+        },
         Err(err) => bail!("probe transport error: {}", render_runner_error(&err)),
-    }
+    };
 
     // 2. Capture the Windows identity (non-fatal).
     let identity = capture_windows_identity(&config.win_mnt);
@@ -1076,7 +1078,7 @@ fn cmd_enroll(
     } else {
         AttestationPolicy::Strict
     };
-    let outcome = {
+    let (outcome, enrolled_sha256) = {
         // The bridge reports progress out-of-band; render the PIN phase as the
         // user-visible step so the second dialog does not pass unnoticed.
         let step = std::cell::Cell::new(0usize);
@@ -1102,7 +1104,20 @@ fn cmd_enroll(
         )?
     };
 
-    // 4. Build and persist the record.
+    // 4. Build and persist the record. The pin is the accepted enrollment ceremony's
+    // executed-descriptor digest.
+    let bridge_sha256 = fsutil::hex(&enrolled_sha256);
+    // A bridge swapped between the probe and the ceremony is either an operator racing an
+    // upgrade or a tamper attempt; both should stop enrollment rather than pin a file
+    // that did not run for the probe.
+    if probe_exchange.bridge_sha256 != enrolled_sha256 {
+        bail!(
+            "bridge changed on disk between probe and enrollment ({} -> {}); \
+             refusing to record a pin for an executable that may have been swapped",
+            fsutil::short_hash(&fsutil::hex(&probe_exchange.bridge_sha256)),
+            fsutil::short_hash(&bridge_sha256)
+        );
+    }
     let enrolled_at = format_rfc3339(SystemTime::now());
     let record = build_record(
         &target,
@@ -1156,7 +1171,7 @@ trait EnrollCeremony {
         &self,
         params: EnrollParams,
         deadline: Duration,
-    ) -> Result<RunnerResponse, wsl_webauthn_runner::RunnerError>;
+    ) -> Result<wsl_webauthn_runner::RunnerExchange, wsl_webauthn_runner::RunnerError>;
 
     /// Like [`EnrollCeremony::run_ceremony`], but reporting [`CeremonyProgress`] events
     /// from the bridge as they arrive.
@@ -1168,7 +1183,7 @@ trait EnrollCeremony {
         params: EnrollParams,
         deadline: Duration,
         _progress: Option<&wsl_webauthn_runner::ProgressSink<'_>>,
-    ) -> Result<RunnerResponse, wsl_webauthn_runner::RunnerError> {
+    ) -> Result<wsl_webauthn_runner::RunnerExchange, wsl_webauthn_runner::RunnerError> {
         self.run_ceremony(params, deadline)
     }
 }
@@ -1178,8 +1193,8 @@ impl EnrollCeremony for Runner {
         &self,
         params: EnrollParams,
         deadline: Duration,
-    ) -> Result<RunnerResponse, wsl_webauthn_runner::RunnerError> {
-        self.enroll(params, deadline)
+    ) -> Result<wsl_webauthn_runner::RunnerExchange, wsl_webauthn_runner::RunnerError> {
+        self.enroll_with_diagnostics(params, deadline)
     }
 
     fn run_ceremony_with_progress(
@@ -1187,8 +1202,8 @@ impl EnrollCeremony for Runner {
         params: EnrollParams,
         deadline: Duration,
         progress: Option<&wsl_webauthn_runner::ProgressSink<'_>>,
-    ) -> Result<RunnerResponse, wsl_webauthn_runner::RunnerError> {
-        self.enroll_with_progress(params, deadline, progress)
+    ) -> Result<wsl_webauthn_runner::RunnerExchange, wsl_webauthn_runner::RunnerError> {
+        self.enroll_with_diagnostics_and_progress(params, deadline, progress)
     }
 }
 
@@ -1219,7 +1234,7 @@ fn enroll_with_double_enroll(
     policy: &AttestationPolicy,
     allow_unattested: bool,
     progress: Option<&wsl_webauthn_runner::ProgressSink<'_>>,
-) -> anyhow::Result<EnrollOutcome> {
+) -> anyhow::Result<(EnrollOutcome, [u8; 32])> {
     enroll_with_verifier(
         runner,
         target,
@@ -1262,7 +1277,7 @@ fn enroll_checked(
     allow_unattested: bool,
     replace: bool,
     progress: Option<&wsl_webauthn_runner::ProgressSink<'_>>,
-) -> anyhow::Result<EnrollOutcome> {
+) -> anyhow::Result<(EnrollOutcome, [u8; 32])> {
     if let Err(error) = store.preflight_write() {
         let context = if matches!(error, StoreError::NotFound { .. }) {
             "the credential store is not initialized; run `install` first"
@@ -1313,12 +1328,12 @@ fn enroll_with_verifier(
     allow_unattested: bool,
     verify: VerifyCeremony,
     progress: Option<&wsl_webauthn_runner::ProgressSink<'_>>,
-) -> anyhow::Result<EnrollOutcome> {
+) -> anyhow::Result<(EnrollOutcome, [u8; 32])> {
     // Ceremony #1. `first` is scoped to this function and is explicitly dropped before
     // the retry: nothing derived from it can be returned or recorded.
     let first = run_ceremony(runner, target, progress)?;
     match verify(&first, policy) {
-        Ok(outcome) => return Ok(outcome),
+        Ok(outcome) => return Ok((outcome, first.bridge_sha256)),
         Err(error) if is_unattested_rejection(&error) => {
             if allow_unattested {
                 // Under AllowUnattested the verifier would have accepted it; an
@@ -1342,7 +1357,7 @@ fn enroll_with_verifier(
     // propagates immediately via `?`.
     let second = run_ceremony(runner, target, progress)?;
     match verify(&second, policy) {
-        Ok(outcome) => Ok(outcome),
+        Ok(outcome) => Ok((outcome, second.bridge_sha256)),
         Err(error) if is_unattested_rejection(&error) => bail!(
             "both enrollment ceremonies produced an unattested credential; this machine \
              has no TPM-backed Windows Hello. Re-run with --allow-unattested to accept a \
@@ -1386,8 +1401,9 @@ fn run_ceremony(
                 render_runner_error(&error)
             )
         })?;
+    let bridge_sha256 = response.bridge_sha256;
 
-    match response {
+    match response.response {
         RunnerResponse::Enroll {
             format,
             attestation_object,
@@ -1403,6 +1419,7 @@ fn run_ceremony(
                 format,
                 attestation_bytes,
                 credential_bytes,
+                bridge_sha256,
             })
         }
         RunnerResponse::Error(err) => bail!(
@@ -1421,6 +1438,8 @@ struct CeremonyOutcome {
     format: String,
     attestation_bytes: Vec<u8>,
     credential_bytes: Vec<u8>,
+    /// SHA-256 of the descriptor executed for this ceremony.
+    bridge_sha256: [u8; 32],
 }
 
 impl std::fmt::Debug for CeremonyOutcome {
@@ -1558,55 +1577,57 @@ fn cmd_probe(bridge: Option<PathBuf>, win_mnt: Option<PathBuf>) -> anyhow::Resul
         return Ok(EXIT_FAIL);
     }
 
-    // Bridge pin: if the current user has a record, report whether the pin still matches.
-    if let Ok(user) = resolve_target_user(None)
-        && let Ok(record) = Store::system().load(&user.name)
-    {
-        match fsutil::sha256_hex_file(&config.bridge) {
-            Ok(actual) if actual == record.bridge_sha256 => {
-                println!("pin:     OK (matches the enrolled bridge)");
+    // Probe the bridge. The runner hashes the descriptor it executes, so its reported
+    // digest is the value to compare against the enrolled pin.
+    let enrolled_pin = resolve_target_user(None)
+        .ok()
+        .and_then(|user| Store::system().load(&user.name).ok())
+        .map(|record| record.bridge_sha256);
+
+    let runner = Runner::new(&config.bridge, &config.win_mnt);
+    match runner.probe_with_diagnostics(PROBE_DEADLINE) {
+        Ok(exchange) => match &exchange.response {
+            RunnerResponse::Probe {
+                uv_platform_available,
+                api_version,
+            } => {
+                println!("interop: OK");
+                println!("api_version: {api_version}");
+                if *uv_platform_available {
+                    println!("Windows Hello: available");
+                } else {
+                    println!(
+                        "Windows Hello: NOT available (no user-verifying platform authenticator)"
+                    );
+                    ok = false;
+                }
+                if let Some(enrolled) = &enrolled_pin {
+                    let actual = fsutil::hex(&exchange.bridge_sha256);
+                    if &actual == enrolled {
+                        println!("pin:     OK (matches the enrolled bridge)");
+                    } else {
+                        println!(
+                            "pin:     MISMATCH — enrolled {}, executed {}",
+                            fsutil::short_hash(enrolled),
+                            fsutil::short_hash(&actual)
+                        );
+                        ok = false;
+                    }
+                }
             }
-            Ok(actual) => {
+            RunnerResponse::Error(err) => {
+                println!("interop: OK (bridge answered)");
                 println!(
-                    "pin:     MISMATCH — enrolled {}, on-disk {}",
-                    fsutil::short_hash(&record.bridge_sha256),
-                    fsutil::short_hash(&actual)
+                    "Windows Hello: error: {} ({err:?})",
+                    friendly_bridge_error(*err)
                 );
                 ok = false;
             }
-            Err(error) => {
-                eprintln!("warning: could not hash the bridge: {error}");
-            }
-        }
-    }
-
-    let runner = Runner::new(&config.bridge, &config.win_mnt);
-    match runner.probe(PROBE_DEADLINE) {
-        Ok(RunnerResponse::Probe {
-            uv_platform_available,
-            api_version,
-        }) => {
-            println!("interop: OK");
-            println!("api_version: {api_version}");
-            if uv_platform_available {
-                println!("Windows Hello: available");
-            } else {
-                println!("Windows Hello: NOT available (no user-verifying platform authenticator)");
+            other => {
+                println!("unexpected probe response: {other:?}");
                 ok = false;
             }
-        }
-        Ok(RunnerResponse::Error(err)) => {
-            println!("interop: OK (bridge answered)");
-            println!(
-                "Windows Hello: error: {} ({err:?})",
-                friendly_bridge_error(err)
-            );
-            ok = false;
-        }
-        Ok(other) => {
-            println!("unexpected probe response: {other:?}");
-            ok = false;
-        }
+        },
         Err(error) => {
             println!("interop: FAILED — {}", render_runner_error(&error));
             ok = false;
@@ -2640,6 +2661,18 @@ mod tests {
 
     // ---- double-enroll state machine (scripted ceremony) ----
 
+    /// Wrap a scripted response in a `RunnerExchange` carrying a fixed digest. The
+    /// enrollment state machine threads the executed descriptor's digest through the
+    /// ceremony outcome, so doubles supply one; correctness of the digest itself is the
+    /// runner's test.
+    fn exchange(response: RunnerResponse) -> wsl_webauthn_runner::RunnerExchange {
+        wsl_webauthn_runner::RunnerExchange {
+            response,
+            bridge_stderr: None,
+            bridge_sha256: [0x42; 32],
+        }
+    }
+
     /// Scripted [`EnrollCeremony`] that returns a well-formed `none` attestation (or a
     /// transport error) and counts invocations.
     struct ScriptedCeremony {
@@ -2670,7 +2703,7 @@ mod tests {
             &self,
             _params: EnrollParams,
             _deadline: Duration,
-        ) -> Result<RunnerResponse, wsl_webauthn_runner::RunnerError> {
+        ) -> Result<wsl_webauthn_runner::RunnerExchange, wsl_webauthn_runner::RunnerError> {
             self.calls.set(self.calls.get() + 1);
             if self.transport_error {
                 return Err(wsl_webauthn_runner::RunnerError::BridgeMissing {
@@ -2684,11 +2717,11 @@ mod tests {
             let cose = p256_cose_key(&self.key).unwrap();
             let auth_data = attested_auth_data(&cose, &credential_id, &STRICT_AAGUID_SELF_TEST);
             let object = none_attestation(&auth_data);
-            Ok(RunnerResponse::Enroll {
+            Ok(exchange(RunnerResponse::Enroll {
                 format: "none".to_string(),
                 attestation_object: wsl_webauthn_protocol::b64u_encode(&object),
                 credential_id: wsl_webauthn_protocol::b64u_encode(&credential_id),
-            })
+            }))
         }
     }
 
@@ -2702,7 +2735,7 @@ mod tests {
     #[test]
     fn double_enroll_single_ceremony_succeeds_under_allow_unattested() {
         let ceremony = ScriptedCeremony::none_attestation();
-        let outcome = enroll_with_double_enroll(
+        let (outcome, _) = enroll_with_double_enroll(
             &ceremony,
             &test_target(),
             &AttestationPolicy::AllowUnattested,
@@ -2785,7 +2818,7 @@ mod tests {
     fn double_enroll_discards_the_first_ceremony_outcome() {
         SCRIPTED_VERIFY_SEEN.with(|s| s.borrow_mut().clear());
         let ceremony = ScriptedCeremony::none_attestation();
-        let outcome = enroll_with_verifier(
+        let (outcome, _) = enroll_with_verifier(
             &ceremony,
             &test_target(),
             &AttestationPolicy::Strict,
@@ -2821,7 +2854,7 @@ mod tests {
             &self,
             _params: EnrollParams,
             _deadline: Duration,
-        ) -> Result<RunnerResponse, wsl_webauthn_runner::RunnerError> {
+        ) -> Result<wsl_webauthn_runner::RunnerExchange, wsl_webauthn_runner::RunnerError> {
             self.calls.set(self.calls.get() + 1);
             if self.calls.get() == 2 {
                 return Err(wsl_webauthn_runner::RunnerError::BridgeMissing {
@@ -2832,11 +2865,11 @@ mod tests {
             let cose = p256_cose_key(&self.key).unwrap();
             let auth_data = attested_auth_data(&cose, &credential_id, &STRICT_AAGUID_SELF_TEST);
             let object = none_attestation(&auth_data);
-            Ok(RunnerResponse::Enroll {
+            Ok(exchange(RunnerResponse::Enroll {
                 format: "none".to_string(),
                 attestation_object: wsl_webauthn_protocol::b64u_encode(&object),
                 credential_id: wsl_webauthn_protocol::b64u_encode(&credential_id),
-            })
+            }))
         }
     }
 
@@ -2924,7 +2957,8 @@ mod tests {
                 &self,
                 _params: EnrollParams,
                 _deadline: Duration,
-            ) -> Result<RunnerResponse, wsl_webauthn_runner::RunnerError> {
+            ) -> Result<wsl_webauthn_runner::RunnerExchange, wsl_webauthn_runner::RunnerError>
+            {
                 unreachable!("run_ceremony_with_progress is overridden")
             }
             fn run_ceremony_with_progress(
@@ -2932,15 +2966,16 @@ mod tests {
                 _params: EnrollParams,
                 _deadline: Duration,
                 progress: Option<&wsl_webauthn_runner::ProgressSink<'_>>,
-            ) -> Result<RunnerResponse, wsl_webauthn_runner::RunnerError> {
+            ) -> Result<wsl_webauthn_runner::RunnerExchange, wsl_webauthn_runner::RunnerError>
+            {
                 if let Some(sink) = progress {
                     sink(CeremonyProgress::PromptOpen);
                     sink(CeremonyProgress::PromptClosed);
                 }
                 // Return a malformed response; we only care that the sink ran.
-                Ok(RunnerResponse::Error(
+                Ok(exchange(RunnerResponse::Error(
                     wsl_webauthn_protocol::BridgeError::UserCancelled,
-                ))
+                )))
             }
         }
 
@@ -3064,7 +3099,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ceremony.calls.get(), 1);
-        assert_eq!(outcome.attestation.format, "none");
+        assert_eq!(outcome.0.attestation.format, "none");
     }
 
     /// A missing store base must fail before any ceremony, with `--replace` or without:

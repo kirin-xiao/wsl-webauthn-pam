@@ -12,10 +12,9 @@
 //!    validator (rejecting null/empty first).
 //! 2. Load `/etc/wsl_webauthn/config` and the user's credential record.
 //! 3. Refuse a bridge executable whose path is not trustworthy (symlinked, or written
-//!    by group/other outside a DrvFs mount), then compare the SHA-256 of the bridge
-//!    executable (hashed from an `O_NOFOLLOW` descriptor) with the digest pinned in
-//!    the record; a mismatch refuses to launch. There is no way to skip
-//!    this check from the argument surface.
+//!    by group/other outside a DrvFs mount). The pinned SHA-256 is then enforced by the
+//!    runner, which hashes the *same held descriptor it executes* and refuses to launch
+//!    on a mismatch; there is no way to skip this check from the argument surface.
 //! 4. Mint a 32-byte challenge, build the exact `clientDataJSON`, optionally emit a
 //!    `pam_conv` action-cue/prompt notice (see below), and run the bridge.
 //! 5. Verify the response with `wsl-webauthn-verifier` (echo consistency, credential
@@ -81,11 +80,11 @@
 //! # Pre-prompt bridge verification cost
 //!
 //! Hashing the bridge executable happens on **every** authentication, before the
-//! Windows Hello prompt. It streams the file (never `fs::read`s it whole) and, on a
-//! 9p/DrvFs mount, measured ~10–15 ms for the ~2 MB bridge — negligible against the
-//! 1–3 s gesture and the 50–110 ms interop spawn. Caching the digest would reopen the
-//! TOCTOU window the pin exists to narrow. A size cap refuses to hash an absurdly large
-//! file.
+//! Windows Hello prompt. The runner streams the held descriptor (never `fs::read`s it
+//! whole) and, on a 9p/DrvFs mount, measured ~10–15 ms for the ~2 MB bridge — negligible
+//! against the 1–3 s gesture and the 50–110 ms interop spawn. Caching the digest would
+//! reopen the TOCTOU window the pin exists to narrow. A size cap refuses to hash an
+//! absurdly large file.
 //!
 //! # Lockout guidance
 //!

@@ -2,8 +2,9 @@
 //!
 //! Spawns the Windows bridge executable over WSL interop, speaks the framed stdio protocol
 //! from [`wsl_webauthn_protocol`], and enforces a hard deadline with a bounded, non-blocking
-//! read loop. It performs **no trust decisions** — all assertion and attestation
-//! verification is the caller's job.
+//! read loop. It performs **no assertion or attestation verification** — that is the
+//! caller's job — but it enforces the caller-supplied bridge SHA-256 pin (see
+//! [`Runner::expected_sha256`]) and never makes an authentication decision itself.
 //!
 //! # Key behaviors
 //!
@@ -20,10 +21,14 @@
 //!   `taskkill.exe /F /PID <n>` runs with `current_dir = win_mnt` under a 5 s budget.
 //!   Failures are ignored, so the deadline is a *lower bound* on total time when an
 //!   escalation runs; see [`RunnerError::Timeout`].
-//! * **Held-fd spawn (tamper resistance).** The bridge is opened
-//!   `O_RDONLY|O_NOFOLLOW|O_CLOEXEC` and that descriptor — not the path — is spawned, so a
-//!   check-then-use swap between the module's hash and the exec cannot change the executed
-//!   image. A `pre_exec` guard re-checks `(dev, ino)` immediately before `execve`.
+//! * **Held-fd spawn with an authoritative pin (tamper resistance).** The bridge is
+//!   opened `O_RDONLY|O_NOFOLLOW|O_CLOEXEC`; that descriptor — not the path — is hashed
+//!   and spawned. When the caller supplies [`Runner::expected_sha256`], the digest is
+//!   taken from the same held descriptor that is exec'd, so a path swap between the
+//!   caller's decision and the exec cannot change the hashed or executed image. The
+//!   executed descriptor's digest is also returned on
+//!   [`RunnerExchange::bridge_sha256`]. A `pre_exec` guard re-checks `(dev, ino)`
+//!   immediately before `execve`.
 //! * **Pre-flight.** [`RunnerError::BridgeMissing`] only if the bridge path genuinely does
 //!   not exist (`NotFound`); any other open failure (e.g. `EACCES` on an unreadable parent,
 //!   or `ELOOP` for a symlinked bridge) is [`RunnerError::Spawn`] carrying the real
@@ -183,6 +188,19 @@ pub enum RunnerError {
         /// The binfmt_misc path that was checked.
         path: PathBuf,
         /// Why the check failed.
+        detail: String,
+    },
+    /// The bridge's SHA-256 pin did not match the held descriptor, or it could not be
+    /// hashed.
+    ///
+    /// Distinct from [`RunnerError::Spawn`] so a tamper event is never logged as a generic
+    /// spawn failure. The digest is taken from the same descriptor that is executed; a
+    /// mismatch therefore refuses the exec rather than racing it.
+    #[error("bridge integrity check failed for {path}: {detail}")]
+    BridgeIntegrity {
+        /// The bridge path.
+        path: PathBuf,
+        /// Whether the digest differed or the descriptor could not be read.
         detail: String,
     },
     /// The request could not be encoded within the wire size cap.
@@ -393,6 +411,11 @@ pub struct RunnerExchange {
     pub response: RunnerResponse,
     /// Sanitized, bounded stderr tail from the exchange, if any.
     pub bridge_stderr: Option<String>,
+    /// SHA-256 of the descriptor that was executed for this exchange.
+    ///
+    /// Computed from the same held open file description the child exec'd, so it is the
+    /// digest of the bytes that actually ran. Enrollment records this as the pin.
+    pub bridge_sha256: [u8; 32],
 }
 
 /// Errors from decoding b64url fields of a [`RunnerResponse`].
@@ -486,7 +509,21 @@ pub struct Runner {
     check_interop: bool,
     args: Vec<std::ffi::OsString>,
     taskkill_program: std::ffi::OsString,
+    expected_sha256: Option<[u8; 32]>,
+    /// Test-only hook invoked inside `run_exchange` immediately after the bridge
+    /// descriptor is opened and before it is hashed/exec'd. Lets a test swap the path in
+    /// that window and prove the held descriptor still wins.
+    #[cfg(feature = "test-support")]
+    post_preflight_hook: Option<PostPreflightHook>,
 }
+
+/// A test-only callback run after pre-flight opens the bridge descriptor.
+///
+/// A plain `fn` (not a closure) keeps [`Runner`] `Clone`/`Debug` and sidesteps shared
+/// global state: a test that needs captured state stores it in a thread-local, and each
+/// test runs on its own thread.
+#[cfg(feature = "test-support")]
+pub type PostPreflightHook = fn();
 
 impl Runner {
     /// Create a runner for `bridge` with `win_mnt` as the child's working directory.
@@ -500,6 +537,9 @@ impl Runner {
             check_interop: true,
             args: Vec::new(),
             taskkill_program: std::ffi::OsString::from("taskkill.exe"),
+            expected_sha256: None,
+            #[cfg(feature = "test-support")]
+            post_preflight_hook: None,
         }
     }
 
@@ -571,6 +611,28 @@ impl Runner {
         &self.bridge
     }
 
+    /// Require the bridge descriptor to hash to `expected` before it is executed.
+    ///
+    /// This is the authoritative pin: the digest is taken from the same held descriptor
+    /// that is spawned via `/proc/self/fd/N`, so a path swap between the caller's
+    /// decision and the spawn cannot substitute the image. Callers that do not set a pin
+    /// (a probe, an enrollment) still receive the executed descriptor's digest on
+    /// [`RunnerExchange::bridge_sha256`].
+    pub fn expected_sha256(mut self, expected: [u8; 32]) -> Self {
+        self.expected_sha256 = Some(expected);
+        self
+    }
+
+    /// Install a test-only hook run inside `run_exchange` right after the bridge
+    /// descriptor is opened.
+    ///
+    /// Available only with the non-default `test-support` feature.
+    #[cfg(feature = "test-support")]
+    pub fn post_preflight_hook(mut self, hook: PostPreflightHook) -> Self {
+        self.post_preflight_hook = Some(hook);
+        self
+    }
+
     /// The configured Windows mount root.
     pub fn win_mnt(&self) -> &Path {
         &self.win_mnt
@@ -587,6 +649,20 @@ impl Runner {
             deadline,
         )
         .map(|exchange| exchange.response)
+    }
+
+    /// Like [`Runner::probe`], but returns the full [`RunnerExchange`] including the
+    /// executed descriptor's SHA-256 and any stderr diagnostic.
+    pub fn probe_with_diagnostics(
+        &self,
+        deadline: Duration,
+    ) -> Result<RunnerExchange, RunnerError> {
+        self.run(
+            Request::Probe {
+                timeout_ms: BRIDGE_PROBE_TIMEOUT_MS,
+            },
+            deadline,
+        )
     }
 
     /// Enroll a credential, using the caller-supplied [`EnrollParams`].
@@ -608,6 +684,27 @@ impl Runner {
         deadline: Duration,
         progress: Option<&ProgressSink<'_>>,
     ) -> Result<RunnerResponse, RunnerError> {
+        self.enroll_with_diagnostics_and_progress(params, deadline, progress)
+            .map(|exchange| exchange.response)
+    }
+
+    /// Like [`Runner::enroll`], but returns the full [`RunnerExchange`] including the
+    /// executed descriptor's SHA-256 and any stderr diagnostic.
+    pub fn enroll_with_diagnostics(
+        &self,
+        params: EnrollParams,
+        deadline: Duration,
+    ) -> Result<RunnerExchange, RunnerError> {
+        self.enroll_with_diagnostics_and_progress(params, deadline, None)
+    }
+
+    /// Like [`Runner::enroll_with_diagnostics`], emitting [`CeremonyProgress`] events.
+    pub fn enroll_with_diagnostics_and_progress(
+        &self,
+        params: EnrollParams,
+        deadline: Duration,
+        progress: Option<&ProgressSink<'_>>,
+    ) -> Result<RunnerExchange, RunnerError> {
         self.run_with_progress(
             Request::Enroll {
                 client_data_json: params.client_data_json,
@@ -620,7 +717,6 @@ impl Runner {
             deadline,
             progress,
         )
-        .map(|exchange| exchange.response)
     }
 
     /// Produce an assertion, using the caller-supplied [`AssertParams`].
@@ -724,6 +820,33 @@ impl Runner {
     ) -> Result<RunnerExchange, RunnerError> {
         let bridge = self.preflight()?;
 
+        // Test-only: simulate an attacker swapping the path between the descriptor open
+        // and the hash/exec. The descriptor held by `bridge` is unaffected, which is
+        // exactly the property under test.
+        #[cfg(feature = "test-support")]
+        if let Some(hook) = self.post_preflight_hook {
+            hook();
+        }
+
+        // The pin is taken from the held descriptor, and the same descriptor is what
+        // gets exec'd below. This binds hash→exec to one open, so a path swap between
+        // the caller's decision and the spawn cannot substitute the image. The digest is
+        // also returned on the exchange so an enrollment can record exactly what ran.
+        let bridge_sha256 = bridge
+            .sha256()
+            .map_err(|source| RunnerError::BridgeIntegrity {
+                path: self.bridge.clone(),
+                detail: format!("could not hash the held descriptor: {source}"),
+            })?;
+        if let Some(expected) = self.expected_sha256
+            && expected != bridge_sha256
+        {
+            return Err(RunnerError::BridgeIntegrity {
+                path: self.bridge.clone(),
+                detail: "SHA-256 pin mismatch (possible tampering); refusing to launch".to_string(),
+            });
+        }
+
         let payload = serde_json::to_vec(&request).map_err(|e| RunnerError::Transport {
             message: format!("encoding request: {e}"),
         })?;
@@ -789,15 +912,15 @@ impl Runner {
             .stderr
             .take()
             .expect("stderr was piped above");
-        self.pump(guard, stdout, stderr, deadline, progress)
+        self.pump(guard, stdout, stderr, deadline, progress, bridge_sha256)
     }
 
     /// Fast-fail pre-flight checks, then hold the bridge descriptor for the spawn.
     ///
     /// The bridge is opened `O_RDONLY|O_NOFOLLOW` and the descriptor is returned, so the
-    /// caller spawns exactly the opened inode rather than re-resolving the path (closing
-    /// the hash→exec check-then-use window). Because the path is never used for the
-    /// spawn, a symlink is refused (`O_NOFOLLOW` → `ELOOP`), not followed.
+    /// caller hashes and spawns exactly the opened inode rather than re-resolving the
+    /// path. Because the path is never used for the spawn, a symlink is refused
+    /// (`O_NOFOLLOW` → `ELOOP`), not followed.
     fn preflight(&self) -> Result<proc::TrustedFile, RunnerError> {
         // `Path::exists()`/`metadata` collapse *every* `stat` failure into "missing".
         // Open directly so only a genuine `NotFound` is reported as
@@ -927,6 +1050,7 @@ impl Runner {
         stderr: std::process::ChildStderr,
         deadline: Duration,
         progress: Option<&ProgressSink<'_>>,
+        bridge_sha256: [u8; 32],
     ) -> Result<RunnerExchange, RunnerError> {
         match drive_child(
             guard,
@@ -941,7 +1065,7 @@ impl Runner {
                 status,
                 stdout,
                 stderr,
-            } => self.finish(status, &stdout, &stderr),
+            } => self.finish(status, &stdout, &stderr, bridge_sha256),
             DriveOutcome::TimedOut { stderr } => self.deadline_error(deadline, &stderr),
             DriveOutcome::StdoutOverflow => Err(RunnerError::Transport {
                 message: format!("response exceeds {MAX_RESPONSE_BYTES} bytes"),
@@ -960,6 +1084,7 @@ impl Runner {
         status: ExitStatus,
         out_buf: &[u8],
         err_buf: &[u8],
+        bridge_sha256: [u8; 32],
     ) -> Result<RunnerExchange, RunnerError> {
         // Non-zero exit is a transport failure even if bytes happen to parse.
         if !status.success() {
@@ -988,6 +1113,7 @@ impl Runner {
         Ok(RunnerExchange {
             response: runner_response(response),
             bridge_stderr: stderr_tail(err_buf, STDERR_DIAGNOSTIC_BYTES),
+            bridge_sha256,
         })
     }
 

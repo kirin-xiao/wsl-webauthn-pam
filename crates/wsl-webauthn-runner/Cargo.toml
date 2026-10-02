@@ -33,8 +33,12 @@ wsl-webauthn-protocol = { path = "../wsl-webauthn-protocol" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 libc = { workspace = true }
+# Authoritative bridge pin: SHA-256 over the same held descriptor that is exec'd.
+sha2 = { workspace = true }
 
 [dev-dependencies]
 # Self-dependency enabling the seams for this crate's unit and integration tests only.
 wsl-webauthn-runner = { path = ".", features = ["test-support"] }
 tempfile = "3"
+# Compute a bridge's expected pin in tests without re-implementing the hasher.
+sha2 = { workspace = true }

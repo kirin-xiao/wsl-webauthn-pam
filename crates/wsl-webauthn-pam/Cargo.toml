@@ -26,8 +26,6 @@ wsl-webauthn-verifier = { path = "../wsl-webauthn-verifier" }
 serde_json = { workspace = true }
 libc = { workspace = true }
 rand = { workspace = true }
-# Bridge executable pin: SHA-256 of the configured `bridge_path`.
-sha2 = { workspace = true }
 
 [dev-dependencies]
 # Test support only: tempdir-backed stores, a real ES256 keypair to sign the
@@ -35,6 +33,8 @@ sha2 = { workspace = true }
 tempfile = "3"
 p256 = { workspace = true, features = ["ecdsa"] }
 ciborium = { workspace = true }
+# Test hashing: compute expected bridge pins in the harnesses.
+sha2 = { workspace = true }
 # Enable the runner's test-only seams (`without_interop_check`, `.args`,
 # `.taskkill_program`) used by `tests/support/mod.rs`; production builds take the
 # runner without this feature, so those seams are compile-time unavailable there.

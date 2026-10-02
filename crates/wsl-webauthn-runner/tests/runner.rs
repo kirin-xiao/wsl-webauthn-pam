@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
-use wsl_webauthn_protocol::{BridgeError, MAX_RESPONSE_BYTES};
+use wsl_webauthn_protocol::{BridgeError, MAX_RESPONSE_BYTES, Response};
 use wsl_webauthn_runner::{
     AssertParams, EnrollParams, ExitReason, Runner, RunnerError, RunnerResponse, decode_probe,
 };
@@ -54,6 +54,17 @@ fn assert_params() -> AssertParams {
 fn enabled_interop_file(dir: &Path) -> PathBuf {
     let path = dir.join("WSLInterop");
     fs::write(&path, "enabled\ninterpreter /init\nflags: P\n").unwrap();
+    path
+}
+
+/// Write a small executable shell bridge with the given body, returning its path.
+///
+/// Used by timing tests and the pin tests so a descriptor hash measures the loop, not the
+/// multi-megabyte `fake-bridge` binary.
+fn tiny_bridge(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let path = dir.join(name);
+    fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write tiny bridge");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
     path
 }
 
@@ -240,11 +251,25 @@ fn noisy_stderr_does_not_break_pid_parsing() {
 /// On the EOF fast path (a child that writes a full response, closes its pipes, then
 /// lingers before exiting) the runner must not add a whole poll tick after the response
 /// is complete; the adaptive spin reaps the child promptly.
+///
+/// A tiny shell bridge is used rather than the multi-megabyte `fake-bridge` binary so the
+/// measurement reflects the drain/reap loop, not the (unrelated) cost of hashing the
+/// held descriptor before every exchange.
 #[test]
 fn eof_fast_path_does_not_wait_a_full_tick() {
     let dir = cwd_dir();
-    // The child answers immediately, closes stdout/stderr, then sleeps 15 ms and exits.
-    let r = build_runner(dir.path(), &["ok", "postclose_sleep=15"]);
+    let frame_path = dir.path().join("frame");
+    fs::write(&frame_path, Response::probe(true, 7).to_frame().unwrap()).unwrap();
+    // Answer immediately, close stdout/stderr, linger 15 ms, then exit.
+    let bridge = tiny_bridge(
+        dir.path(),
+        "eof-bridge",
+        &format!(
+            "cat {frame:?}\nexec 1>&-\nexec 2>&-\nsleep 0.015\nexit 0",
+            frame = frame_path
+        ),
+    );
+    let r = Runner::without_interop_check(&bridge, dir.path()).taskkill_program("/bin/true");
     let start = Instant::now();
     let resp = r.probe(Duration::from_secs(5)).expect("probe succeeds");
     let elapsed = start.elapsed();
@@ -261,13 +286,17 @@ fn eof_fast_path_does_not_wait_a_full_tick() {
 #[test]
 fn timeout_does_not_overshoot_deadline_by_a_full_tick() {
     let dir = cwd_dir();
-    let r = build_runner(dir.path(), &["ok", "sleep=5000"]);
+    // A tiny bridge so the measurement isolates the drain/reap loop from the up-front
+    // descriptor hash of the large `fake-bridge` binary.
+    let bridge = tiny_bridge(dir.path(), "sleep-bridge", "sleep 5\nexit 0");
+    let r = Runner::without_interop_check(&bridge, dir.path()).taskkill_program("/bin/true");
     let deadline = Duration::from_millis(150);
     let start = Instant::now();
     let err = r.probe(deadline).expect_err("must time out");
     let elapsed = start.elapsed();
     assert!(matches!(err, RunnerError::Timeout { .. }), "{err:?}");
-    // Allow for process spawn + scheduling, but well under deadline + several ticks.
+    // Allow for process spawn + scheduling + one SHA-256 pass of the tiny script, but
+    // well under deadline + several ticks.
     assert!(
         elapsed < deadline + Duration::from_millis(100),
         "timeout overshot the deadline, took {elapsed:?} for {deadline:?}"
@@ -898,4 +927,133 @@ fn default_entry_points_ignore_progress_lines() {
         .enroll(enroll_params(), Duration::from_secs(5))
         .expect("enroll");
     assert!(matches!(resp, RunnerResponse::Enroll { .. }), "{resp:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Authoritative bridge pin
+// ---------------------------------------------------------------------------
+
+/// SHA-256 of a file, for computing an expected pin in tests.
+fn sha256_of(path: &Path) -> [u8; 32] {
+    use sha2::{Digest as _, Sha256};
+    let bytes = fs::read(path).expect("read bridge");
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let d = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&d);
+    out
+}
+
+/// A minimal executable that writes a marker file when it runs, then exits 0 with no
+/// frame. The marker proves *which* file the runner actually executed.
+fn write_marker_exe(dir: &Path, name: &str, marker: &Path) -> PathBuf {
+    tiny_bridge(dir, name, &format!("echo ran > {marker:?}\nexit 0"))
+}
+
+/// The pin is taken from the descriptor opened by pre-flight, and a path swap *after*
+/// that open cannot change the executed image. The hook performs the swap deterministically
+/// between the descriptor open and the hash/exec.
+#[test]
+fn pin_is_bound_to_the_executed_descriptor_not_the_path() {
+    thread_local! {
+        static SWAP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    fn run_swap() {
+        if let Some(f) = SWAP.with(|s| s.borrow_mut().take()) {
+            f();
+        }
+    }
+
+    let dir = cwd_dir();
+    let orig_marker = dir.path().join("orig-marker");
+    let repl_marker = dir.path().join("repl-marker");
+    let bridge = write_marker_exe(dir.path(), "bridge", &orig_marker);
+    let replacement = write_marker_exe(dir.path(), "replacement", &repl_marker);
+    let pin = sha256_of(&bridge);
+
+    // The hook swaps the path after pre-flight has opened it. A hash that re-opened the
+    // path would see `replacement` and fail; the held descriptor must still hash and
+    // execute the original bytes.
+    let hook_path = bridge.clone();
+    let repl = replacement.clone();
+    SWAP.with(|s| {
+        *s.borrow_mut() = Some(Box::new(move || {
+            fs::rename(&repl, &hook_path).expect("swap bridge path");
+        }));
+    });
+
+    let r = Runner::without_interop_check(&bridge, dir.path())
+        .taskkill_program("/bin/true")
+        .expected_sha256(pin)
+        .post_preflight_hook(run_swap);
+
+    // The marker script emits no frame, so the exchange fails transport after exec. What
+    // matters is that the pin matched (no `BridgeIntegrity`) and the original ran.
+    let err = r
+        .probe(Duration::from_secs(5))
+        .expect_err("a marker script is not a valid bridge frame");
+    assert!(
+        !matches!(err, RunnerError::BridgeIntegrity { .. }),
+        "pin must be bound to the held descriptor, not the swapped path: {err:?}"
+    );
+    assert!(orig_marker.exists(), "the originally-opened image must run");
+    assert!(
+        !repl_marker.exists(),
+        "the swapped-in path must not be the executed image"
+    );
+}
+
+/// A wrong expected pin is refused with the typed `BridgeIntegrity` error, and the bridge
+/// is never spawned.
+#[test]
+fn wrong_pin_refuses_before_spawn() {
+    let dir = cwd_dir();
+    let marker = dir.path().join("ran-marker");
+    let bridge = write_marker_exe(dir.path(), "bridge", &marker);
+
+    // Flip one bit of the real digest.
+    let mut wrong = sha256_of(&bridge);
+    wrong[0] ^= 0xff;
+
+    let r = Runner::without_interop_check(&bridge, dir.path())
+        .taskkill_program("/bin/true")
+        .expected_sha256(wrong);
+    match r.probe(Duration::from_secs(5)) {
+        Err(RunnerError::BridgeIntegrity { path, detail }) => {
+            assert_eq!(path, bridge);
+            assert!(detail.contains("mismatch"), "{detail}");
+        }
+        other => panic!("expected BridgeIntegrity, got {other:?}"),
+    }
+    assert!(
+        !marker.exists(),
+        "the bridge must not be spawned when the pin fails"
+    );
+}
+
+/// The exchange reports the executed descriptor's digest, which is the value enrollment
+/// records as the pin.
+#[test]
+fn exchange_reports_the_executed_digest() {
+    let dir = cwd_dir();
+    let r = build_runner(dir.path(), &["ok"]);
+    let exchange = r
+        .probe_with_diagnostics(Duration::from_secs(5))
+        .expect("probe");
+    assert_eq!(exchange.bridge_sha256, sha256_of(Path::new(FAKE)));
+}
+
+/// The pin is enforced on the auth path too, and the diagnostics variant surfaces the
+/// digest on success.
+#[test]
+fn authenticate_with_diagnostics_returns_digest_and_enforces_pin() {
+    let dir = cwd_dir();
+    let pin = sha256_of(Path::new(FAKE));
+    let r = build_runner(dir.path(), &["ok"])
+        .expected_sha256(pin)
+        .authenticate_with_diagnostics(assert_params(), Duration::from_secs(5))
+        .expect("assert");
+    assert_eq!(r.bridge_sha256, pin);
 }

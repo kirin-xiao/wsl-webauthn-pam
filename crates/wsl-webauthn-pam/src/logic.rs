@@ -85,11 +85,6 @@ pub trait Deps {
         record: &CredentialRecord,
         expected: FileIdentity,
     ) -> Result<(), StoreError>;
-    /// SHA-256 of the file at `path`, opened `O_NOFOLLOW` (no symlink following).
-    ///
-    /// The pin is a real integrity control, so the digest must come from a descriptor
-    /// opened with the hardening flags rather than a path-following `open`.
-    fn sha256_file(&self, path: &Path) -> Result<[u8; 32], String>;
     /// Whether `path` is a trustworthy bridge executable location: not a symlink, and
     /// (unless `win_mnt` itself is a WSL DrvFs mount) owned by root and not
     /// group/other-writable, with every parent up to `win_mnt` held to the same rule.
@@ -107,10 +102,15 @@ pub trait Deps {
     /// `PAM_AUTHINFO_UNAVAIL` instead of letting a panic classify it as `PAM_ABORT`.
     fn fill_random(&self, dest: &mut [u8]) -> Result<(), String>;
     /// Run the `assert` ceremony against the bridge under a hard deadline.
+    ///
+    /// `expected_sha256` is the pin decoded from the credential record. The module
+    /// forwards this pin; the runner enforces it by hashing the same held descriptor it
+    /// executes and refusing the spawn on mismatch.
     fn authenticate(
         &self,
         bridge: &Path,
         win_mnt: &Path,
+        expected_sha256: [u8; 32],
         params: AssertParams,
         deadline: Duration,
     ) -> Result<RunnerResponse, RunnerError>;
@@ -126,11 +126,12 @@ pub trait Deps {
         &self,
         bridge: &Path,
         win_mnt: &Path,
+        expected_sha256: [u8; 32],
         params: AssertParams,
         deadline: Duration,
         _progress: Option<&wsl_webauthn_runner::ProgressSink<'_>>,
     ) -> Result<RunnerResponse, RunnerError> {
-        self.authenticate(bridge, win_mnt, params, deadline)
+        self.authenticate(bridge, win_mnt, expected_sha256, params, deadline)
     }
     /// Test-only panic injection point.
     ///
@@ -165,9 +166,6 @@ impl Deps for SystemDeps {
     ) -> Result<(), StoreError> {
         wsl_webauthn_store::Store::system().update_if_unchanged(record, expected)
     }
-    fn sha256_file(&self, path: &Path) -> Result<[u8; 32], String> {
-        sha256_file_nofollow(path)
-    }
     fn bridge_path_is_trusted(&self, path: &Path, win_mnt: &Path) -> Result<(), String> {
         bridge_path_is_trusted(path, win_mnt)
     }
@@ -184,20 +182,23 @@ impl Deps for SystemDeps {
         &self,
         bridge: &Path,
         win_mnt: &Path,
+        expected_sha256: [u8; 32],
         params: AssertParams,
         deadline: Duration,
     ) -> Result<RunnerResponse, RunnerError> {
-        self.authenticate_with_progress(bridge, win_mnt, params, deadline, None)
+        self.authenticate_with_progress(bridge, win_mnt, expected_sha256, params, deadline, None)
     }
     fn authenticate_with_progress(
         &self,
         bridge: &Path,
         win_mnt: &Path,
+        expected_sha256: [u8; 32],
         params: AssertParams,
         deadline: Duration,
         progress: Option<&wsl_webauthn_runner::ProgressSink<'_>>,
     ) -> Result<RunnerResponse, RunnerError> {
         let exchange = wsl_webauthn_runner::Runner::new(bridge, win_mnt)
+            .expected_sha256(expected_sha256)
             .authenticate_with_diagnostics_and_progress(params, deadline, progress)?;
         // A ceremony failure arrives on a healthy transport, so the HRESULT/error line the
         // bridge writes to stderr is the only fine-grained diagnostic. Log it (bounded and
@@ -215,61 +216,17 @@ impl Deps for SystemDeps {
     }
 }
 
-/// Hash a file with SHA-256 from an `O_NOFOLLOW` descriptor, streaming so an
-/// arbitrarily large bridge executable is never held in memory.
-///
-/// `O_NOFOLLOW` closes the "hash a symlink target, then spawn the link" gap: a symlink
-/// at the configured path is refused rather than silently followed. The runner
-/// spawns by path *after* this hash, so this narrows — but does not by itself close —
-/// the check-then-use window; see [`bridge_path_is_trusted`].
-pub fn sha256_file_nofollow(path: &Path) -> Result<[u8; 32], String> {
-    use sha2::{Digest as _, Sha256};
-    use std::io::Read as _;
-
-    /// Upper bound on the bytes this module will read from the bridge path. The real
-    /// bridge is ~2 MB; a value this far above it is a sanity guard against hashing an
-    /// attacker-planted huge/special file, not a functional limit.
-    const MAX_BRIDGE_BYTES: u64 = 64 * 1024 * 1024;
-
-    let file = crate::sys::open_readonly_nofollow(path)
-        .map_err(|e| format!("open {path:?} (O_NOFOLLOW): {e}"))?;
-    let len = file
-        .metadata()
-        .map_err(|e| format!("stat {path:?}: {e}"))?
-        .len();
-    if len > MAX_BRIDGE_BYTES {
-        return Err(format!(
-            "{path:?} is {len} bytes, above the {MAX_BRIDGE_BYTES}-byte bridge sanity cap"
-        ));
-    }
-
-    let mut reader = std::io::BufReader::new(file);
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| format!("read {path:?}: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    let digest = hasher.finalize();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest);
-    Ok(out)
-}
-
 /// Refuse a bridge path that a non-root writer could swap.
 ///
-/// The leaf must be a regular file that is not a symlink; outside a DrvFs mount it
-/// must additionally not be group/other-writable, and every parent component below
-/// `win_mnt` (the configured trust anchor, itself already pinned by the store/config)
-/// must be a real directory owned by root and not group/other-writable. When `win_mnt`
-/// is DrvFs the POSIX owner/mode rule is unenforceable (DrvFs synthesizes them), so
-/// only the symlink/regular-file part applies and the SHA-256 pin carries the
-/// integrity load.
+/// Validates the bridge *path*; the runner's SHA-256 pin over the descriptor it executes
+/// is the byte-integrity control. The leaf must be a regular file
+/// that is not a symlink; outside a DrvFs mount it must additionally not be
+/// group/other-writable, and every parent component below `win_mnt` (the configured
+/// trust anchor, itself already pinned by the store/config) must be a real directory
+/// owned by root and not group/other-writable. When `win_mnt` is DrvFs the POSIX
+/// owner/mode rule is unenforceable (DrvFs synthesizes them), so only the
+/// symlink/regular-file part applies and the runner's SHA-256 pin carries the integrity
+/// load.
 pub fn bridge_path_is_trusted(path: &Path, win_mnt: &Path) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -494,9 +451,9 @@ pub fn authenticate<S: PamSeam, D: Deps>(
             record.bridge_path, config.bridge_path
         ));
     }
-    // The pin is always enforced. Before hashing, refuse a path a non-root writer could
-    // swap: the runner spawns by name after this hash, so the path must be trustworthy
-    // in its own right.
+    // The pin is enforced by the runner, which hashes the same held descriptor it
+    // executes. Before handing off, refuse a path a non-root writer could swap: this is a
+    // path-level pre-check (symlink/ownership) that complements the runner's byte pin.
     if let Err(e) = deps.bridge_path_is_trusted(bridge_path, &config.win_mnt) {
         return fail(
             PAM_AUTHINFO_UNAVAIL,
@@ -512,24 +469,6 @@ pub fn authenticate<S: PamSeam, D: Deps>(
             );
         }
     };
-    match deps.sha256_file(bridge_path) {
-        Ok(actual) if actual == expected => {}
-        Ok(_) => {
-            return fail(
-                PAM_AUTHINFO_UNAVAIL,
-                format!(
-                    "bridge executable {bridge_path:?} failed its SHA-256 pin check \
-                     (possible tampering); refusing to launch"
-                ),
-            );
-        }
-        Err(e) => {
-            return fail(
-                PAM_AUTHINFO_UNAVAIL,
-                format!("bridge executable {bridge_path:?} unreadable for pin check: {e}"),
-            );
-        }
-    }
 
     // --- 5. Challenge + clientDataJSON -----------------------------------
     let mut challenge = [0u8; 32];
@@ -593,16 +532,22 @@ pub fn authenticate<S: PamSeam, D: Deps>(
     let response = match deps.authenticate_with_progress(
         bridge_path,
         &config.win_mnt,
+        expected,
         params,
         deadline,
         Some(&progress),
     ) {
         Ok(r) => r,
         Err(e) => {
-            return fail(
-                PAM_AUTHINFO_UNAVAIL,
-                format!("bridge transport failure: {e}"),
-            );
+            // A pin mismatch is a tamper signal, not an infrastructure transport fault;
+            // keep it distinct in the audit line while still failing closed.
+            let reason = match &e {
+                RunnerError::BridgeIntegrity { .. } => {
+                    format!("bridge integrity check failed: {e}")
+                }
+                _ => format!("bridge transport failure: {e}"),
+            };
+            return fail(PAM_AUTHINFO_UNAVAIL, reason);
         }
     };
 
@@ -906,32 +851,6 @@ mod tests {
             assert!(msg.contains("PAM_AUTH_ERR"), "{msg}");
             assert!(msg.contains(&e.to_string()), "{msg}");
         }
-    }
-
-    /// The bridge hasher streams (never `fs::read`-ing the whole executable) and
-    /// returns a digest identical to a one-shot hash of the same bytes.
-    #[test]
-    fn sha256_file_nofollow_streams_and_matches_a_known_digest() {
-        use std::io::Write as _;
-        // Kept small: the process temp dir can be a tiny tmpfs in constrained CI. The
-        // behaviour under test is digest correctness and O_NOFOLLOW, not file size.
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let path = dir.path().join("bridge.exe");
-        let bytes = vec![0x5au8; 8 * 1024];
-        std::fs::File::create(&path)
-            .and_then(|mut f| f.write_all(&bytes))
-            .expect("write");
-        let expected: [u8; 32] = {
-            use sha2::{Digest as _, Sha256};
-            let mut out = [0u8; 32];
-            out.copy_from_slice(&Sha256::digest(&bytes));
-            out
-        };
-        assert_eq!(sha256_file_nofollow(&path).unwrap(), expected);
-        // A symlink at the path is refused rather than followed.
-        let link = dir.path().join("link.exe");
-        std::os::unix::fs::symlink(&path, &link).unwrap();
-        assert!(sha256_file_nofollow(&link).is_err());
     }
 
     #[test]

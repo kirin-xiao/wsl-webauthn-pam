@@ -364,23 +364,51 @@ fn dummy_config() -> wsl_webauthn_store::Config {
 // Bridge pin
 // ---------------------------------------------------------------------------
 
+/// The module forwards the record's decoded digest to the runner, which enforces the pin
+/// by hashing the same held descriptor it executes. A fake runner reporting a mismatch
+/// fails closed.
 #[test]
 fn pin_mismatch_is_authinfo_unavail() {
     let (_f, mut seam, mut deps) = happy();
-    deps.sha256 = Sha256Behavior::Fixed([0u8; 32]);
+    deps.runner.pin = RunnerPinBehavior::Mismatch;
     assert_eq!(run_basic(&mut seam, &deps, 0, &[]), PAM_AUTHINFO_UNAVAIL);
 }
 
+/// A malformed pinned digest fails closed before the runner is ever called.
 #[test]
-fn pin_unreadable_is_authinfo_unavail() {
-    let (_f, mut seam, mut deps) = happy();
-    deps.sha256 = Sha256Behavior::Err("permission denied".to_string());
+fn malformed_record_digest_is_authinfo_unavail() {
+    let fixture = Fixture::new();
+    let mut record = fixture.record("alice", 0);
+    record.bridge_sha256 = "not-a-valid-digest".to_string();
+    let mut seam = FakeSeam::for_user("alice");
+    let mut deps = fixture.deps(temp_store(fixture.tmp.path()), vec![]);
+    deps.store = None;
+    deps.config = ConfigReply::Ok(fixture.config());
+    deps.record = RecordReply::Ok(Box::new(record));
     assert_eq!(run_basic(&mut seam, &deps, 0, &[]), PAM_AUTHINFO_UNAVAIL);
+    assert!(
+        deps.runner.seen_expected_sha256.borrow().is_none(),
+        "the runner must not be reached with a malformed pin"
+    );
+}
+
+/// The digest the module forwards is exactly the record's pinned digest (wiring check:
+/// the runner, not the module, performs the comparison, so the forward must carry it).
+#[test]
+fn module_forwards_the_record_digest_to_the_runner() {
+    let (_fixture, mut seam, deps) = happy();
+    assert_eq!(run_basic(&mut seam, &deps, 0, &[]), PAM_SUCCESS);
+    let expected = hash_file(std::path::Path::new(FAKE_BRIDGE)).unwrap();
+    assert_eq!(
+        deps.runner.seen_expected_sha256.borrow().as_ref(),
+        Some(&expected),
+        "the module must forward the record's digest, not re-hash the path itself"
+    );
 }
 
 /// The pin cannot be disabled from the argument surface, and an untrusted
-/// (group/other-writable or symlinked) bridge path is refused before the hash.
-/// The production check is exercised against a tempdir it will accept.
+/// (group/other-writable or symlinked) bridge path is refused before the runner is
+/// invoked. The production check is exercised against a tempdir it will accept.
 #[test]
 fn untrusted_bridge_path_is_authinfo_unavail() {
     let (_f, mut seam, mut deps) = happy();
@@ -393,7 +421,7 @@ fn untrusted_bridge_path_is_authinfo_unavail() {
 #[test]
 fn noverifypin_token_no_longer_bypasses_a_pin_mismatch() {
     let (_f, mut seam, mut deps) = happy();
-    deps.sha256 = Sha256Behavior::Fixed([0u8; 32]);
+    deps.runner.pin = RunnerPinBehavior::Mismatch;
     assert_eq!(
         run_basic(&mut seam, &deps, 0, &["noverifypin"]),
         PAM_AUTHINFO_UNAVAIL
@@ -720,8 +748,7 @@ fn failure_requests_two_second_fail_delay() {
     let record = fixture.record("alice", 0);
     let store = fixture.enrolled_store(&record);
     let mut seam = FakeSeam::for_user("alice");
-    let mut deps = fixture.deps(store, vec!["err=user_cancelled".to_string()]);
-    deps.sha256 = Sha256Behavior::OfFile;
+    let deps = fixture.deps(store, vec!["err=user_cancelled".to_string()]);
     assert_eq!(run_basic(&mut seam, &deps, 0, &[]), PAM_AUTH_ERR);
     assert_eq!(seam.fail_delays, vec![FAIL_DELAY_USEC]);
 }
