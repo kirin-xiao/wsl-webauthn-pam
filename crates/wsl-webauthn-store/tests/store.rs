@@ -12,9 +12,15 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 use wsl_webauthn_store::{
-    AttestationRecord, CONFIG_MODE, CredentialRecord, DIR_MODE, FILE_MODE, MODE_STRICT, Store,
-    StoreError, WindowsIdentity, current_euid, validate_username,
+    AttestationRecord, CONFIG_MODE, CredentialRecord, DIR_MODE, FILE_MODE, MODE_STRICT,
+    MODE_UNATTESTED_OPT_IN, Store, StoreError, WindowsIdentity, current_euid, validate_username,
 };
+
+/// Byte-for-byte golden encoding of [`sample_record("alice")`] (schema version 1).
+///
+/// The on-disk JSON strings are an API: the shared-enum follow-up for `attestation.mode`
+/// (see `record.rs`) must not change them, so this literal pins the format.
+const GOLDEN_STRICT_JSON: &str = r#"{"schema_version":1,"rp_id":"io.github.kirin-xiao.wsl-webauthn-pam","origin":"io.github.kirin-xiao.wsl-webauthn-pam","linux_user":"alice","linux_uid":1000,"credential_id":"Zm9vYmFy","cose_public_key":"AAECAw","alg":-7,"aaguid":"08987058-cadc-4b81-b6e1-30de50dcbe96","attestation":{"format":"packed","mode":"strict","verified":true,"leaf_sha256":"abababababababababababababababababababababababababababababababab"},"windows_identity":{"account":"HOST\\alice","sid":"S-1-5-21-1-2-3"},"enrolled_at":"2026-10-01T12:34:56Z","sign_count":0,"bridge_path":"/mnt/c/Users/alice/WSLWebAuthnBridge.exe","bridge_sha256":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}"#;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -152,6 +158,26 @@ fn save_load_list_remove_round_trip() {
     assert!(!store.remove("alice").unwrap());
     assert!(store.load("alice").is_err());
     assert_eq!(store.list().unwrap(), vec!["bob".to_string()]);
+}
+
+#[test]
+fn strict_record_json_is_byte_identical_to_golden() {
+    // The on-disk JSON strings are an API (the verifier and PAM both parse them); pin the
+    // exact bytes so the enum follow-up for `attestation.mode` cannot silently rename them.
+    assert_eq!(
+        serde_json::to_string(&sample_record("alice")).unwrap(),
+        GOLDEN_STRICT_JSON
+    );
+}
+
+#[test]
+fn golden_json_round_trips_through_store() {
+    let (_d, store) = fresh();
+    let dir = store.credentials_dir();
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    write_private(&dir.join("alice.json"), GOLDEN_STRICT_JSON.as_bytes());
+    assert_eq!(store.load("alice").unwrap(), sample_record("alice"));
 }
 
 #[test]
@@ -420,6 +446,64 @@ fn load_unsupported_schema_is_corrupt() {
         store.load("alice"),
         Err(StoreError::Corrupt { .. })
     ));
+}
+
+#[test]
+fn load_rejects_unknown_attestation_mode_as_corrupt() {
+    // L16-7 = L6-6: a hand-edited `"mode"` must not load clean.
+    let (_d, store) = fresh();
+    let dir = store.credentials_dir();
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut rec = sample_record("alice");
+    rec.attestation.mode = "anything".into();
+    write_record_json(&dir.join("alice.json"), &rec);
+    assert!(matches!(
+        store.load("alice"),
+        Err(StoreError::Corrupt { .. })
+    ));
+}
+
+#[test]
+fn load_rejects_strict_record_that_is_not_verified() {
+    let (_d, store) = fresh();
+    let dir = store.credentials_dir();
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut rec = sample_record("alice");
+    rec.attestation.verified = false;
+    write_record_json(&dir.join("alice.json"), &rec);
+    assert!(matches!(
+        store.load("alice"),
+        Err(StoreError::Corrupt { .. })
+    ));
+}
+
+#[test]
+fn unattested_opt_in_round_trips_and_is_not_verified() {
+    let (_d, store) = fresh();
+    let mut rec = sample_record("alice");
+    rec.attestation.mode = MODE_UNATTESTED_OPT_IN.into();
+    rec.attestation.verified = false;
+    store.save_atomic(&rec, false).expect("save");
+    assert_eq!(store.load("alice").unwrap(), rec);
+    // The serialized string keeps the stable `unattested-opt-in` spelling.
+    let bytes = fs::read(store.credentials_dir().join("alice.json")).unwrap();
+    assert!(
+        std::str::from_utf8(&bytes)
+            .unwrap()
+            .contains("\"mode\":\"unattested-opt-in\"")
+    );
+}
+
+#[test]
+fn save_rejects_unknown_attestation_mode() {
+    // The writer must refuse to persist a record the reader would reject.
+    let (_d, store) = fresh();
+    let mut rec = sample_record("alice");
+    rec.attestation.mode = "bogus".into();
+    assert!(store.save_atomic(&rec, false).is_err());
+    assert!(!store.credentials_dir().join("alice.json").exists());
 }
 
 #[test]

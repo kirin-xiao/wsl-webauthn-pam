@@ -38,8 +38,11 @@
 //! * The record's `schema_version` must be exactly 1 and its `linux_user` must equal the
 //!   lookup name; otherwise [`StoreError::Corrupt`]/[`StoreError::RecordUserMismatch`].
 //!   Parsing uses `deny_unknown_fields`, so a record carrying unexpected keys is
-//!   [`StoreError::Corrupt`] (strict, fail-closed). `enrolled_at` is stored but not
-//!   re-validated here (the verifier/PAM trust only the cryptographic fields).
+//!   [`StoreError::Corrupt`] (strict, fail-closed). [`CredentialRecord::validate`] also
+//!   enforces the cross-field invariants serde cannot express: `attestation.mode` must be
+//!   `"strict"` or `"unattested-opt-in"`, and a `"strict"` record must be `verified`.
+//!   `enrolled_at` is stored but not re-validated here (the verifier/PAM trust only the
+//!   cryptographic fields).
 //! * Writes are atomic: `mkstemp` in the target directory (`.tmp-XXXXXX`), `fchmod 0600`,
 //!   `fsync` the file, then `rename` over the target (or `link` when `replace == false`),
 //!   then `fsync` the directory **on every success path** (durability of the rename). A
@@ -73,7 +76,8 @@
 //! ```
 //!
 //! `windows_identity` may be `null`. `attestation.mode` is `"strict"` or
-//! `"unattested-opt-in"` (plan D3).
+//! `"unattested-opt-in"` (plan D3); [`Store::load`] rejects any other value as
+//! [`StoreError::Corrupt`].
 
 // `forbid` would prevent the audited `sys` module from using `unsafe` at all; we use
 // `deny` crate-wide and a single documented `#[allow(unsafe_code)]` on `sys`.
@@ -91,8 +95,8 @@ use thiserror::Error;
 use wsl_webauthn_protocol::b64u_decode;
 
 pub use record::{
-    AttestationRecord, Config, CredentialRecord, MODE_STRICT, MODE_UNATTESTED_OPT_IN,
-    SCHEMA_VERSION, WindowsIdentity,
+    AttestationRecord, Config, CredentialRecord, InvalidRecord, MODE_STRICT,
+    MODE_UNATTESTED_OPT_IN, SCHEMA_VERSION, WindowsIdentity,
 };
 
 /// Mode required on the `credentials` directory.
@@ -520,6 +524,15 @@ impl Store {
                 argument_user: username.to_string(),
             });
         }
+        // The record's self-consistency invariants (e.g. `attestation.mode` is one of the
+        // known values) are validated here, not just on write, so a hand-edited record
+        // cannot load clean (L16-7 = L6-6).
+        if let Err(e) = record.validate() {
+            return Err(StoreError::Corrupt {
+                path,
+                message: e.to_string(),
+            });
+        }
         // Defense in depth: the two binary fields PAM/verifier will decode must be valid
         // unpadded base64url *now*, so a corrupt record fails closed at load rather than
         // deep inside the ceremony. Values are not otherwise constrained here.
@@ -541,6 +554,11 @@ impl Store {
     /// value there is [`StoreError::InvalidUsername`].
     pub fn save_atomic(&self, record: &CredentialRecord, replace: bool) -> Result<(), StoreError> {
         validate_username(&record.linux_user)?;
+        // Refuse to persist a record that would not survive `load` (e.g. an unknown
+        // `attestation.mode`), so the writer cannot create a record the reader rejects.
+        record.validate().map_err(|e| StoreError::Encode {
+            message: e.to_string(),
+        })?;
         self.check_base()?;
         // Re-validate ownership/mode of the destination directory *before* creating a
         // temp file in it; the returned, identity-checked handle is used for the final

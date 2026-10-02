@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 /// Current on-disk record schema version.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -15,6 +16,29 @@ pub const MODE_STRICT: &str = "strict";
 
 /// `attestation.mode` value: a self/`none`-attested key admitted by explicit opt-in.
 pub const MODE_UNATTESTED_OPT_IN: &str = "unattested-opt-in";
+
+/// Returns `true` if `mode` is one of the known [`MODE_STRICT`]/[`MODE_UNATTESTED_OPT_IN`]
+/// `attestation.mode` values.
+///
+/// This is the single allow-list used both while serializing a record and while loading
+/// one, so a hand-edited `"mode"` value cannot be persisted or read back as valid.
+pub(crate) fn valid_attestation_mode(mode: &str) -> bool {
+    mode == MODE_STRICT || mode == MODE_UNATTESTED_OPT_IN
+}
+
+/// A `CredentialRecord` that violates the on-disk invariant documented at
+/// [`crate::CredentialRecord::validate`].
+#[derive(Debug, Error)]
+pub enum InvalidRecord {
+    /// `attestation.mode` was not [`MODE_STRICT`] or [`MODE_UNATTESTED_OPT_IN`].
+    #[error(
+        "unknown attestation mode {0:?} (expected {MODE_STRICT:?} or {MODE_UNATTESTED_OPT_IN:?})"
+    )]
+    AttestationMode(String),
+    /// `attestation.verified` was `false` while `attestation.mode` claimed [`MODE_STRICT`].
+    #[error("attestation.mode {MODE_STRICT:?} requires verified = true")]
+    StrictNotVerified,
+}
 
 /// A single Linux user's enrolled credential (one record per user, plan D8).
 ///
@@ -61,9 +85,23 @@ impl CredentialRecord {
         self.schema_version == SCHEMA_VERSION
     }
 
-    /// Returns `true` if `attestation.mode` is one of the known values.
-    pub fn has_known_attestation_mode(&self) -> bool {
-        self.attestation.has_known_mode()
+    /// Validate the invariants the store documents for a record but that serde alone
+    /// cannot express.
+    ///
+    /// This is called from [`crate::Store::load`] and [`crate::Store::save_atomic`], so
+    /// an invalid record is rejected both when read from disk and before it is written.
+    /// Today that means `attestation.mode` must be [`MODE_STRICT`] or
+    /// [`MODE_UNATTESTED_OPT_IN`], and a strict record must be `verified`.
+    pub fn validate(&self) -> Result<(), InvalidRecord> {
+        if !valid_attestation_mode(&self.attestation.mode) {
+            return Err(InvalidRecord::AttestationMode(
+                self.attestation.mode.clone(),
+            ));
+        }
+        if self.attestation.mode == MODE_STRICT && !self.attestation.verified {
+            return Err(InvalidRecord::StrictNotVerified);
+        }
+        Ok(())
     }
 }
 
@@ -79,13 +117,6 @@ pub struct AttestationRecord {
     pub verified: bool,
     /// Lowercase hex SHA-256 of the leaf certificate, when one was present.
     pub leaf_sha256: Option<String>,
-}
-
-impl AttestationRecord {
-    /// Returns `true` if `mode` is one of the known values.
-    pub fn has_known_mode(&self) -> bool {
-        self.mode == MODE_STRICT || self.mode == MODE_UNATTESTED_OPT_IN
-    }
 }
 
 /// The Windows account bound to a credential for audit purposes (plan D8).
