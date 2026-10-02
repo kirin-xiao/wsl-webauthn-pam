@@ -320,6 +320,10 @@ pub struct EnrollOutcome {
     pub credential_id: Vec<u8>,
     /// The credential's COSE public key bytes (as found in `authData`).
     pub cose_public_key: Vec<u8>,
+    /// The credential key's allow-listed COSE algorithm identifier (`-7` ES256,
+    /// `-257` RS256, `-8` EdDSA), taken from the already-parsed key so callers do not
+    /// have to re-parse the CBOR to recover label 3.
+    pub alg: i32,
     /// The authenticator's AAGUID.
     pub aaguid: [u8; 16],
     /// The signature counter at registration.

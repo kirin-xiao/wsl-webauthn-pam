@@ -203,6 +203,9 @@ pub(crate) fn verify(
     Ok(crate::EnrollOutcome {
         credential_id: attested.credential_id.to_vec(),
         cose_public_key: attested.cose_public_key.to_vec(),
+        alg: i32::try_from(credential_key.alg()).map_err(|_| VerifyError::Internal {
+            reason: "credential COSE alg does not fit i32",
+        })?,
         aaguid: attested.aaguid,
         sign_count: prefix.sign_count,
         attestation: AttestationMetadata {
