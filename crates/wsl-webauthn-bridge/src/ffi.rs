@@ -23,13 +23,21 @@
 //!   whole lifetime. The blocking ceremony executes on the *calling* thread
 //!   using that HWND. This is deliberate: if the pump and the blocking
 //!   ceremony shared a thread, no messages would be dispatched during the
-//!   ceremony, defeating the purpose. If window creation fails, the bridge
-//!   falls back to `GetForegroundWindow()` (then `GetTopWindow(NULL)`, then
+//!   ceremony, defeating the purpose. The pump is stopped with a `WM_CLOSE`
+//!   window message — the window proc answers by draining the thread queue
+//!   (`PostQuitMessage(0)`) — and, belt-and-braces, with a `WM_QUIT` posted to
+//!   the pump *thread*'s queue. It is **not** stopped by posting `WM_QUIT` to
+//!   the HWND: `WM_QUIT` is a thread (queue) message and a window-filtered pump
+//!   does not observe it (L3-4). If window creation fails, the bridge falls
+//!   back to `GetForegroundWindow()` (then `GetTopWindow(NULL)`, then
 //!   `GetDesktopWindow()`), so the API never receives a NULL window.
-//! * **Hardened load.** `webauthn.dll` is loaded with
-//!   `LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32)` rather than the
-//!   brief's `LoadLibraryW`, so the bridge's Windows mount-root working
-//!   directory (plan D11) cannot plant a DLL.
+//! * **Hardened load.** `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)`
+//!   is applied process-wide before the first load (L9-3), and `webauthn.dll`
+//!   is then loaded with `LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32)`
+//!   rather than the brief's `LoadLibraryW`, so the bridge's Windows mount-root
+//!   working directory (plan D11) cannot plant a DLL — not the named module,
+//!   nor any dependency it pulls in (`LoadLibraryExW`'s flag only pins the
+//!   direct load; the process default search order governs dependencies).
 
 #![allow(non_snake_case)]
 
@@ -54,7 +62,13 @@ type Handle = *mut c_void;
 type Hwnd = *mut c_void;
 
 const WS_POPUP: u32 = 0x8000_0000;
+const WM_CLOSE: u32 = 0x0010;
 const WM_QUIT: u32 = 0x0012;
+
+/// `LOAD_LIBRARY_SEARCH_SYSTEM32` — pin module resolution to
+/// `%SystemRoot%\System32`. Applied both process-wide (so a dependency of
+/// `webauthn.dll` cannot be planted either) and on the explicit load.
+const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
 
 const WEBAUTHN_CREDENTIAL_TYPE_PUBLIC_KEY: &str = "public-key";
 const WEBAUTHN_HASH_ALGORITHM_SHA_256: &str = "SHA-256";
@@ -69,6 +83,7 @@ unsafe extern "system" {
     fn LoadLibraryExW(lpLibFileName: *const u16, hFile: Handle, dwFlags: u32) -> Handle;
     fn FreeLibrary(hLibModule: Handle) -> i32;
     fn GetProcAddress(hModule: Handle, lpProcName: *const u8) -> *mut c_void;
+    fn SetDefaultDllDirectories(directoryFlags: u32) -> i32;
     pub fn GetCurrentProcessId() -> u32;
 }
 
@@ -90,11 +105,15 @@ unsafe extern "system" {
         hInstance: Handle,
         lpParam: *mut c_void,
     ) -> Hwnd;
+    fn DestroyWindow(hWnd: Hwnd) -> i32;
     fn DefWindowProcW(hWnd: Hwnd, msg: u32, wParam: usize, lParam: isize) -> isize;
     fn GetMessageW(lpMsg: *mut Msg, hWnd: Hwnd, wMsgFilterMin: u32, wMsgFilterMax: u32) -> i32;
     fn TranslateMessage(lpMsg: *const Msg) -> i32;
     fn DispatchMessageW(lpMsg: *const Msg) -> isize;
     fn PostMessageW(hWnd: Hwnd, msg: u32, wParam: usize, lParam: isize) -> i32;
+    fn PostQuitMessage(nExitCode: i32);
+    fn PostThreadMessageW(idThread: u32, msg: u32, wParam: usize, lParam: isize) -> i32;
+    fn GetWindowThreadProcessId(hWnd: Hwnd, lpdwProcessId: *mut u32) -> u32;
     fn GetForegroundWindow() -> Hwnd;
     fn GetTopWindow(hWnd: Hwnd) -> Hwnd;
     fn GetDesktopWindow() -> Hwnd;
@@ -414,11 +433,10 @@ fn module_name() -> *const u16 {
     NAME.get_or_init(|| wide("webauthn.dll")).as_ptr()
 }
 
-fn class_name() -> *const u16 {
-    static NAME: OnceLock<Vec<u16>> = OnceLock::new();
-    NAME.get_or_init(|| wide("WSLWebAuthnBridgeHidden"))
-        .as_ptr()
-}
+/// Window class used by the hidden window pump. Kept as a string so the
+/// test-only failure seam can hand `create_inner` a class that was never
+/// registered.
+const HIDDEN_CLASS_NAME: &str = "WSLWebAuthnBridgeHidden";
 
 fn window_name() -> *const u16 {
     static NAME: OnceLock<Vec<u16>> = OnceLock::new();
@@ -455,13 +473,42 @@ unsafe fn raw_bytes(p: *mut u8, len: u32) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(p, len as usize).to_vec() }
 }
 
-fn guid_from_bytes(b: [u8; 16]) -> Guid {
-    // `Guid` is `#[repr(C)]` and exactly 16 bytes with no padding.
-    unsafe { mem::transmute::<[u8; 16], Guid>(b) }
+/// Resolve the human-readable name for an `HRESULT`, tolerating a missing
+/// `WebAuthNGetErrorName` export.
+///
+/// `get_error_name` is documented optional (L3-6); when it is `None` (or the
+/// DLL returns a null string) the stable placeholder `UnknownError` is used, so
+/// the stderr diagnostic still carries a name field.
+fn error_name(get_error_name: Option<FnGetErrorName>, hr: Hresult) -> String {
+    match get_error_name {
+        Some(f) => unsafe { wide_ptr_to_string(f(hr)) }.unwrap_or_else(|| "UnknownError".into()),
+        None => "UnknownError".into(),
+    }
 }
 
+/// Build a [`Guid`] from its 16 raw bytes.
+///
+/// The layout is a plain field-by-field copy (no `unsafe`, no `transmute`): a
+/// Win32 `GUID` is `{ u32, u16, u16, [u8; 8] }` with no padding, and the raw
+/// byte image is the same on the wire because `data1`..`data3` already carry
+/// little-endian values as returned by the platform.
+fn guid_from_bytes(b: [u8; 16]) -> Guid {
+    Guid {
+        data1: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+        data2: u16::from_le_bytes([b[4], b[5]]),
+        data3: u16::from_le_bytes([b[6], b[7]]),
+        data4: [b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]],
+    }
+}
+
+/// The raw 16-byte image of a [`Guid`] (inverse of [`guid_from_bytes`]).
 fn bytes_from_guid(g: Guid) -> [u8; 16] {
-    unsafe { mem::transmute::<Guid, [u8; 16]>(g) }
+    let mut out = [0u8; 16];
+    out[0..4].copy_from_slice(&g.data1.to_le_bytes());
+    out[4..6].copy_from_slice(&g.data2.to_le_bytes());
+    out[6..8].copy_from_slice(&g.data3.to_le_bytes());
+    out[8..16].copy_from_slice(&g.data4);
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -475,6 +522,10 @@ unsafe impl Send for HwndSend {}
 
 struct HiddenWindow {
     hwnd: Hwnd,
+    /// Pump-thread id, captured from `GetWindowThreadProcessId`. Used to post
+    /// `WM_QUIT` to the *thread* queue, which a NULL-filtered pump observes
+    /// (unlike an HWND-filtered one; L3-4).
+    pump_thread_id: u32,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -486,30 +537,80 @@ unsafe impl Sync for HiddenWindow {}
 impl HiddenWindow {
     /// Best-effort creation; returns `None` if the class/window cannot be
     /// created (caller then falls back to the foreground window).
+    ///
+    /// On failure the pump thread is **not joined** — it runs its message loop
+    /// with no owner until the process exits. That is deliberate: the channel
+    /// send cannot tell us whether the thread will die on its own, and joining
+    /// a possibly-stuck thread here would reintroduce the hang this fix
+    /// removes. The process is short-lived, so a leaked pump is harmless
+    /// (L9-8).
     fn create() -> Option<HiddenWindow> {
-        let (tx, rx) = mpsc::channel::<HwndSend>();
-        let thread = thread::Builder::new()
-            .name("win-message-pump".to_string())
-            .spawn(move || pump_thread(tx))
-            .ok()?;
+        create_inner(wide(HIDDEN_CLASS_NAME), true)
+    }
+}
 
-        match rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(HwndSend(h)) if !h.is_null() => Some(HiddenWindow {
+/// Create the hidden window using `class` as the window class.
+///
+/// `register_class = false` is a test-only seam: leaving the class
+/// unregistered makes `CreateWindowExW` fail deterministically, which is how
+/// the Windows-gated `create_failure_is_observable_as_none` test exercises the
+/// `None` path. Production always passes `true`.
+fn create_inner(class: Vec<u16>, register_class: bool) -> Option<HiddenWindow> {
+    let (tx, rx) = mpsc::channel::<HwndSend>();
+    let thread = thread::Builder::new()
+        .name("win-message-pump".to_string())
+        .spawn(move || pump_thread(tx, class, register_class))
+        .ok()?;
+
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(HwndSend(h)) if !h.is_null() => {
+            // The window belongs to the pump thread; the thread id is what
+            // `PostThreadMessageW` needs.
+            let pump_thread_id = unsafe { GetWindowThreadProcessId(h, ptr::null_mut()) };
+            Some(HiddenWindow {
                 hwnd: h,
+                pump_thread_id,
                 thread: Some(thread),
-            }),
-            // Window creation failed, or the pump thread vanished: detach it
-            // (process is short-lived) and report failure.
-            _ => None,
+            })
+        }
+        // Window creation failed, or the pump thread vanished: do not join —
+        // join could hang if the pump is wedged. Log it (the ceremony then uses
+        // the foreground-window fallback) so a silent failure is observable,
+        // then report failure. The process is short-lived, so an unjoined pump
+        // is harmless (L9-8).
+        other => {
+            let hwnd = match other {
+                Ok(HwndSend(h)) => h,
+                Err(_) => ptr::null_mut(),
+            };
+            eprintln!(
+                "wsl-webauthn-bridge: hidden window creation failed (hwnd={hwnd:p}); \
+                 falling back to the foreground window"
+            );
+            None
         }
     }
 }
 
 impl Drop for HiddenWindow {
     fn drop(&mut self) {
-        // WM_QUIT makes GetMessageW return 0, ending the pump.
-        unsafe {
-            PostMessageW(self.hwnd, WM_QUIT, 0, 0);
+        // Stop the pump deterministically. `WM_QUIT` is a *thread* message: a
+        // window-filtered `GetMessageW` never sees it, so post it to the pump
+        // thread's queue. Belt-and-braces, also ask the window to close; the
+        // window proc answers `WM_CLOSE` with `PostQuitMessage(0)`, which posts
+        // `WM_QUIT` to the pumping thread's queue. Either message ends the
+        // NULL-filtered pump. Both posts are guarded on a non-NULL HWND/
+        // non-zero thread id so we never post into the *dropping* thread's
+        // queue (L9-8).
+        if !self.hwnd.is_null() {
+            unsafe {
+                PostMessageW(self.hwnd, WM_CLOSE, 0, 0);
+            }
+        }
+        if self.pump_thread_id != 0 {
+            unsafe {
+                PostThreadMessageW(self.pump_thread_id, WM_QUIT, 0, 0);
+            }
         }
         if let Some(t) = self.thread.take() {
             let _ = t.join();
@@ -517,26 +618,47 @@ impl Drop for HiddenWindow {
     }
 }
 
-fn pump_thread(tx: mpsc::Sender<HwndSend>) {
-    let hinstance = unsafe { GetModuleHandleW(ptr::null()) };
-    let class = class_name();
+/// Hidden window's window procedure: on `WM_CLOSE`, post a quit to the owning
+/// thread's queue and destroy the window. Everything else is default handling.
+unsafe extern "system" fn hidden_wnd_proc(
+    hwnd: Hwnd,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    if msg == WM_CLOSE {
+        unsafe {
+            PostQuitMessage(0);
+            DestroyWindow(hwnd);
+        }
+        0
+    } else {
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+}
 
-    let wc = WndClassW {
-        style: 0,
-        lpfn_wnd_proc: Some(DefWindowProcW),
-        cb_cls_extra: 0,
-        cb_wnd_extra: 0,
-        h_instance: hinstance,
-        h_icon: ptr::null_mut(),
-        h_cursor: ptr::null_mut(),
-        hbr_background: ptr::null_mut(),
-        lpsz_menu_name: ptr::null(),
-        lpsz_class_name: class,
-    };
-    // Ignore a failure from RegisterClassW (e.g. already registered); a failed
-    // creation below is what matters.
-    unsafe {
-        RegisterClassW(&wc);
+fn pump_thread(tx: mpsc::Sender<HwndSend>, class: Vec<u16>, register_class: bool) {
+    let hinstance = unsafe { GetModuleHandleW(ptr::null()) };
+    let class = class.as_ptr();
+
+    if register_class {
+        let wc = WndClassW {
+            style: 0,
+            lpfn_wnd_proc: Some(hidden_wnd_proc),
+            cb_cls_extra: 0,
+            cb_wnd_extra: 0,
+            h_instance: hinstance,
+            h_icon: ptr::null_mut(),
+            h_cursor: ptr::null_mut(),
+            hbr_background: ptr::null_mut(),
+            lpsz_menu_name: ptr::null(),
+            lpsz_class_name: class,
+        };
+        // Ignore a failure from RegisterClassW (e.g. already registered); a
+        // failed creation below is what matters.
+        unsafe {
+            RegisterClassW(&wc);
+        }
     }
 
     let hwnd = unsafe {
@@ -562,6 +684,9 @@ fn pump_thread(tx: mpsc::Sender<HwndSend>) {
         return;
     }
 
+    // NULL hWnd filter: retrieve *every* message for this thread, including the
+    // thread-targeted `WM_QUIT` (which a window-filtered pump would miss).
+    // `GetMessageW` returns 0 on `WM_QUIT`, -1 on error; both end the loop.
     let mut msg: Msg = unsafe { mem::zeroed() };
     loop {
         let r = unsafe { GetMessageW(&mut msg, ptr::null_mut(), 0, 0) };
@@ -594,10 +719,11 @@ struct WebauthnDll {
     free_credential_attestation: FnFreeCredentialAttestation,
     /// Optional (pre-1903 DLLs); `None` ⇒ treat as API version 0.
     get_api_version_number: Option<FnGetApiVersionNumber>,
-    /// Required: every DLL exposing the ceremony APIs also exports
-    /// `WebAuthNGetErrorName` (libfido2 treats a missing export as a load
-    /// failure too). Used for bounded stderr diagnostics only.
-    get_error_name: FnGetErrorName,
+    /// Optional: some pre-1903 DLLs do not export `WebAuthNGetErrorName`.
+    /// Used for bounded stderr diagnostics only; when absent,
+    /// [`Win32Api::log_error`] falls back to the literal `UnknownError`. It is
+    /// deliberately **not** a load gate (L3-6).
+    get_error_name: Option<FnGetErrorName>,
 }
 
 // SAFETY: after `load()` the function pointers and module handle are
@@ -645,12 +771,24 @@ impl Win32Api {
     /// required export is absent. `WebAuthNGetApiVersionNumber` and
     /// `WebAuthNGetErrorName` are optional.
     ///
-    /// Loading is restricted to `%SystemRoot%\System32`
-    /// (`LOAD_LIBRARY_SEARCH_SYSTEM32`) so the bridge's Windows mount-root
-    /// working directory cannot be used to plant a rogue `webauthn.dll`
-    /// (plan D11/§5).
+    /// Hardening (L9-3): `SetDefaultDllDirectories` narrows the **process**
+    /// default DLL search order to `%SystemRoot%\System32` before the first
+    /// load, and the explicit `LoadLibraryExW` is additionally passed
+    /// `LOAD_LIBRARY_SEARCH_SYSTEM32`. The process-wide call matters because
+    /// `LoadLibraryExW`'s flag pins only the named module: the dependencies
+    /// `webauthn.dll` pulls in are resolved against the process default order,
+    /// which otherwise includes the bridge's Windows mount-root working
+    /// directory (plan D11/§5). The call is idempotent; `load()` is called once
+    /// per process here, but repeating it is harmless.
     pub fn load() -> Result<Win32Api, BridgeError> {
-        const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+        // SAFETY: no pointers; returns a BOOL we intentionally ignore. Narrowing
+        // the default search path is best-effort: if it fails (e.g. a very old
+        // OS) the explicit per-load flag below still applies to `webauthn.dll`
+        // itself. (A real-Windows test should assert the return value on
+        // supported SKUs; off-Windows this is unverified — L9-3.)
+        unsafe {
+            SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
+        }
         let handle =
             unsafe { LoadLibraryExW(module_name(), ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
         if handle.is_null() {
@@ -681,6 +819,9 @@ impl Win32Api {
             unsafe { proc::<FnGetApiVersionNumber>(handle, b"WebAuthNGetApiVersionNumber\0") };
         let get_error_name = unsafe { proc::<FnGetErrorName>(handle, b"WebAuthNGetErrorName\0") };
 
+        // `get_error_name` is intentionally *not* in this required set: it is
+        // documented optional and only feeds stderr diagnostics (L3-6). A
+        // missing export is represented by `None` and handled by `log_error`.
         let (
             Some(is_uv_platform_available),
             Some(make_credential),
@@ -689,7 +830,6 @@ impl Win32Api {
             Some(get_cancellation_id),
             Some(free_assertion),
             Some(free_credential_attestation),
-            Some(get_error_name),
         ) = (
             is_uv_platform_available,
             make_credential,
@@ -698,11 +838,13 @@ impl Win32Api {
             get_cancellation_id,
             free_assertion,
             free_credential_attestation,
-            get_error_name,
         )
         else {
             // `WebauthnDll` owns `handle`; dropping it via this early return
-            // requires moving the handle first.
+            // requires moving the handle first. Freeing the handle here is the
+            // observable "load failed" side effect a Windows-gated test can
+            // assert against a DLL that exposes some, but not all, of the
+            // required exports (L3-6).
             unsafe {
                 FreeLibrary(handle);
             }
@@ -760,8 +902,7 @@ impl Win32Api {
     }
 
     fn log_error(&self, context: &str, hr: Hresult) {
-        let name = unsafe { wide_ptr_to_string((self.dll.get_error_name)(hr)) }
-            .unwrap_or_else(|| "UnknownError".into());
+        let name = error_name(self.dll.get_error_name, hr);
         eprintln!("{context}: hr=0x{:08X} {name}", hr as u32);
     }
 }
@@ -1010,6 +1151,8 @@ pub fn load() -> Result<Arc<dyn WebAuthnApi>, BridgeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use std::time::Instant;
 
     // ABI layout guards. These run on the Windows CI job (the module only
     // compiles on Windows) and pin the sizes we derived from the public
@@ -1019,6 +1162,83 @@ mod tests {
     #[test]
     fn guid_is_16_bytes() {
         assert_eq!(mem::size_of::<Guid>(), 16);
+    }
+
+    // A missing/optional `WebAuthNGetErrorName` export must still produce a
+    // stable name, not a load failure or a panic (L3-6).
+    #[test]
+    fn error_name_falls_back_when_export_is_absent() {
+        assert_eq!(error_name(None, 0x8009_0036u32 as Hresult), "UnknownError");
+        assert_eq!(error_name(None, 0), "UnknownError");
+    }
+
+    #[test]
+    fn guid_explicit_round_trip_matches_byte_image() {
+        // Replaces the two `mem::transmute`s (L3-8) with field-wise
+        // construction; this pins the little-endian byte image the platform's
+        // `GUID` uses.
+        let patterns: [[u8; 16]; 3] = [
+            [
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+                0x0F, 0x10,
+            ],
+            [0x00; 16],
+            [0xFF; 16],
+        ];
+        for bytes in patterns {
+            let g = guid_from_bytes(bytes);
+            assert_eq!(
+                g.data1,
+                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+            );
+            assert_eq!(g.data2, u16::from_le_bytes([bytes[4], bytes[5]]));
+            assert_eq!(g.data3, u16::from_le_bytes([bytes[6], bytes[7]]));
+            assert_eq!(g.data4, bytes[8..16]);
+            assert_eq!(bytes_from_guid(g), bytes);
+        }
+    }
+
+    // ---- hidden-window lifecycle (Windows-gated; L3-4 / L9-8) ------------
+
+    /// Creating the hidden window and dropping it must join the pump thread
+    /// promptly. Before the fix `Drop` posted `WM_QUIT` to the HWND, which a
+    /// window-filtered pump never observes; this test only proves the current
+    /// pattern terminates, so it must run on a real Windows host (it does
+    /// compile here under the gnu target).
+    #[cfg(windows)]
+    #[test]
+    fn hidden_window_create_and_drop_returns_promptly() {
+        let start = Instant::now();
+        if let Some(w) = HiddenWindow::create() {
+            assert!(
+                !w.hwnd.is_null(),
+                "created window must have a non-null HWND"
+            );
+            assert_ne!(w.pump_thread_id, 0, "pump thread id must be known");
+            drop(w);
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "create+drop took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A `CreateWindowExW` failure must be observable as `None` (the caller
+    /// falls back to the foreground window) and must not block on the pump.
+    /// The unregistered class guarantees the failure without touching system
+    /// state.
+    #[cfg(windows)]
+    #[test]
+    fn hidden_window_create_failure_is_observable_as_none() {
+        let start = Instant::now();
+        let w = create_inner(wide("WSLWebAuthnBridgeNeverRegistered"), false);
+        assert!(w.is_none());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "failed create took {:?}",
+            start.elapsed()
+        );
     }
 
     #[cfg(target_pointer_width = "64")]
