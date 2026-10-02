@@ -16,4 +16,4 @@ tests/vectors/local/
 *.rs.bk
 .idea/
 .vscode/
-release*/
+/release/

@@ -40,7 +40,8 @@ bridge:
 test:
 	$(CARGO) test --workspace --locked
 
-# Local pre-flight: everything CI gates on, best-effort for tools not installed.
+# Local pre-flight: fast local subset of the CI gate (see
+# .github/workflows/ci.yaml for the full set), best-effort for tools not installed.
 check: fmt clippy test crlf deny
 	@echo ">> check complete"
 
