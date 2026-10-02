@@ -42,6 +42,7 @@
 
 use std::fmt::Write as _;
 use std::io::Write as _;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -510,38 +511,48 @@ struct Artifacts {
 }
 
 /// Candidate directories to search for artifacts, nearest-first.
+///
+/// Only directories derived from the running executable are considered. The current
+/// working directory is deliberately **not** searched: the module is installed as a
+/// root PAM object, and a non-root invoker controls the cwd, so a `.so` planted there
+/// (or a `./build/release` tree) could otherwise be installed. A source checkout runs
+/// the CLI from `target/<profile>/`, whose directory is therefore already a candidate.
 fn candidate_artifact_dirs() -> Vec<PathBuf> {
+    // No executable directory (or no parent) yields no implicit candidates, so the
+    // caller reports the build/`--artifact-dir` hint rather than searching anywhere
+    // untrusted.
+    let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    else {
+        return Vec::new();
+    };
+    artifact_dirs_from_exe_dir(&dir)
+}
+
+/// The search roots implied by running the CLI from `dir` (the executable's directory).
+fn artifact_dirs_from_exe_dir(dir: &Path) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        dirs.push(dir.to_path_buf());
-        if let Some(target) = ancestor_named(dir, "target") {
-            dirs.push(target.join("release"));
-            if let Ok(entries) = std::fs::read_dir(&target) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        dirs.push(path.join("release"));
-                    }
+    dirs.push(dir.to_path_buf());
+    if let Some(target) = ancestor_named(dir, "target") {
+        dirs.push(target.join("release"));
+        if let Ok(entries) = std::fs::read_dir(&target) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path.join("release"));
                 }
             }
         }
-        let mut cur = dir;
-        for _ in 0..4 {
-            let Some(parent) = cur.parent() else { break };
-            dirs.push(parent.to_path_buf());
-            dirs.push(parent.join("build"));
-            dirs.push(parent.join("build/release"));
-            dirs.push(parent.join("release"));
-            cur = parent;
-        }
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        dirs.push(cwd.join("build/release"));
-        dirs.push(cwd.join("build"));
-        dirs.push(cwd.join("release"));
-        dirs.push(cwd);
+    let mut cur = dir;
+    for _ in 0..4 {
+        let Some(parent) = cur.parent() else { break };
+        dirs.push(parent.to_path_buf());
+        dirs.push(parent.join("build"));
+        dirs.push(parent.join("build/release"));
+        dirs.push(parent.join("release"));
+        cur = parent;
     }
     let mut seen = Vec::new();
     dirs.retain(|d| {
@@ -582,9 +593,10 @@ fn find_in(dirs: &[PathBuf], names: &[&str]) -> Option<PathBuf> {
 /// Resolve the module and bridge artifacts.
 ///
 /// Order: an explicit `--artifact-dir` (or `$WSL_WEBAUTHN_ARTIFACTS`) is authoritative
-/// and must contain both files; otherwise the executable's own directory, the `target/`
-/// tree around it, and the current directory are searched (release-tarball and cargo
-/// layouts).
+/// and must contain both files; otherwise only the executable's own directory and its
+/// `build/`/`target/` ancestors are searched (release-tarball and cargo layouts). The
+/// invoking user's current directory is never searched (see
+/// [`candidate_artifact_dirs`]).
 fn resolve_artifacts(explicit: Option<&Path>) -> anyhow::Result<Artifacts> {
     let env_dir = std::env::var_os("WSL_WEBAUTHN_ARTIFACTS").map(PathBuf::from);
     let explicit = explicit.map(Path::to_path_buf).or(env_dir);
@@ -887,15 +899,53 @@ fn resolve_local_appdata(interop: &dyn InteropRunner, win_mnt: &Path) -> anyhow:
 // Provisioning
 // ---------------------------------------------------------------------------
 
-/// Ensure a directory exists, refusing symlinks, and record the highest newly created
-/// directory for rollback.
-fn ensure_dir(dir: &Path, mode: u32, rollback: &mut Rollback, what: &str) -> anyhow::Result<()> {
+/// Ensure a directory exists with a safe owner/mode, refusing symlinks, and record the
+/// highest newly created directory for rollback.
+///
+/// A pre-existing Linux directory is validated, not trusted: when `owner_uid` is
+/// `Some`, it must be owned by that uid and must not be group/other-writable. A too-open
+/// mode is tightened in place (with a warning); wrong ownership is refused, since this
+/// process may not be able to `chown` it and silently reusing another owner's directory
+/// on the root install path would violate the "root-owned" invariant. `owner_uid` is
+/// `None` for the Windows bridge directory on DrvFs, where ownership and mode are
+/// synthesized and neither check is meaningful.
+fn ensure_dir(
+    dir: &Path,
+    mode: u32,
+    owner_uid: Option<u32>,
+    rollback: &mut Rollback,
+    what: &str,
+) -> anyhow::Result<()> {
     if let Some(md) = fsutil::lstat_opt(dir)? {
         if md.file_type().is_symlink() {
             bail!("refusing to use a symlinked {what}: {}", dir.display());
         }
         if !md.is_dir() {
             bail!("{what} is not a directory: {}", dir.display());
+        }
+        if let Some(expected) = owner_uid {
+            if md.uid() != expected {
+                bail!(
+                    "refusing to reuse {what} {}: owned by uid {}, expected uid {}",
+                    dir.display(),
+                    md.uid(),
+                    expected
+                );
+            }
+            // Remove any permission bit not present in the requested mode, but never
+            // *add* bits: an existing 0777 credentials dir becomes 0700, while a
+            // deliberately stricter 0750 config dir is left alone.
+            let current = fsutil::mode_of(&md);
+            if current & !mode != 0 {
+                eprintln!(
+                    "warning: {what} {} has mode {current:o}, more permissive than the \
+                     intended {mode:o}; tightening",
+                    dir.display()
+                );
+                fsutil::set_mode(dir, mode).with_context(|| {
+                    format!("tightening mode on existing {what} {}", dir.display())
+                })?;
+            }
         }
         return Ok(());
     }
@@ -935,7 +985,8 @@ fn provision_bridge(
     let parent = dest
         .parent()
         .ok_or_else(|| anyhow!("bridge destination has no parent: {}", dest.display()))?;
-    ensure_dir(parent, 0o755, rollback, "bridge directory")?;
+    // DrvFs synthesizes ownership/mode, so only the symlink/dir checks apply here.
+    ensure_dir(parent, 0o755, None, rollback, "bridge directory")?;
 
     let undo = prepare_write(&dest)?;
     fsutil::copy_file_atomic(source, &dest, BRIDGE_MODE)
@@ -960,7 +1011,13 @@ fn provision_config(
     bridge_path: &Path,
     rollback: &mut Rollback,
 ) -> anyhow::Result<()> {
-    ensure_dir(&paths.etc_wsl_webauthn, 0o755, rollback, "config directory")?;
+    ensure_dir(
+        &paths.etc_wsl_webauthn,
+        0o755,
+        Some(paths.owner_uid),
+        rollback,
+        "config directory",
+    )?;
     let toml = config_toml(bridge_path, win_mnt);
     let config = paths.config_path();
     let undo = prepare_write(&config)?;
@@ -972,7 +1029,13 @@ fn provision_config(
     println!("  config:      {}", config.display());
 
     let creds = paths.credentials_dir();
-    ensure_dir(&creds, DIR_MODE, rollback, "credentials directory")?;
+    ensure_dir(
+        &creds,
+        DIR_MODE,
+        Some(paths.owner_uid),
+        rollback,
+        "credentials directory",
+    )?;
     println!("  credentials: {}", creds.display());
     Ok(())
 }
@@ -996,7 +1059,13 @@ fn provision_module(
 
 /// Install the `pam-configs` profile with the embedded bytes.
 fn provision_profile(paths: &InstallPaths, rollback: &mut Rollback) -> anyhow::Result<PathBuf> {
-    ensure_dir(&paths.pam_configs, 0o755, rollback, "pam-configs directory")?;
+    ensure_dir(
+        &paths.pam_configs,
+        0o755,
+        Some(paths.owner_uid),
+        rollback,
+        "pam-configs directory",
+    )?;
     let dest = paths.profile_path();
     let undo = prepare_write(&dest)?;
     fsutil::atomic_write(&dest, PROFILE_TEXT.as_bytes(), PROFILE_MODE)
@@ -1008,10 +1077,11 @@ fn provision_profile(paths: &InstallPaths, rollback: &mut Rollback) -> anyhow::R
     Ok(dest)
 }
 
-/// Verify the freshly written artifacts: profile bytes, module type/mode, config parse.
+/// Verify the freshly written artifacts: profile bytes, module bytes+type+mode, config.
 fn verify_installed(
     paths: &InstallPaths,
     module_dir: &Path,
+    module_src: &Path,
     profile: &Path,
     bridge: &Path,
 ) -> anyhow::Result<()> {
@@ -1042,6 +1112,28 @@ fn verify_installed(
             module.display(),
             fsutil::mode_of(&md),
             MODULE_MODE
+        );
+    }
+    // A regular file with the right mode is not enough: a truncated/zero-byte/partial
+    // copy would install "successfully" and only fail at dlopen on the root path. The
+    // copy is a byte-for-byte `copy_file_atomic`, so assert equality with the source.
+    let installed_module = fsutil::read_nofollow(&module)
+        .with_context(|| format!("re-reading {}", module.display()))?;
+    let source_module = fsutil::read_nofollow(module_src)
+        .with_context(|| format!("re-reading source {}", module_src.display()))?;
+    if installed_module != source_module {
+        bail!(
+            "verification failed: {} ({} bytes) does not match its source {} ({} bytes)",
+            module.display(),
+            installed_module.len(),
+            module_src.display(),
+            source_module.len()
+        );
+    }
+    if !installed_module.starts_with(b"\x7fELF") {
+        bail!(
+            "verification failed: {} is not an ELF shared object (bad magic)",
+            module.display()
         );
     }
     if fsutil::lstat_opt(bridge)?.is_none() {
@@ -1487,7 +1579,13 @@ pub(crate) fn install_with(
     let module_dest = provision_module(&module_dir, &artifacts.module, &mut rollback)?;
     let profile_dest = provision_profile(paths, &mut rollback)?;
     // 4. Verify before touching anything legacy.
-    verify_installed(paths, &module_dir, &profile_dest, &bridge_dest)?;
+    verify_installed(
+        paths,
+        &module_dir,
+        &artifacts.module,
+        &profile_dest,
+        &bridge_dest,
+    )?;
     println!();
     println!("Installed and verified {}.", module_dest.display());
 

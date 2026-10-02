@@ -14,6 +14,11 @@ use tempfile::TempDir;
 
 use super::*;
 
+/// Byte contents standing in for a built PAM module. Starts with the real ELF magic
+/// (`\x7fELF`) so the artifact passes `verify_installed`'s magic and byte-equality
+/// checks; it is never dlopened by the tests.
+const MODULE_FIXTURE_BYTES: &[u8] = b"\x7fELF-fake-module-bytes";
+
 // ---------------------------------------------------------------------------
 // Mock seams
 // ---------------------------------------------------------------------------
@@ -200,11 +205,12 @@ impl Harness {
         let module_dir = root.join("usr/lib/x86_64-linux-gnu/security");
         write(&module_dir.join("pam_unix.so"), b"fake pam_unix", 0o644);
 
-        // Artifact fixtures.
+        // Artifact fixtures. The module carries real ELF magic so the installed
+        // artifact passes the magic check in `verify_installed`.
         let art_dir = root.join("artifacts");
         write(
             &art_dir.join(MODULE_NAME),
-            b"ELF-fake-module-bytes",
+            MODULE_FIXTURE_BYTES,
             MODULE_MODE,
         );
         write(&art_dir.join(BRIDGE_EXE), b"MZ-fake-bridge-bytes", 0o755);
@@ -399,6 +405,104 @@ fn resolve_module_dir_prefers_explicit_flag() {
 }
 
 // ---------------------------------------------------------------------------
+// Artifact resolution
+// ---------------------------------------------------------------------------
+
+#[test]
+fn install_prefers_exe_dir_over_cwd() {
+    // L12-10: the implicit artifact search is rooted at the running executable only.
+    // Two unrelated trees stand in for the executable's directory and an
+    // attacker-controlled cwd; the search derived from the exe dir must never touch
+    // the cwd tree, even though the latter has the tempting `build/release` layout a
+    // `.so` would be planted in.
+    let tmp_exe = TempDir::new().unwrap();
+    let tmp_cwd = TempDir::new().unwrap();
+    let exe_dir = tmp_exe.path().join("build/release");
+    std::fs::create_dir_all(&exe_dir).unwrap();
+    let cwd = tmp_cwd.path().to_path_buf();
+    std::fs::create_dir_all(cwd.join("build/release")).unwrap();
+
+    let dirs = artifact_dirs_from_exe_dir(&exe_dir);
+    assert!(
+        dirs.contains(&exe_dir),
+        "the executable's directory must be searched: {dirs:?}"
+    );
+    assert!(
+        !dirs.contains(&cwd),
+        "the current working directory must not be searched: {dirs:?}"
+    );
+    for suffix in ["build", "build/release", "release"] {
+        assert!(
+            !dirs.contains(&cwd.join(suffix)),
+            "cwd/{suffix} must not be an implicit artifact root: {dirs:?}"
+        );
+    }
+
+    // And the real search is a subset of the exe-dir-derived roots (never cwd).
+    let real_exe_dir = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let real_cwd = std::env::current_dir().unwrap();
+    assert!(
+        candidate_artifact_dirs().contains(&real_exe_dir),
+        "the real executable dir must be searched"
+    );
+    if real_exe_dir != real_cwd {
+        assert!(
+            !candidate_artifact_dirs().contains(&real_cwd),
+            "the real cwd must never be an implicit artifact root"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Directory hardening
+// ---------------------------------------------------------------------------
+
+#[test]
+fn install_fixes_or_refuses_world_writable_credentials_dir() {
+    // L12-8: a pre-existing credentials/ directory must not be reused with an unsafe
+    // owner/mode.
+    let h = Harness::new();
+    std::fs::create_dir_all(h.paths.credentials_dir()).unwrap();
+    std::fs::set_permissions(
+        h.paths.credentials_dir(),
+        std::fs::Permissions::from_mode(0o777),
+    )
+    .unwrap();
+
+    // A world-writable directory owned by us is tightened back to 0700.
+    h.run_install(
+        &ScriptedPrompter::always(true),
+        &MockEnroller::default(),
+        &MockCommands::default(),
+        &h.opts(),
+    )
+    .unwrap();
+    assert_eq!(
+        mode_of(&h.paths.credentials_dir()),
+        DIR_MODE,
+        "a world-writable credentials dir must be tightened"
+    );
+
+    // A directory owned by a different uid is refused rather than silently reused.
+    let other = h._tmp.path().join("other-owner");
+    std::fs::create_dir_all(&other).unwrap();
+    let mut rollback = Rollback::new();
+    let err = ensure_dir(
+        &other,
+        DIR_MODE,
+        Some(h.paths.owner_uid.wrapping_add(1)),
+        &mut rollback,
+        "credentials directory",
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("owned by uid"), "{err:#}");
+}
+
+// ---------------------------------------------------------------------------
 // Happy path
 // ---------------------------------------------------------------------------
 
@@ -436,7 +540,7 @@ fn install_provisions_everything() {
 
     // Module: contents preserved, mode 0644.
     let module = h.module_dir.join(MODULE_NAME);
-    assert_eq!(std::fs::read(&module).unwrap(), b"ELF-fake-module-bytes");
+    assert_eq!(std::fs::read(&module).unwrap(), MODULE_FIXTURE_BYTES);
     assert_eq!(mode_of(&module), MODULE_MODE);
 
     // Profile: exact bytes, mode 0644.
@@ -773,6 +877,41 @@ fn install_fails_cleanly_when_bridge_artifact_missing() {
 }
 
 #[test]
+fn install_fails_when_module_artifact_is_truncated() {
+    // L12-9: a truncated module artifact must not be installed and "verified"; the
+    // installer compares the installed bytes against the source, not just the type+mode.
+    let h = Harness::new();
+    // A normal install + verify succeeds.
+    h.run_install(
+        &ScriptedPrompter::always(true),
+        &MockEnroller::default(),
+        &MockCommands::default(),
+        &h.opts(),
+    )
+    .unwrap();
+
+    // Simulate a partial/interrupted copy: the destination is a prefix of the source
+    // (still a regular file with the right mode and ELF magic).
+    let dest = h.module_dir.join(MODULE_NAME);
+    let full = std::fs::read(&dest).unwrap();
+    assert!(full.len() > 2);
+    write(&dest, &full[..full.len() - 2], MODULE_MODE);
+
+    let err = verify_installed(
+        &h.paths,
+        &h.module_dir,
+        &h.art_dir.join(MODULE_NAME),
+        &h.paths.profile_path(),
+        &h.bridge_dest(),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("does not match its source"),
+        "{err:#}"
+    );
+}
+
+#[test]
 fn install_rolls_back_partial_state_on_module_failure() {
     let h = Harness::new();
     // Make the module source a symlink so the copy fails *after* the bridge and config
@@ -806,8 +945,8 @@ fn install_rolls_back_partial_state_on_module_failure() {
 fn install_overwrite_failure_restores_previous_module_and_config() {
     let h = Harness::new();
     // Simulate an upgrade/re-install over an already-working install: the module and
-    // config already exist with known bytes.
-    let old_module = b"OLD-WORKING-MODULE-BYTES".to_vec();
+    // config already exist with known bytes (the module carries ELF magic).
+    let old_module = b"\x7fELF-OLD-WORKING-MODULE-BYTES".to_vec();
     let old_config = b"bridge_path = \"/old/bridge.exe\"\nwin_mnt = \"/mnt/old\"\n".to_vec();
     write(&h.module_dir.join(MODULE_NAME), &old_module, MODULE_MODE);
     write(&h.paths.config_path(), &old_config, CONFIG_MODE);
