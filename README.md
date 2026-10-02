@@ -120,8 +120,8 @@ is refused. There is **no silent fallback to an unattested key, ever**.
   as root. The record's `linux_user` must match the account being authenticated.
 - **Bridge binary.** The PAM module refuses to launch the bridge unless its
   SHA-256 matches the digest pinned at enrollment (plan D11, fail-closed). A
-  tampered or replaced `.exe` is not executed; `noverifypin` disables this check
-  and is logged loudly.
+  tampered or replaced `.exe` is not executed. The pin is always enforced:
+  there is no module argument that disables it.
 - **Clone signal.** The signature counter is recorded at enrollment and
   compared on each authentication per WebAuthn §7.2 step 22 whenever either
   count is non-zero. Windows Hello is a zero/constant-counter authenticator, so
@@ -523,7 +523,9 @@ watchdog that calls `WebAuthNCancelCurrentOperation` at 55 s. The Linux runner
 enforces a hard 60 s deadline for the whole child, then `SIGKILL`s the shim and
 best-effort `taskkill.exe`s the reported Windows PID within a 5 s budget. So
 total wall time can reach about `deadline + 5 s`. Override with the
-`timeout=<secs>` module argument or `timeout_secs` in the config.
+`timeout=<secs>` module argument or `timeout_secs` in the config. The module
+argument is clamped to `1..=600` seconds; a non-numeric or out-of-range value is
+logged at `LOG_ERR` and ignored (the config value or the 60 s default applies).
 
 > Because `WebAuthNCancelCurrentOperation` makes the platform return the same
 > `NTE_USER_CANCELLED` HRESULT as a manual cancel, the bridge reclassifies its
@@ -531,10 +533,9 @@ total wall time can reach about `deadline + 5 s`. Override with the
 > `user_cancelled` (`SPIKE.md` §5; `ceremony.rs`).
 
 **The bridge pin fails after I replaced the `.exe`.**
-That is the pin doing its job. Re-enroll, or (if you intend to trust the new
-binary) re-run `enroll --replace`, or launch with the `noverifypin` module
-argument — which is logged loudly at `LOG_ERR` on every authentication and
-removes a defence-in-depth control.
+That is the pin doing its job. The pin is always enforced and there is no module
+argument to disable it: re-enroll, or, if you intend to trust the new binary,
+re-run `enroll --replace`.
 
 ---
 

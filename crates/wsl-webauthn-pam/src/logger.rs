@@ -54,8 +54,9 @@ thread_local! {
 
 /// Configure whether [`debug`] emits messages for the current authentication thread.
 ///
-/// Called from `run` after parsing the module arguments. Because the flag is
-/// thread-local, a second concurrent authentication on another thread is unaffected.
+/// Called from [`crate::args::parse`] via `run` in `pam_sm_authenticate`. Because the
+/// flag is thread-local, a second concurrent authentication on another thread is
+/// unaffected.
 pub fn set_debug(enabled: bool) {
     DEBUG_ENABLED.with(|d| d.set(enabled));
 }

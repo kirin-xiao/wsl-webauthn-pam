@@ -348,9 +348,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # The `fuzz/` cargo-fuzz workspace is committed, so `present` is true on
-      # this ref. The gate is kept so that a fork/backport without `fuzz/` does
-      # not fail the job; the heavy steps activate automatically when it lands.
+      # The `fuzz/` cargo-fuzz workspace is present in the tree (committed since
+      # the fuzz-reproducibility work), so `present` is true on this ref. The
+      # gate is retained so that a future revert or fork dropping `fuzz/` fails
+      # gracefully (skip) instead of erroring.
       - name: detect fuzz workspace
         id: detect
         run: |

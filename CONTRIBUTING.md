@@ -61,10 +61,21 @@ Notes:
 
 - Use `--locked` everywhere. If you change a dependency, commit the updated
   `Cargo.lock`.
-- Keep the code `unsafe`-free where practical. The only sanctioned `unsafe` is
-  in the small, documented FFI/syscall modules (`wsl-webauthn-pam` bindings and
-  `wsl-webauthn-store::sys`, `wsl-webauthn-runner::proc`); new `unsafe` needs a
-  `// SAFETY:` justification.
+- Keep the code `unsafe`-free where practical. Every `unsafe` site is a small,
+  documented FFI/syscall module that turns a raw C ABI or syscall into safe
+  wrappers; new `unsafe` needs a `// SAFETY:` justification. The complete list
+  (each opens with `#![allow(unsafe_code)]`, while its parent crate is
+  `#![deny(unsafe_code)]` or `#![forbid(unsafe_code)]`):
+  - `wsl-webauthn-pam/src/bindings.rs` — raw libpam/`syslog` C declarations.
+  - `wsl-webauthn-pam/src/seam.rs` — the libpam calls (`pam_get_item`,
+    `pam_get_user`, the conversation callback, `free`).
+  - `wsl-webauthn-pam/src/logger.rs` — `openlog`/`syslog`.
+  - `wsl-webauthn-store/src/sys.rs` — `openat`/`fstat`/`read`/`write`/`renameat`
+    syscall wrappers.
+  - `wsl-webauthn-runner/src/proc.rs` — `poll`/`read`/`write`/`fcntl` and the
+    per-thread `pthread_sigmask` SIGPIPE guard.
+  - `wsl-webauthn-cli/src/main.rs` (`mod userdb`) — `getpwnam`/`getpwuid` passwd
+    lookups.
 - The verifier must never panic on attacker-controlled input and must return an
   error for every malformed path.
 - Never commit real-machine attestation material or machine identifiers. Local
