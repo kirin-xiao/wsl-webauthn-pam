@@ -2,15 +2,16 @@
 //!
 //! Subcommands:
 //!
-//! * `enroll` — probe, run a Windows Hello enrollment ceremony, verify the attestation
-//!   under the selected policy (including the **double-enroll** retry), capture the
-//!   Windows identity, and atomically persist a credential record.
+//! * `enroll` — probe, print a pre-ceremony advisory, run a Windows Hello enrollment
+//!   ceremony, verify the attestation under the selected policy (including the
+//!   **double-enroll** retry), capture the Windows identity, and atomically persist a
+//!   credential record.
 //! * `unregister` — remove exactly one user's credential record.
 //! * `probe` — report interop / Hello availability and the bridge pin.
 //! * `status` — list enrolled users and the config summary.
 //! * `verify` — run the verifier against an in-process synthetic attestation+assertion
 //!   to prove the crypto stack works on this machine.
-//! * `install` — provision the bridge, config, module and profile, migrate a legacy
+//! * `install` — provision the bridge, config, module, profile and CLI, migrate a legacy
 //!   WSL-Hello-sudo install, and offer enrollment.
 //! * `uninstall` — remove one user's record or, with `--all`, every provisioned
 //!   component (never the legacy `/etc/pam_wsl_hello`).
@@ -104,6 +105,25 @@ const CHALLENGE_BYTES: usize = 32;
 /// Default COSE algorithm allow-list presented to Windows at enrollment.
 const ENROLL_ALGS: [i32; 2] = [-7, -257];
 
+/// Advisory printed immediately before the enrollment ceremony.
+///
+/// The Windows Hello dialog can open behind the terminal and the save-then-PIN flow
+/// happens inside one `makeCredential` call, so the CLI cannot otherwise signal progress.
+const ENROLL_ADVISORY: &[&str] = &[
+    "About to open the Windows Hello dialog. If it does not come to the front,",
+    "check the taskbar; the save dialog may be followed by a PIN prompt.",
+    "Do not type the PIN into this terminal.",
+];
+
+/// Print [`ENROLL_ADVISORY`], surrounded by blank lines.
+fn print_enroll_advisory() {
+    println!();
+    for line in ENROLL_ADVISORY {
+        println!("{line}");
+    }
+    println!();
+}
+
 /// `--help` text.
 const USAGE: &str = "\
 wsl-webauthn-pam — Windows Hello authentication for sudo/su on WSL
@@ -127,7 +147,7 @@ COMMANDS:
     status       List enrolled users and the config summary (root for config and records)
                    --user <NAME>         show one user's full record
     verify       Self-test the crypto stack against a synthetic ceremony
-    install      Provision the bridge, config, PAM module and profile (root)
+    install      Provision the bridge, config, PAM module, profile and CLI (root)
                    --artifact-dir <DIR>   where to find the .so/.exe (else env/cwd)
                    --module-dir <DIR>     override the PAM security directory
                    --win-mnt <PATH>       override the Windows mount root
@@ -136,9 +156,10 @@ COMMANDS:
                    --dry-run              resolve and print the plan; write nothing
                    --yes, -y              answer yes to every prompt
                    --non-interactive      never read stdin; use question defaults
+                   note: the CLI is also installed to /usr/local/bin/wsl-webauthn-pam
     uninstall    Remove a credential or all components (root)
                    --user <NAME>         remove one user's record (default)
-                   --all                 remove profile, module, config, bridge
+                   --all                 remove profile, module, config, bridge, CLI
                    --module-dir <DIR>     override the PAM security directory
                    --win-mnt <PATH>       override the Windows mount root
                    --yes, -y              skip confirmations
@@ -994,6 +1015,10 @@ fn cmd_enroll(
     }
 
     // 3. Ceremony with double-enroll handling.
+    //
+    // Last point before the ceremony that can explain a pause which otherwise looks like
+    // a hang: the Windows Hello dialog may open behind the terminal.
+    print_enroll_advisory();
     let policy = if allow_unattested {
         AttestationPolicy::AllowUnattested
     } else {
@@ -2664,6 +2689,16 @@ mod tests {
     }
 
     // ---- enroll pre-check (no orphaned credential) ----
+
+    /// The pre-ceremony advisory must name the actual risks (background window, PIN into
+    /// the terminal) so the pause is not mistaken for a hang.
+    #[test]
+    fn enroll_advisory_names_taskbar_and_pin() {
+        let text = ENROLL_ADVISORY.join("\n").to_lowercase();
+        assert!(text.contains("taskbar"), "{text}");
+        assert!(text.contains("pin"), "{text}");
+        assert!(text.contains("terminal"), "{text}");
+    }
 
     /// With an existing record and no `--replace`, the ceremony must not run at all:
     /// otherwise Windows creates a credential that is then discarded by `save_atomic`,

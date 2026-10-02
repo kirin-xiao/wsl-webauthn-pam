@@ -122,7 +122,10 @@ sudo ./build/wsl-webauthn-pam-<version>-<arch>/install.sh
 ```
 
 The shim runs the CLI from its own directory, so invoke it from inside the
-unpacked/staged directory. If the CLI is on `PATH`: `sudo wsl-webauthn-pam install`.
+unpacked/staged directory. `install` copies the CLI to
+`/usr/local/bin/wsl-webauthn-pam`, so afterwards the short command works from any
+directory and survives deleting the unpacked tree. If `/usr/local/bin` is not on
+your `PATH`, use the absolute path or add it.
 
 `install` (running as root) will:
 
@@ -137,10 +140,11 @@ unpacked/staged directory. If the CLI is on `PATH`: `sudo wsl-webauthn-pam insta
    `/etc/wsl_webauthn/credentials/` (`0700` root), and install the
    `pam-auth-update` profile to `/usr/share/pam-configs/wsl-webauthn`
    (`Default: no` — never silently enabled).
-4. Offer to remove the legacy `wsl-hello` profile and rewrite stale
+4. Install the CLI itself to `/usr/local/bin/wsl-webauthn-pam` (`0755` root).
+5. Offer to remove the legacy `wsl-hello` profile and rewrite stale
    `pam_wsl_hello` references in `/etc/pam.d/*` (with confirmation and backup),
    never importing the legacy PEM.
-5. Offer to enable the profile now (default no), print the lockout warning, and
+6. Offer to enable the profile now (default no), print the lockout warning, and
    offer to enroll the invoking user. `--skip-enroll` stops before enrollment;
    `--yes` answers yes to every prompt; `--dry-run` previews without writing;
    `--non-interactive` never reads stdin.
@@ -154,6 +158,11 @@ sudo pam-auth-update                  # select "WSL WebAuthn authentication"
 # or non-interactively:
 sudo pam-auth-update --enable wsl-webauthn
 ```
+
+`enroll` prints a short notice before the ceremony: the Windows Hello dialog can
+open behind the terminal, and the save dialog may be followed by a PIN prompt. If
+the dialog does not come to the front, check the taskbar. Type the PIN into the
+dialog, not the terminal.
 
 ### Manual installation (no installer)
 
@@ -219,8 +228,8 @@ serial/SSH) and remove the module line.
 | `probe` | Report interop / Hello availability and the bridge pin | `--bridge <PATH>`; `--win-mnt <PATH>` |
 | `status` | List enrolled users and the config summary | `--user <NAME>` for one full record; config and records need root |
 | `verify` | Self-test the crypto stack against a synthetic ceremony | — |
-| `install` | Provision the bridge, config, PAM module and profile (root) | `--artifact-dir <DIR>`; `--module-dir <DIR>`; `--win-mnt <PATH>`; `--allow-unattested`; `--skip-enroll`; `--dry-run`; `--yes`, `-y`; `--non-interactive` |
-| `uninstall` | Remove a credential or all components (root) | `--user <NAME>`; `--all`; `--module-dir <DIR>`; `--win-mnt <PATH>`; `--yes`, `-y`; `--non-interactive` |
+| `install` | Provision the bridge, config, PAM module, profile and CLI (root) | `--artifact-dir <DIR>`; `--module-dir <DIR>`; `--win-mnt <PATH>`; `--allow-unattested`; `--skip-enroll`; `--dry-run`; `--yes`, `-y`; `--non-interactive` |
+| `uninstall` | Remove a credential or all components (root) | `--user <NAME>`; `--all` (also removes the CLI at `/usr/local/bin`); `--module-dir <DIR>`; `--win-mnt <PATH>`; `--yes`, `-y`; `--non-interactive` |
 
 `--bridge` and `--win-mnt` fall back to the config, then (`--win-mnt`) to
 `/mnt/c`. `--bridge` only supplies the bridge path; it does not initialize the

@@ -25,8 +25,9 @@
 //!
 //! 1. Provision the Windows bridge exe (needed before enrollment can pin it).
 //! 2. Write `/etc/wsl_webauthn/config` (`0600`) and `credentials/` (`0700`).
-//! 3. Install the new `pam_wsl_webauthn.so` and the `pam-configs` profile, then
-//!    **verify** them. The rollback is **committed** here.
+//! 3. Install the CLI itself to `/usr/local/bin`, then the new `pam_wsl_webauthn.so` and
+//!    the `pam-configs` profile, then **verify** the module/profile. The rollback is
+//!    **committed** here.
 //! 4. Only then offer legacy cleanup: rewrite `/etc/pam.d` references *before*
 //!    removing the old `.so`, `pam-auth-update --remove wsl-hello`, remove the old
 //!    module/config dirs. The legacy PEM is **never** imported.
@@ -76,6 +77,10 @@ pub(crate) const MODULE_STEM: &[u8] = b"pam_wsl_webauthn";
 pub(crate) const BRIDGE_EXE: &str = "WSLWebAuthnBridge.exe";
 /// Sub-path under `%LOCALAPPDATA%` where the bridge is installed.
 pub(crate) const WIN_BRIDGE_SUBPATH: &[&str] = &["Programs", "wsl-webauthn-pam"];
+/// Our own CLI binary name, installed to [`InstallPaths::bin_dir`] by `install`.
+pub(crate) const CLI_NAME: &str = "wsl-webauthn-pam";
+/// Mode of the installed CLI (`root:root`, executable).
+pub(crate) const CLI_MODE: u32 = 0o755;
 
 /// Mode of the installed module and profile (`root:root`).
 pub(crate) const MODULE_MODE: u32 = 0o644;
@@ -118,6 +123,8 @@ pub(crate) struct InstallPaths {
     pub pam_d: PathBuf,
     /// `/usr/share/pam-configs`.
     pub pam_configs: PathBuf,
+    /// `/usr/local/bin` — where `install` copies the running CLI.
+    pub bin_dir: PathBuf,
     /// `/etc/pam_wsl_hello` (legacy config dir; never removed by uninstall).
     pub legacy_config_dir: PathBuf,
     /// Roots scanned for `<root>/security` and `<root>/<triplet>/security`
@@ -135,6 +142,7 @@ impl InstallPaths {
             etc_wsl_conf: PathBuf::from("/etc/wsl.conf"),
             pam_d: PathBuf::from("/etc/pam.d"),
             pam_configs: PathBuf::from("/usr/share/pam-configs"),
+            bin_dir: PathBuf::from("/usr/local/bin"),
             legacy_config_dir: PathBuf::from("/etc/pam_wsl_hello"),
             module_search_roots: vec![
                 PathBuf::from("/usr/lib"),
@@ -1059,6 +1067,73 @@ fn provision_profile(paths: &InstallPaths, rollback: &mut Rollback) -> anyhow::R
     Ok(dest)
 }
 
+/// Ensure the CLI directory exists, without rewriting an existing mode.
+///
+/// `/usr/local/bin` is a normal system directory that may pre-exist with a distro-chosen
+/// mode (e.g. setgid and group-writable), so an existing directory is only validated —
+/// real directory, not a symlink, owned by `owner_uid` — and its mode is left untouched.
+/// A directory this run creates is `root:root 0755` and is removed on rollback.
+fn ensure_bin_dir(
+    dir: &Path,
+    owner_uid: u32,
+    rollback: &mut Rollback,
+    what: &str,
+) -> anyhow::Result<()> {
+    if let Some(md) = fsutil::lstat_opt(dir)? {
+        if md.file_type().is_symlink() {
+            bail!("refusing to use a symlinked {what}: {}", dir.display());
+        }
+        if !md.is_dir() {
+            bail!("{what} is not a directory: {}", dir.display());
+        }
+        if md.uid() != owner_uid {
+            bail!(
+                "refusing to reuse {what} {}: owned by uid {}, expected uid {}",
+                dir.display(),
+                md.uid(),
+                owner_uid
+            );
+        }
+        return Ok(());
+    }
+    // Missing: create it through `ensure_dir` for the same rollback bookkeeping.
+    ensure_dir(dir, 0o755, Some(owner_uid), rollback, what)
+}
+
+/// Install the CLI itself to `bin_dir` with mode `0755`.
+///
+/// The source is the running executable, the one the operator invoked. Runs before
+/// [`Rollback::commit`], so an overwritten CLI is restored (or a new one removed) if a
+/// later provisioning step fails, exactly like the module and profile.
+fn provision_cli(
+    paths: &InstallPaths,
+    source: &Path,
+    rollback: &mut Rollback,
+) -> anyhow::Result<PathBuf> {
+    ensure_bin_dir(&paths.bin_dir, paths.owner_uid, rollback, "bin directory")?;
+    let dest = paths.bin_dir.join(CLI_NAME);
+    let undo = prepare_write(&dest)?;
+    fsutil::copy_file_atomic(source, &dest, CLI_MODE)
+        .with_context(|| format!("installing the CLI to {}", dest.display()))?;
+    if let Some(action) = undo {
+        rollback.push(action);
+    }
+    // `copy_file_atomic` pins the mode at creation, but assert it as the module/profile
+    // helpers do: an installed CLI that is not executable is unusable.
+    let md = fsutil::lstat_opt(&dest)?
+        .ok_or_else(|| anyhow!("verification failed: CLI missing at {}", dest.display()))?;
+    if !md.is_file() || fsutil::mode_of(&md) != CLI_MODE {
+        bail!(
+            "verification failed: {} has mode {:o}, expected {:o}",
+            dest.display(),
+            fsutil::mode_of(&md),
+            CLI_MODE
+        );
+    }
+    println!("  cli:         {}", dest.display());
+    Ok(dest)
+}
+
 /// Verify the freshly written artifacts: profile bytes, module bytes+type+mode, config.
 fn verify_installed(
     paths: &InstallPaths,
@@ -1440,12 +1515,13 @@ fn offer_enable(
 ///
 /// WSL has no virtual console to fall back to, so the recovery path is a Windows-side
 /// root shell; for non-WSL Linux the classic TTY route is offered too.
-fn print_lockout_guidance() {
+fn print_lockout_guidance(enroll_cmd: &str) {
     println!();
     println!("Lockout safety:");
     println!("  * Keep at least one of `sudo`/`su` working with a password while you test.");
     println!("  * The profile is not enabled automatically; run `sudo pam-auth-update` and");
     println!("    select \"WSL WebAuthn authentication\" when you are ready.");
+    println!("  * Enroll a credential before relying on the module: `sudo {enroll_cmd}`");
     println!("  * Manual alternative (add to /etc/pam.d/common-auth above the password line):");
     println!("        auth sufficient pam_wsl_webauthn.so");
     println!("  * If sudo/su breaks, recover WITHOUT relying on the broken login:");
@@ -1497,17 +1573,31 @@ fn print_dry_run(paths: &InstallPaths, module_dir: &Path, pam_auth_update: bool)
     } else {
         print_manual_enable_steps(paths);
     }
+    // Name the installed CLI so a `--dry-run` shows the real post-install command.
+    println!("  cli:         {}", paths.bin_dir.join(CLI_NAME).display());
+}
+
+/// The lines of post-install guidance (pure, so the text is testable).
+///
+/// `enroll_cmd` is the installed CLI's absolute path, so the instruction is runnable even
+/// when `/usr/local/bin` is not on the shell's `PATH`.
+fn next_steps_lines(enroll_cmd: &str, enrolled: bool) -> Vec<String> {
+    if enrolled {
+        vec!["Installation complete. Test with: sudo -k; sudo true".to_string()]
+    } else {
+        vec![
+            "Installation complete, but no credential is enrolled yet.".to_string(),
+            format!("Enroll one before relying on the module:  sudo {enroll_cmd} enroll"),
+            "  (add --allow-unattested only on machines without a TPM-backed Hello)".to_string(),
+        ]
+    }
 }
 
 /// Print what the operator must do next.
-fn print_next_steps(enrolled: bool) {
+fn print_next_steps(enroll_cmd: &str, enrolled: bool) {
     println!();
-    if enrolled {
-        println!("Installation complete. Test with: sudo -k; sudo true");
-    } else {
-        println!("Installation complete, but no credential is enrolled yet.");
-        println!("Enroll one before relying on the module:  sudo wsl-webauthn-pam enroll");
-        println!("  (add --allow-unattested only on machines without a TPM-backed Hello)");
+    for line in next_steps_lines(enroll_cmd, enrolled) {
+        println!("{line}");
     }
 }
 
@@ -1556,10 +1646,15 @@ pub(crate) fn install_with(
     let bridge_dest = provision_bridge(interop, &win_mnt, &artifacts.bridge, &mut rollback)?;
     // 2. Linux config + credentials dir.
     provision_config(paths, &win_mnt, &bridge_dest, &mut rollback)?;
-    // 3. New module and profile FIRST (a stale reference would mean lockout).
+    // 3. Our own CLI, so the guidance printed later names a command that exists. The
+    // running executable is the binary the operator invoked.
+    let running_cli =
+        std::env::current_exe().context("resolving the running CLI to install it to PATH")?;
+    let cli_dest = provision_cli(paths, &running_cli, &mut rollback)?;
+    // 4. New module and profile FIRST (a stale reference would mean lockout).
     let module_dest = provision_module(&module_dir, &artifacts.module, &mut rollback)?;
     let profile_dest = provision_profile(paths, &mut rollback)?;
-    // 4. Verify before touching anything legacy.
+    // 5. Verify before touching anything legacy.
     verify_installed(
         paths,
         &module_dir,
@@ -1574,8 +1669,11 @@ pub(crate) fn install_with(
     // after this point (legacy cleanup, prompts, enrollment) must never be undone by
     // removing the module/profile we just installed.
     rollback.commit();
+    // The CLI is installed to an absolute path, so the printed guidance is runnable even
+    // when `/usr/local/bin` is not on the shell's `PATH`.
+    let enroll_cmd = cli_dest.display().to_string();
 
-    // 5. Legacy migration, only after our module/profile are verified.
+    // 6. Legacy migration, only after our module/profile are verified.
     let legacy = detect_legacy(paths);
     if legacy.is_present() {
         println!();
@@ -1605,10 +1703,10 @@ pub(crate) fn install_with(
         )?;
         println!();
         println!("Legacy cleanup complete. A FRESH enrollment is required (old credentials");
-        println!("are not migrated): run `sudo wsl-webauthn-pam enroll`.");
+        println!("are not migrated): run `sudo {enroll_cmd}`.");
     }
 
-    // 6. Offer to enable the profile, print lockout guidance, then offer enrollment LAST.
+    // 7. Offer to enable the profile, print lockout guidance, then offer enrollment LAST.
     println!();
     offer_enable(
         paths,
@@ -1617,10 +1715,10 @@ pub(crate) fn install_with(
         pam_auth_update,
         opts.non_interactive,
     )?;
-    print_lockout_guidance();
+    print_lockout_guidance(&enroll_cmd);
 
     if opts.skip_enroll {
-        print_next_steps(false);
+        print_next_steps(&enroll_cmd, false);
         return Ok(EXIT_OK);
     }
 
@@ -1630,7 +1728,7 @@ pub(crate) fn install_with(
         true,
     )?;
     if !enroll_now {
-        print_next_steps(false);
+        print_next_steps(&enroll_cmd, false);
         return Ok(EXIT_OK);
     }
 
@@ -1640,13 +1738,13 @@ pub(crate) fn install_with(
     match enroller.enroll(opts.allow_unattested) {
         Ok(code) => {
             if code == EXIT_OK {
-                print_next_steps(true);
+                print_next_steps(&enroll_cmd, true);
             }
             Ok(code)
         }
         Err(error) => {
             eprintln!("warning: enrollment failed: {error:#}");
-            print_next_steps(false);
+            print_next_steps(&enroll_cmd, false);
             Ok(EXIT_FAIL)
         }
     }
@@ -1917,7 +2015,7 @@ pub(crate) fn uninstall_all(
 ) -> anyhow::Result<i32> {
     let win_mnt = resolve_win_mnt(paths, opts.win_mnt.as_deref());
     println!("wsl-webauthn-pam uninstaller");
-    println!("This removes the PAM profile, module, Linux config, and the Windows bridge.");
+    println!("This removes the PAM profile, module, Linux config, Windows bridge, and the CLI.");
 
     if !prompter.confirm(
         "Remove ALL wsl-webauthn-pam components? This cannot be undone.",
@@ -2006,11 +2104,29 @@ pub(crate) fn uninstall_all(
         Err(e) => eprintln!("warning: could not resolve the Windows bridge directory: {e}"),
     }
 
-    // 6. Fallback: migrations may not have left a backup (or the file was edited by
+    // 6. The CLI installed to /usr/local/bin (if any). Removing it is safe even when it is
+    // the currently-running binary: Linux permits unlink while executing, and the process
+    // keeps its inode until it exits.
+    let cli = paths.bin_dir.join(CLI_NAME);
+    if fsutil::lstat_opt(&cli)?.is_some() {
+        if prompter.confirm(
+            &format!("Remove the installed CLI {}?", cli.display()),
+            true,
+        )? {
+            match fsutil::remove_file(&cli) {
+                Ok(()) => println!("  removed {}", cli.display()),
+                Err(e) => eprintln!("warning: could not remove {}: {e}", cli.display()),
+            }
+        }
+    } else {
+        println!("  installed CLI not present");
+    }
+
+    // 7. Fallback: migrations may not have left a backup (or the file was edited by
     // hand). Never blind-edit /etc/pam.d on uninstall; warn about leftover references.
     warn_pam_d_references(paths);
 
-    // 7. The legacy /etc/pam_wsl_hello is NEVER removed (it is not ours).
+    // 8. The legacy /etc/pam_wsl_hello is NEVER removed (it is not ours).
     println!();
     println!("Done. The legacy /etc/pam_wsl_hello (if any) was left untouched.");
     Ok(EXIT_OK)

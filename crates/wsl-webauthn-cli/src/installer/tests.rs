@@ -225,6 +225,7 @@ impl Harness {
             etc_wsl_conf,
             pam_d: root.join("etc/pam.d"),
             pam_configs: root.join("usr/share/pam-configs"),
+            bin_dir: root.join("usr/local/bin"),
             legacy_config_dir: root.join("etc/pam_wsl_hello"),
             module_search_roots: vec![root.join("usr/lib"), root.join("lib")],
             owner_uid: wsl_webauthn_store::current_euid(),
@@ -554,6 +555,16 @@ fn install_provisions_everything() {
         b"MZ-fake-bridge-bytes"
     );
 
+    // The CLI itself is installed to bin_dir with the executable mode, so the guidance
+    // printed by the installer names a command that exists.
+    let cli = h.paths.bin_dir.join(CLI_NAME);
+    assert_eq!(mode_of(&cli), CLI_MODE, "CLI must be installed 0755");
+    assert_eq!(
+        std::fs::read(&cli).unwrap(),
+        std::fs::read(std::env::current_exe().unwrap()).unwrap(),
+        "the installed CLI must be a byte-for-byte copy of the running binary"
+    );
+
     // The profile is not enabled unless confirmed.
     assert!(
         commands
@@ -563,6 +574,75 @@ fn install_provisions_everything() {
             .all(|(p, _)| p != "pam-auth-update"),
         "no pam-auth-update call expected when not enabling"
     );
+}
+
+/// The post-install guidance must name the installed absolute path, so the printed
+/// command is runnable regardless of `PATH`.
+#[test]
+fn next_steps_lines_name_the_installed_cli() {
+    let lines = next_steps_lines("/usr/local/bin/wsl-webauthn-pam", false);
+    let text = lines.join("\n");
+    assert!(
+        text.contains("sudo /usr/local/bin/wsl-webauthn-pam enroll"),
+        "the guidance must be copy-pasteable with the installed path: {text}"
+    );
+    // The enrolled variant just points at the smoke test.
+    let done = next_steps_lines("/usr/local/bin/wsl-webauthn-pam", true).join("\n");
+    assert!(done.contains("sudo -k; sudo true"), "{done}");
+}
+
+/// A failure to install the CLI must roll the whole install back (the copy happens before
+/// `Rollback::commit`), leaving no partial PAM stack. Here `bin_dir` is a regular file, so
+/// `ensure_bin_dir` refuses it.
+#[test]
+fn install_rolls_back_when_cli_install_fails() {
+    let h = Harness::new();
+    // A regular file where the bin directory should be.
+    write(&h.paths.bin_dir, b"not a directory", 0o644);
+
+    let err = h
+        .run_install(
+            &ScriptedPrompter::always(true),
+            &MockEnroller::default(),
+            &MockCommands::default(),
+            &h.opts(),
+        )
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("bin directory"), "{err:#}");
+    // The failure happened before commit, so the PAM artifacts this run wrote are gone.
+    assert!(
+        !h.module_dir.join(MODULE_NAME).exists(),
+        "module rolled back"
+    );
+    assert!(!h.paths.profile_path().exists(), "profile rolled back");
+    assert!(!h.paths.etc_wsl_webauthn.exists(), "config dir rolled back");
+    // And the planted file is untouched (we never wrote through it).
+    assert_eq!(mode_of(&h.paths.bin_dir), 0o644);
+}
+
+/// An already-populated `/usr/local/bin` with a distro-chosen mode must not be rewritten
+/// (the setgid bit some distros set on the directory is not ours to strip).
+#[test]
+fn install_does_not_rewrite_existing_bin_dir_mode() {
+    let h = Harness::new();
+    std::fs::create_dir_all(&h.paths.bin_dir).unwrap();
+    // The Debian convention: 2775 root:staff. We require 0755 only of directories we
+    // create; an existing one is validated, not tightened.
+    std::fs::set_permissions(&h.paths.bin_dir, std::fs::Permissions::from_mode(0o2775)).unwrap();
+
+    h.run_install(
+        &ScriptedPrompter::always(true),
+        &MockEnroller::default(),
+        &MockCommands::default(),
+        &h.opts(),
+    )
+    .unwrap();
+    assert_eq!(
+        mode_of(&h.paths.bin_dir),
+        0o2775,
+        "an existing bin dir's mode (incl. setgid) must be preserved"
+    );
+    assert!(h.paths.bin_dir.join(CLI_NAME).exists());
 }
 
 /// The config bytes the installer writes must come from the store's serializer
@@ -1369,6 +1449,10 @@ fn uninstall_all_removes_provisioned_artifacts_but_not_legacy() {
     assert!(!h.paths.profile_path().exists(), "profile removed");
     assert!(!h.module_dir.join(MODULE_NAME).exists(), "module removed");
     assert!(!h.paths.etc_wsl_webauthn.exists(), "config dir removed");
+    assert!(
+        !h.paths.bin_dir.join(CLI_NAME).exists(),
+        "installed CLI removed"
+    );
     assert!(
         !h.bridge_dest().parent().unwrap().exists(),
         "bridge dir removed"
