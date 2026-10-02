@@ -183,6 +183,15 @@ pub enum VerifyError {
         reason: &'static str,
     },
 
+    /// A certificate exceeded the verifier's DER size cap.
+    #[error("certificate of {len} bytes exceeds the maximum accepted size of {max}")]
+    CertificateTooLarge {
+        /// The observed DER length in bytes.
+        len: usize,
+        /// The maximum accepted DER length in bytes.
+        max: usize,
+    },
+
     /// The `x5c` array was empty.
     #[error("x5c certificate chain is empty")]
     CertificateChainEmpty,
@@ -339,5 +348,16 @@ pub enum VerifyError {
     Internal {
         /// Short, non-sensitive reason string.
         reason: &'static str,
+    },
+
+    /// An input exceeded the verifier's defence-in-depth size cap.
+    #[error("{field} of {len} bytes exceeds the maximum accepted size of {max}")]
+    InputTooLarge {
+        /// The name of the oversized input.
+        field: &'static str,
+        /// The observed length in bytes.
+        len: usize,
+        /// The maximum accepted length in bytes.
+        max: usize,
     },
 }

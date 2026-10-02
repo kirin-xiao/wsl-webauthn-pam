@@ -116,6 +116,28 @@ pub use error::VerifyError;
 use std::time::SystemTime;
 
 // ---------------------------------------------------------------------------
+// Input size bounds
+// ---------------------------------------------------------------------------
+//
+// These are defence-in-depth caps at the verifier boundary. The normal caller is
+// already bounded (a response frame is ≤ `wsl_webauthn_protocol::MAX_RESPONSE_BYTES`,
+// 64 KiB, before base64-decoding), but the verifier is a public API and must not
+// assume it: a caller that relaxes its own cap would otherwise hand the CBOR/der
+// decoders unbounded input and let the materialised `Value`/certificate tree amplify
+// memory use. Every cap is far above any real WebAuthn structure.
+
+/// Maximum size of an `attestationObject`.
+pub(crate) const MAX_ATTESTATION_BYTES: usize = 64 * 1024;
+/// Maximum size of an `authenticatorData`.
+pub(crate) const MAX_AUTHENTICATOR_DATA_BYTES: usize = 64 * 1024;
+/// Maximum size of a `clientDataJSON`.
+pub(crate) const MAX_CLIENT_DATA_BYTES: usize = 16 * 1024;
+/// Maximum size of a signature (ES256 DER ≤ 72 B, RS256 4096-bit = 512 B, EdDSA 64 B).
+pub(crate) const MAX_SIGNATURE_BYTES: usize = 1024;
+/// Maximum size of an encoded COSE public key (a 4096-bit RSA modulus is 512 B).
+pub(crate) const MAX_COSE_KEY_BYTES: usize = 4 * 1024;
+
+// ---------------------------------------------------------------------------
 // Pinned trust material (plan D3)
 // ---------------------------------------------------------------------------
 

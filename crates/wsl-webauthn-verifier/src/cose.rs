@@ -182,6 +182,11 @@ fn strip_leading_zero(v: &[u8]) -> &[u8] {
 /// Parse a COSE_Key CBOR map and enforce the algorithm allow-list plus structural
 /// constraints (EC point on curve and uncompressed only, RSA modulus size bounds).
 pub(crate) fn parse(cose_key: &[u8]) -> Result<ParsedCoseKey, VerifyError> {
+    if cose_key.len() > crate::MAX_COSE_KEY_BYTES {
+        return Err(VerifyError::MalformedCoseKey {
+            reason: "key exceeds the maximum accepted size",
+        });
+    }
     let value =
         crate::cbor::decode_exact(cose_key).map_err(|()| VerifyError::MalformedCoseKey {
             reason: "not valid CBOR",
@@ -482,6 +487,15 @@ mod tests {
     fn rejects_malformed_cbor() {
         assert!(matches!(
             parse(&[0xff, 0x00]),
+            Err(VerifyError::MalformedCoseKey { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_oversized_key_before_decoding() {
+        let huge = vec![0x40u8; crate::MAX_COSE_KEY_BYTES + 1];
+        assert!(matches!(
+            parse(&huge),
             Err(VerifyError::MalformedCoseKey { .. })
         ));
     }

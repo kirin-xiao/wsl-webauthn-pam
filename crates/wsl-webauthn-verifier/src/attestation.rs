@@ -49,6 +49,19 @@ pub(crate) fn verify(
     now: SystemTime,
     anchor_fingerprint: &[u8; 32],
 ) -> Result<crate::EnrollOutcome, VerifyError> {
+    if attestation_object.len() > crate::MAX_ATTESTATION_BYTES {
+        return Err(VerifyError::MalformedAttestationObject {
+            reason: "exceeds the maximum accepted size",
+        });
+    }
+    if client_data_json.len() > crate::MAX_CLIENT_DATA_BYTES {
+        return Err(VerifyError::InputTooLarge {
+            field: "clientDataJSON",
+            len: client_data_json.len(),
+            max: crate::MAX_CLIENT_DATA_BYTES,
+        });
+    }
+
     // 1. clientDataJSON must be a `webauthn.create` for our challenge/origin.
     clientdata::validate(client_data_json, ClientDataKind::Create, expected_challenge)?;
 
@@ -200,8 +213,9 @@ pub(crate) fn verify(
     })
 }
 
-/// Parse the `x5c` array (each element a byte string) into raw DER certificates.
-fn parse_x5c(value: &Value) -> Result<Vec<Vec<u8>>, VerifyError> {
+/// Parse the `x5c` array (each element a byte string) into raw DER certificate
+/// slices, borrowed from the attestation value (no per-certificate copy).
+fn parse_x5c(value: &Value) -> Result<Vec<&[u8]>, VerifyError> {
     let arr = value
         .as_array()
         .ok_or(VerifyError::MalformedAttestationObject {
@@ -209,10 +223,13 @@ fn parse_x5c(value: &Value) -> Result<Vec<Vec<u8>>, VerifyError> {
         })?;
     let mut certs = Vec::with_capacity(arr.len());
     for item in arr {
-        let bytes = item.as_bytes().ok_or(VerifyError::MalformedCertificate {
-            reason: "x5c entry is not a byte string",
-        })?;
-        certs.push(bytes.clone());
+        let bytes =
+            item.as_bytes()
+                .map(Vec::as_slice)
+                .ok_or(VerifyError::MalformedCertificate {
+                    reason: "x5c entry is not a byte string",
+                })?;
+        certs.push(bytes);
     }
     Ok(certs)
 }
@@ -305,4 +322,52 @@ fn reject_unknown_att_stmt_keys(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_oversized_attestation_object() {
+        let big = vec![0u8; crate::MAX_ATTESTATION_BYTES + 1];
+        let err = verify(
+            &big,
+            &[],
+            b"challenge",
+            b"cred",
+            &AttestationPolicy::Strict,
+            SystemTime::now(),
+            &crate::MS_TPM_ROOT_2014_SHA256,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            VerifyError::MalformedAttestationObject {
+                reason: "exceeds the maximum accepted size"
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_oversized_client_data() {
+        let big = vec![0u8; crate::MAX_CLIENT_DATA_BYTES + 1];
+        let err = verify(
+            &[],
+            &big,
+            b"challenge",
+            b"cred",
+            &AttestationPolicy::Strict,
+            SystemTime::now(),
+            &crate::MS_TPM_ROOT_2014_SHA256,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            VerifyError::InputTooLarge {
+                field: "clientDataJSON",
+                ..
+            }
+        ));
+    }
 }
