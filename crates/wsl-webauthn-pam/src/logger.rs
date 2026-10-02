@@ -9,32 +9,76 @@
 //! that authenticates many times, and re-`openlog`ing each time is both wasteful and
 //! racy. `closelog` is intentionally never called for the same reason.
 //!
+//! `syslog` itself is serialized by a process-wide mutex: libc does not guarantee it
+//! is thread-safe, and a threaded PAM consumer (a display manager, a session broker)
+//! may run several `pam_sm_authenticate` calls concurrently.
+//!
+//! The `debug` verbosity is **per-thread** (L9-7): a process-global flag would let one
+//! service's `debug` argument turn on verbose logging for every concurrent
+//! authentication in the same process. A PAM call runs on one thread, so a
+//! thread-local flag is the correct scope and needs no locking.
+//!
 //! The message is always passed to libc as a `%s` *argument*, never interpolated into
 //! the format string, so attacker-influenced text (a username, a path) cannot perform
 //! format-string expansion.
 
 #![allow(unsafe_code)]
 
+use std::cell::Cell;
+#[cfg(test)]
+use std::cell::RefCell;
 use std::ffi::CString;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::bindings::{self, LOG_AUTHPRIV, LOG_CRIT, LOG_DEBUG, LOG_PID};
+use crate::bindings::{LOG_CRIT, LOG_DEBUG};
 
+#[cfg(not(test))]
+use crate::bindings::{self, LOG_AUTHPRIV, LOG_PID};
+#[cfg(not(test))]
+use std::sync::Mutex;
+
+#[cfg(not(test))]
 static OPENLOG: OnceLock<()> = OnceLock::new();
-static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 static PANIC_HOOK: OnceLock<()> = OnceLock::new();
+/// Serializes the non-thread-safe `syslog(3)` call across concurrent PAM calls.
+#[cfg(not(test))]
+static SYSLOG_LOCK: Mutex<()> = Mutex::new(());
 
-/// Configure whether [`debug`] emits messages for the lifetime of the process.
-///
-/// Called once from [`crate::pam_args`] parsing in `pam_sm_authenticate`.
-pub fn set_debug(enabled: bool) {
-    DEBUG_ENABLED.store(enabled, Ordering::Relaxed);
+thread_local! {
+    /// Whether *this thread's* authentication emitted `debug`.
+    static DEBUG_ENABLED: Cell<bool> = const { Cell::new(false) };
+    /// Captured `(priority, message)` pairs for unit tests; absent in production.
+    #[cfg(test)]
+    static CAPTURED: RefCell<Vec<(i32, String)>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Whether debug logging is currently enabled.
+/// Configure whether [`debug`] emits messages for the current authentication thread.
+///
+/// Called from `run` after parsing the module arguments. Because the flag is
+/// thread-local, a second concurrent authentication on another thread is unaffected.
+pub fn set_debug(enabled: bool) {
+    DEBUG_ENABLED.with(|d| d.set(enabled));
+}
+
+/// Whether debug logging is currently enabled on this thread.
 pub fn debug_enabled() -> bool {
-    DEBUG_ENABLED.load(Ordering::Relaxed)
+    DEBUG_ENABLED.with(Cell::get)
+}
+
+/// Test-only: capture emitted records instead of calling `syslog(3)` on this thread.
+///
+/// The capture is thread-local and re-entrant: it affects only the calling thread
+/// (production threads never call it) and is safe for a test that inspects records
+/// after the code under test returns.
+#[cfg(test)]
+pub(crate) fn begin_capture() {
+    CAPTURED.with(|c| c.borrow_mut().clear());
+}
+
+/// Test-only: return the records captured on this thread.
+#[cfg(test)]
+pub(crate) fn captured() -> Vec<(i32, String)> {
+    CAPTURED.with(|c| c.borrow().clone())
 }
 
 /// Render a panic payload and location for the syslog record.
@@ -77,6 +121,7 @@ pub fn install_panic_hook() {
     });
 }
 
+#[cfg(not(test))]
 fn ensure_openlog() {
     OPENLOG.get_or_init(|| {
         // SAFETY: `ident` is a `'static` C string and the call is idempotent.
@@ -96,25 +141,34 @@ fn ensure_openlog() {
 /// Emit `msg` at `priority` (a `LOG_*` level, OR-ed with no facility; the facility is
 /// fixed by `openlog`).
 pub fn auth(priority: i32, msg: &str) {
-    ensure_openlog();
-    // `CString::new` rejects any interior NUL. Dropping the record would let hostile
-    // input (e.g. a username embedding NUL) suppress the audit line for its own
-    // rejection, so sanitize and log a redacted line instead.
-    let c_msg = match CString::new(msg) {
-        Ok(c_msg) => c_msg,
-        Err(_) => {
-            let Ok(sanitized) = CString::new(sanitize_for_syslog(msg)) else {
-                return;
-            };
-            sanitized
+    // Tests capture records on the calling thread instead of touching the real sink.
+    #[cfg(test)]
+    CAPTURED.with(|c| c.borrow_mut().push((priority, msg.to_string())));
+    #[cfg(not(test))]
+    {
+        ensure_openlog();
+        // `CString::new` rejects any interior NUL. Dropping the record would let hostile
+        // input (e.g. a username embedding NUL) suppress the audit line for its own
+        // rejection, so sanitize and log a redacted line instead.
+        let c_msg = match CString::new(msg) {
+            Ok(c_msg) => c_msg,
+            Err(_) => {
+                let Ok(sanitized) = CString::new(sanitize_for_syslog(msg)) else {
+                    return;
+                };
+                sanitized
+            }
+        };
+        // Serialize the non-thread-safe libc `syslog` call. A poisoned lock still lets
+        // us log (recover the guard) rather than silently dropping an audit record.
+        let _guard = SYSLOG_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: `%s` is a valid literal format and `c_msg` is a valid C string that
+        // outlives the call.
+        unsafe {
+            bindings::syslog(priority, c"%s".as_ptr(), c_msg.as_ptr());
         }
-    };
-    // SAFETY: `%s` is a valid literal format and `c_msg` is a valid C string that
-    // outlives the call. libc's `syslog` is not thread-safe, but PAM modules are
-    // invoked from a single authentication thread at a time; a data race here could
-    // at worst interleave log lines, never affect an authentication decision.
-    unsafe {
-        bindings::syslog(priority, c"%s".as_ptr(), c_msg.as_ptr());
     }
 }
 
@@ -148,6 +202,7 @@ pub fn debug(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bindings::LOG_ERR;
 
     #[test]
     fn sanitize_replaces_interior_nul_and_control_bytes() {
@@ -162,8 +217,42 @@ mod tests {
 
     #[test]
     fn auth_with_interior_nul_does_not_panic_or_drop() {
-        // Must not panic and must still issue a (redacted) record. We cannot inspect the
-        // syslog sink here, but the sanitized path is exercised end to end.
-        auth(LOG_DEBUG, "hostile\0username rejected");
+        // The production sanitizer is exercised directly above. Here we assert the
+        // capture path still records the hostile message (so it is not silently
+        // dropped) and that `CString::new` really does reject it — which is what makes
+        // production take the sanitize branch.
+        assert!(CString::new("hostile\0username rejected").is_err());
+        begin_capture();
+        auth(LOG_ERR, "hostile\0username rejected");
+        let records = captured();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0, LOG_ERR);
+        assert!(records[0].1.contains("hostile\0username"));
+    }
+
+    /// L9-7: the `debug` flag is per-thread, so enabling it for one thread must not
+    /// change another thread's verbosity.
+    #[test]
+    fn debug_flag_is_per_thread() {
+        set_debug(false);
+        assert!(!debug_enabled());
+        begin_capture();
+        debug("suppressed");
+
+        let other = std::thread::spawn(|| {
+            set_debug(true);
+            assert!(debug_enabled());
+            begin_capture();
+            debug("enabled elsewhere");
+            captured()
+        });
+        let other_records = other.join().unwrap();
+
+        // This thread stays at its own (false) setting; it captured nothing.
+        debug("still suppressed");
+        assert!(captured().is_empty(), "debug=false must capture nothing");
+        assert_eq!(other_records.len(), 1, "debug=true on the other thread");
+        assert_eq!(other_records[0].1, "enabled elsewhere");
+        assert!(!debug_enabled(), "this thread is unchanged");
     }
 }
