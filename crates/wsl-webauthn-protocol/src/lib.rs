@@ -117,6 +117,7 @@ impl From<std::io::Error> for FrameError {
 ///
 /// No length cap is enforced here; callers are responsible for choosing a payload that
 /// fits the relevant [`MAX_REQUEST_BYTES`] / [`MAX_RESPONSE_BYTES`] budget.
+#[must_use]
 pub fn encode_frame(payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + payload.len());
     out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -169,6 +170,7 @@ fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<(), FrameErro
 // ---------------------------------------------------------------------------
 
 /// Encode bytes as unpadded `base64url` (RFC 4648 §5).
+#[must_use]
 pub fn b64u_encode(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }

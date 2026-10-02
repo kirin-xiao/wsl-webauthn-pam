@@ -10,7 +10,7 @@
 //! ```
 //!
 //! The production base dir is `/etc/wsl_webauthn` ([`Store::system`]). Tests and the
-//! installer pass an arbitrary base directory via [`Store::new`]/[`Store::with_owner`].
+//! installer pass an arbitrary base directory via [`Store::with_owner`].
 //!
 //! # Hardening model (SR-4)
 //!
@@ -263,6 +263,7 @@ impl StoreError {
     /// syslog: logging the full `Display` would disclose the record path — and therefore
     /// the username — on every failure (L8-9). The CLI keeps using `Display` for operator
     /// diagnostics. The spelling of each token is part of this API and must not change.
+    #[must_use]
     pub fn kind_str(&self) -> &'static str {
         match self {
             StoreError::InvalidUsername => "invalid_username",
@@ -316,14 +317,6 @@ impl Store {
         Store::with_owner(SYSTEM_BASE, 0)
     }
 
-    /// Open a store at `base` with the production default owner expectation (uid 0).
-    ///
-    /// Callers running against a non-root base (tests, or a non-root install) should use
-    /// [`Store::with_owner`] instead.
-    pub fn new(base: impl AsRef<Path>) -> Store {
-        Store::with_owner(base, 0)
-    }
-
     /// Open a store at `base`, expecting files to be owned by `owner_uid`.
     ///
     /// Production passes `0`; tests pass [`current_euid`].
@@ -335,21 +328,25 @@ impl Store {
     }
 
     /// The base directory this store is rooted at.
+    #[must_use]
     pub fn base(&self) -> &Path {
         &self.base
     }
 
     /// The expected owner uid.
+    #[must_use]
     pub fn owner_uid(&self) -> u32 {
         self.owner_uid
     }
 
     /// `<base>/credentials`.
+    #[must_use]
     pub fn credentials_dir(&self) -> PathBuf {
         self.base.join("credentials")
     }
 
     /// `<base>/config`.
+    #[must_use]
     pub fn config_path(&self) -> PathBuf {
         self.base.join("config")
     }

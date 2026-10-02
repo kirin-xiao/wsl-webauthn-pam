@@ -9,8 +9,7 @@
 
 #![forbid(unsafe_code)]
 
-use wsl_webauthn_protocol::{BridgeError, MAX_RESPONSE_BYTES, Response};
-use wsl_webauthn_protocol::{Request, read_frame};
+use wsl_webauthn_protocol::{BridgeError, MAX_RESPONSE_BYTES, Request, Response, read_frame};
 
 /// Why an input frame could not be turned into a [`Request`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
