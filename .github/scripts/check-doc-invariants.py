@@ -262,7 +262,10 @@ INVARIANTS = [
         "id": "CHAIN-PATHLEN",
         "level": "high",
         "claims": [(VERIFIER_LIB, "chain to pinned root")],
-        "tests": [],
+        "tests": [
+            {"name": "negative_path_len_exceeded", "expect": ["Err(VerifyError::CertificatePathLenExceeded)"]},
+            {"name": "positive_path_len_within_limit", "expect": [".expect("]},
+        ],
         "marker": False,
     },
     {
@@ -692,12 +695,6 @@ INVARIANTS = [
 # Documented invariants with no executable test yet.  Reported distinctly on
 # every run so the gap stays visible, without failing unrelated work.
 KNOWN_UNCOVERED = {
-    "CHAIN-PATHLEN": (
-        "`enforce_path_len` is reached but `CertificatePathLenExceeded` is never "
-        "asserted: the synthetic chain helper hardcodes pathLen=0 on a fixed "
-        "root->intermediate->leaf shape, so the constraint is never exceeded. "
-        "Add a `ChainOptions` knob for an extra CA level, or a pathLen test."
-    ),
     "RUNNER-NO-SHELL": (
         "The runner/doc invariant \"spawned with an argument array, no shell\" is "
         "structural (Command::new + .arg) and has no test that would fail if a "

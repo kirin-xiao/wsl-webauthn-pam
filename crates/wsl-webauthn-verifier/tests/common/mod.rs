@@ -329,6 +329,15 @@ pub struct ChainOptions {
     pub leaf_ou: String,
     pub leaf_is_ca: bool,
     pub intermediate_is_ca: bool,
+    /// Insert a fourth CA level between the root and the leaf-signing intermediate
+    /// (`root → extra CA → intermediate CA → leaf`), so a `pathLenConstraint` on the
+    /// extra CA can be genuinely exceeded by the intermediate below it.
+    pub extra_intermediate: bool,
+    /// The `pathLenConstraint` placed on the extra CA (see
+    /// [`ChainOptions::extra_intermediate`]). `Some(0)` (the default) is violated by
+    /// the single non-self-issued intermediate below it; `Some(1)` or `None` admits
+    /// the chain.
+    pub extra_intermediate_path_len: Option<u8>,
     pub include_aaguid_ext: bool,
     /// Sign the leaf with a key other than the intermediate's (breaks the link).
     pub break_leaf_signature: bool,
@@ -376,6 +385,8 @@ impl Default for ChainOptions {
             leaf_ou: "Authenticator Attestation".to_string(),
             leaf_is_ca: false,
             intermediate_is_ca: true,
+            extra_intermediate: false,
+            extra_intermediate_path_len: Some(0),
             include_aaguid_ext: true,
             break_leaf_signature: false,
             omit_root: false,
@@ -409,6 +420,7 @@ pub struct TestChain {
 /// The root is included last in `x5c` unless [`ChainOptions::omit_root`] is set.
 pub fn build_chain(opts: &ChainOptions) -> TestChain {
     let root_key = es256();
+    let extra_key = es256();
     let intermediate_key = es256();
     let leaf_key = es256();
     // A throwaway key used only to produce a bad leaf signature.
@@ -416,6 +428,8 @@ pub fn build_chain(opts: &ChainOptions) -> TestChain {
 
     let root_subject =
         Name::from_str("CN=Test Root CA,O=wsl-webauthn-pam tests,C=US").expect("root name");
+    let extra_subject =
+        Name::from_str("CN=Test Extra CA,O=wsl-webauthn-pam tests,C=US").expect("extra name");
     let intermediate_subject =
         Name::from_str("CN=Test Intermediate CA,O=wsl-webauthn-pam tests,C=US").expect("int name");
     let leaf_subject = Name::from_str(&format!(
@@ -433,17 +447,45 @@ pub fn build_chain(opts: &ChainOptions) -> TestChain {
         root_subject.clone(),
         None,
     );
+
+    // Optionally insert an extra CA level below the root. The intermediate (and thus
+    // the leaf's issuer) is then signed by this extra CA instead of directly by the
+    // root, so a `pathLenConstraint` declared here bounds the intermediate below it.
+    let (extra, intermediate_issuer) = if opts.extra_intermediate {
+        let extra = build_cert_full(
+            &root_key, // signed by the root
+            &extra_key,
+            Profile::SubCA {
+                issuer: root_subject.clone(),
+                path_len_constraint: opts.extra_intermediate_path_len,
+            },
+            4,
+            opts.intermediate_validity,
+            extra_subject.clone(),
+            None,
+            &[],
+            &ChainOptions::default(),
+        );
+        (Some(extra), extra_subject)
+    } else {
+        (None, root_subject.clone())
+    };
+
     let intermediate = build_cert_full(
-        &root_key,         // signed by the root
+        if opts.extra_intermediate {
+            &extra_key
+        } else {
+            &root_key
+        }, // signed by the extra CA (or the root)
         &intermediate_key, // subject key
         if opts.intermediate_is_ca {
             Profile::SubCA {
-                issuer: root_subject.clone(),
+                issuer: intermediate_issuer.clone(),
                 path_len_constraint: Some(0),
             }
         } else {
             Profile::Leaf {
-                issuer: root_subject.clone(),
+                issuer: intermediate_issuer.clone(),
                 enable_key_agreement: false,
                 enable_key_encipherment: false,
             }
@@ -500,6 +542,9 @@ pub fn build_chain(opts: &ChainOptions) -> TestChain {
         leaf.to_der().expect("leaf der"),
         intermediate.to_der().expect("int der"),
     ];
+    if let Some(extra) = &extra {
+        x5c.push(extra.to_der().expect("extra der"));
+    }
     if !opts.omit_root {
         x5c.push(root_der.clone());
     }
