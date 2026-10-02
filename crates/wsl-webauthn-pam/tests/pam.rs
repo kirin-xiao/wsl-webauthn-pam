@@ -14,10 +14,6 @@ use std::time::Duration;
 use support::*;
 
 use pam_wsl_webauthn::ModuleArgs;
-use pam_wsl_webauthn::bindings::{
-    PAM_ABORT, PAM_AUTH_ERR, PAM_AUTHINFO_UNAVAIL, PAM_IGNORE, PAM_SILENT, PAM_SUCCESS,
-    PAM_USER_UNKNOWN,
-};
 use pam_wsl_webauthn::logic::{AuthOutcome, FAIL_DELAY_USEC, authenticate, run};
 use pam_wsl_webauthn::seam::SeamError;
 
@@ -561,7 +557,7 @@ fn conv_message_sent_when_not_silent() {
     assert_eq!(run_basic(&mut seam, &deps, 0, &[]), PAM_SUCCESS);
     assert_eq!(seam.messages.len(), 1);
     let (style, text) = &seam.messages[0];
-    assert_eq!(*style, pam_wsl_webauthn::bindings::PAM_TEXT_INFO);
+    assert_eq!(*style, PAM_TEXT_INFO);
     assert!(text.contains("sudo"), "{text}");
     assert!(text.contains("alice"), "{text}");
 }
@@ -589,7 +585,7 @@ fn conv_failure_is_nonfatal() {
 #[test]
 fn non_auth_exports_return_expected_codes() {
     use std::ptr;
-    let null: *mut pam_wsl_webauthn::bindings::pam_handle_t = ptr::null_mut();
+    let null: *mut pam_wsl_webauthn::pam_handle_t = ptr::null_mut();
     let null_argv: *const *const std::ffi::c_char = ptr::null();
     assert_eq!(
         pam_wsl_webauthn::pam_sm_setcred(null, 0, 0, null_argv),

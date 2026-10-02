@@ -127,19 +127,29 @@ compile_error!(
 );
 
 pub mod args;
-pub mod bindings;
+// Raw libpam FFI: an implementation detail of this cdylib. It is crate-private so
+// a downstream crate cannot reach the raw `pam_get_user`/`syslog`/… symbols or
+// accidentally grow a dependency on their exact shape (L6-7). Integration tests
+// that need to speak the C ABI declare their own minimal surface in
+// `tests/support` instead of widening this module for them.
+pub(crate) mod bindings;
 pub mod logger;
 pub mod logic;
 pub mod seam;
 mod sys;
 
 pub use args::ModuleArgs;
+// The six exported `pam_sm_*` entry points are declared over this opaque handle,
+// so the type must remain nameable by an out-of-tree caller even though the raw
+// `pam_get_user`/`syslog`/… functions stay `pub(crate)` (L6-7). The handle has no
+// public API of its own; it is only ever passed through.
+pub use bindings::pam_handle_t;
 pub use logic::{AuthOutcome, Deps, FAIL_DELAY_USEC, SystemDeps, authenticate, run};
 pub use seam::{PamSeam, RealPamSeam, SeamError};
 
 use std::ffi::{c_char, c_int};
 
-use crate::bindings::{LOG_CRIT, PAM_ABORT, PAM_IGNORE, PAM_SUCCESS, pam_handle_t};
+use crate::bindings::{LOG_CRIT, PAM_ABORT, PAM_IGNORE, PAM_SUCCESS};
 
 /// Wrap a PAM entry point so a panic becomes `PAM_ABORT` instead of unwinding across
 /// the FFI boundary (undefined behaviour) or aborting the process.
