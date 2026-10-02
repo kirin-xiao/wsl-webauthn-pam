@@ -1,0 +1,4 @@
+# NEGATIVE FIXTURE: a line that names the module but is not a parseable PAM
+# module line (no authentication type), so it cannot be trusted.
+auth	[success=1 default=ignore]	pam_wsl_webauthn.so
+[not-a-type] pam_wsl_webauthn.so

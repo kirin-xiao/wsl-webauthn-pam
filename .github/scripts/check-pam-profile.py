@@ -19,7 +19,14 @@ generated file on every CI run:
       (``ignore``/``ok``/``done``/``bad``/``die``/``reset`` or a positive
       integer) — i.e. no literal ``end`` survived expansion;
   (c) the ``success=`` jump is >= 1 (guards the ``success=0 == ignore`` trap);
-  (d) every ``value=action`` key is a real libpam return-value name.
+  (d) every ``value=action`` key is a real libpam return-value name;
+  (e) the module's ``default=`` action is exactly ``ignore``: anything else
+      (``die``/``bad``/``reset``) either gates the stack on Hello with no
+      password fallback or denies outright — a lockout.
+
+The ``--profile`` mode additionally asserts the *source* profile keeps the
+lockout-safe shape: ``Default: no`` (never silently enabled) and the exact
+``[success=end default=ignore]`` module line.
 
 Usage:
     check-pam-profile.py [FILE ...]     # default: /etc/pam.d/common-auth
@@ -89,6 +96,20 @@ MODULE = "pam_wsl_webauthn.so"
 # pam-auth-update's own idiom, only valid in a *profile source* file.
 PROFILE_END = "end"
 
+# The only lockout-safe `default=` action on our module line.  `die`/`bad`/
+# `reset` all stop or deny the stack when Hello fails instead of falling
+# through to the password modules below.
+LOCKOUT_SAFE_DEFAULT = "ignore"
+
+# The exact module line the shipped `pam-config` profile must carry.  Kept in
+# lockstep with the installer's `embedded_profile_matches_repo_file_byte_for_byte` test.
+PROFILE_MODULE_LINE = "[success=end default=ignore] pam_wsl_webauthn.so"
+
+# ASCII-only test for a positive integer jump.  Plain `str.isdigit()` accepts
+# Unicode superscripts (e.g. "²") which then crash `int()` with a traceback
+# instead of a clean FAIL.
+POSITIVE_INT_RE = re.compile(r"^[0-9]+$")
+
 TOKEN_RE = re.compile(r"^(?P<key>[A-Za-z_][A-Za-z0-9_]*)(?:=(?P<val>[^\s=\[\]]+))?$")
 LINE_RE = re.compile(r"^(?P<type>[a-z-]+)\s+(?P<rest>.*\S)\s*$")
 
@@ -132,8 +153,14 @@ def validate_bracket(control: str) -> list[str]:
                     "(the jump was not rewritten to an integer)"
                 )
             elif val in KEYWORD_ACTIONS:
-                pass
-            elif val.isdigit():
+                if key == "default" and val != LOCKOUT_SAFE_DEFAULT:
+                    problems.append(
+                        f"unsafe control action {val!r} in {token!r}: only "
+                        f"default={LOCKOUT_SAFE_DEFAULT} keeps a failed WebAuthn "
+                        "attempt falling through to the password modules below, so "
+                        "default=die/bad/reset can lock out sudo/su"
+                    )
+            elif POSITIVE_INT_RE.match(val):
                 if int(val) <= 0:
                     problems.append(
                         f"non-positive control action {val!r} in {token!r}: "
@@ -201,7 +228,7 @@ def check_common_auth(path: str) -> tuple[bool, list[str]]:
             m = TOKEN_RE.match(token)
             if m and m.group("key") == "success" and m.group("val") is not None:
                 val = m.group("val")
-                if val.isdigit() and int(val) < 1:
+                if POSITIVE_INT_RE.match(val) and int(val) < 1:
                     problems.append(
                         f"{path}:{module_lineno}: expanded success jump is {val}; must be >= 1"
                     )
@@ -231,37 +258,75 @@ def check_profile_source(path: str) -> tuple[bool, list[str]]:
     for key in required:
         if not re.search(rf"^{re.escape(key)}", text, re.MULTILINE):
             problems.append(f"{path}: missing required profile key {key!r}")
+
+    # The lockout-relevant value the docstring promises to guard: a profile with
+    # `Default: yes` is enabled unattended by pam-auth-update on the next
+    # `pam-auth-update` run, before the operator has tested the module.
+    m = re.search(r"^Default:[ \t]*(?P<val>.*?)[ \t]*$", text, re.MULTILINE)
+    if m is None:
+        problems.append(f"{path}: missing required profile key 'Default:'")
+    elif m.group("val") != "no":
+        problems.append(
+            f"{path}: Default: is {m.group('val')!r}; must be exactly 'no' so the "
+            "profile is never enabled unattended"
+        )
+
     if MODULE not in text:
         problems.append(f"{path}: profile does not reference {MODULE}")
-    if "[success=end" not in text:
-        problems.append(f"{path}: expected the '[success=end default=ignore]' idiom")
-    # Only keys valid in a *source* profile are checked loosely here.
-    m = re.search(r"^Auth:\s*\n(?P<lines>(?:\s+.*\n?)+)", text, re.MULTILINE)
+    if "[success=end default=ignore]" not in text:
+        problems.append(
+            f"{path}: expected the exact '[success=end default=ignore]' idiom"
+        )
+
+    # The Auth: block's module line must be *exactly* the fail-safe control with
+    # `default=ignore` — not just any bracket starting with `success=end`.
+    m = re.search(r"^Auth:[ \t]*\n(?P<lines>(?:[ \t]+.*\n?)+)", text, re.MULTILINE)
     if not m:
         problems.append(f"{path}: could not find the Auth: block")
     else:
         for line in m.group("lines").splitlines():
-            if MODULE in line and not line.strip().startswith("[success=end"):
-                problems.append(f"{path}: unexpected Auth: module line {line.strip()!r}")
+            if MODULE in line and " ".join(line.split()) != PROFILE_MODULE_LINE:
+                problems.append(
+                    f"{path}: unexpected Auth: module line {line.strip()!r}; expected "
+                    f"{PROFILE_MODULE_LINE!r}"
+                )
     return (not problems), problems
 
 
+# Committed fixtures live at the repository root under `scripts/fixtures/`
+# (the comment above used to name a path one level deeper than the arithmetic
+# actually resolves to).  Expand both `..` segments via normpath below.
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "scripts", "fixtures")
 
 
 def self_test() -> int:
     base = os.path.normpath(FIXTURES)
+    # (fixture, expected_ok, checker).  Both the expanded-common-auth branches and
+    # the profile-source branches are exercised, including the failure branches
+    # (duplicate module, bare keyword, unterminated bracket, missing module,
+    # unparseable line) and the lockout-relevant value assertions.
     cases = [
-        ("common-auth.sample", True),
-        ("negative-end-survives.sample", False),
-        ("negative-success-zero.sample", False),
-        ("negative-bad-action.sample", False),
-        ("negative-unknown-return-value.sample", False),
+        ("common-auth.sample", True, check_common_auth),
+        ("negative-end-survives.sample", False, check_common_auth),
+        ("negative-success-zero.sample", False, check_common_auth),
+        ("negative-bad-action.sample", False, check_common_auth),
+        ("negative-unknown-return-value.sample", False, check_common_auth),
+        ("negative-default-die.sample", False, check_common_auth),
+        ("negative-default-bad.sample", False, check_common_auth),
+        ("negative-default-reset.sample", False, check_common_auth),
+        ("negative-duplicate-module.sample", False, check_common_auth),
+        ("negative-bare-keyword.sample", False, check_common_auth),
+        ("negative-unterminated-bracket.sample", False, check_common_auth),
+        ("negative-missing-module.sample", False, check_common_auth),
+        ("negative-unparseable-line.sample", False, check_common_auth),
+        ("negative-unicode-digit.sample", False, check_common_auth),
+        ("negative-default-yes-profile", False, check_profile_source),
+        ("positive-profile.sample", True, check_profile_source),
     ]
     failed = 0
-    for name, expect_ok in cases:
+    for name, expect_ok, checker in cases:
         path = os.path.join(base, name)
-        ok, problems = check_common_auth(path)
+        ok, problems = checker(path)
         status = "PASS" if ok else "FAIL"
         verdict = "ok" if ok == expect_ok else "UNEXPECTED"
         if ok != expect_ok:

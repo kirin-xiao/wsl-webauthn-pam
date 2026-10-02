@@ -1,0 +1,7 @@
+# NEGATIVE FIXTURE: a Unicode superscript digit as the jump value. `str.isdigit()`
+# is true for "²" but `int("²")` raises — the checker must report a clean FAIL,
+# never a Python traceback.
+auth	[success=² default=ignore]	pam_wsl_webauthn.so
+auth	[success=1 default=ignore]	pam_unix.so nullok try_first_pass
+auth	requisite			pam_deny.so
+auth	required			pam_permit.so
