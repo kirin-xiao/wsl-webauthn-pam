@@ -935,6 +935,43 @@ fn negative_intermediate_not_ca() {
 }
 
 #[test]
+fn negative_path_len_exceeded() {
+    // A four-level chain `root -> extra CA (pathLen=0) -> intermediate CA -> leaf`.
+    // The extra CA's `pathLenConstraint` bounds the non-self-issued intermediate CA
+    // certificates below it toward the leaf (RFC 5280 §4.2.1.9); one such CA exceeds
+    // the declared limit of zero, so the verifier must reject the chain.
+    let f = chain_fixture(
+        ChainOptions {
+            extra_intermediate: true,
+            extra_intermediate_path_len: Some(0),
+            ..Default::default()
+        },
+        -7,
+    );
+    assert_eq!(
+        verify(&f, AttestationPolicy::Strict),
+        Err(VerifyError::CertificatePathLenExceeded)
+    );
+}
+
+#[test]
+fn positive_path_len_within_limit() {
+    // The same extra-CA chain, but the extra CA declares `pathLen=1`, which the
+    // single non-self-issued intermediate below it satisfies. This pins that the
+    // rejection above is caused by the constraint being exceeded, not by the extra
+    // level merely existing (so `negative_path_len_exceeded` is not vacuous).
+    let f = chain_fixture(
+        ChainOptions {
+            extra_intermediate: true,
+            extra_intermediate_path_len: Some(1),
+            ..Default::default()
+        },
+        -7,
+    );
+    verify(&f, AttestationPolicy::Strict).expect("pathLen=1 admits one intermediate CA");
+}
+
+#[test]
 fn negative_wrong_ou() {
     let f = chain_fixture(
         ChainOptions {
