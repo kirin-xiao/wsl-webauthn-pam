@@ -114,10 +114,10 @@ const ENROLL_ADVISORY: &str =
     "Waiting for the Windows Hello prompt — save your passkey, then enter your PIN.";
 
 /// Print [`ENROLL_ADVISORY`], surrounded by blank lines.
-fn print_enroll_advisory() {
-    println!();
-    println!("{ENROLL_ADVISORY}");
-    println!();
+fn print_enroll_advisory(ui: &Ui) {
+    status!(ui, "");
+    status!(ui, "{ENROLL_ADVISORY}");
+    status!(ui, "");
 }
 
 /// Render one ceremony-phase transition as a human line, or `None` when there is nothing
@@ -151,6 +151,8 @@ COMMANDS:
                    --user <NAME>         target user (default: SUDO_USER or current)
                    --bridge <PATH>       bridge exe path (else config, else required)
                    --win-mnt <PATH>      Windows mount root (else config, else /mnt/c)
+                   -v, --verbose         print resolved config and ceremony detail
+                   --quiet, -q           suppress all non-error status output
     unregister   Remove one user's credential record (root, per-user only)
                    --user <NAME>         target user (default: SUDO_USER or current)
                    --yes, -y             skip the confirmation prompt
@@ -169,6 +171,8 @@ COMMANDS:
                    --dry-run              resolve and print the plan; write nothing
                    --yes, -y              answer yes to every prompt
                    --non-interactive      never read stdin; use question defaults
+                   -v, --verbose         print resolved config and provisioning detail
+                   --quiet, -q           suppress all non-error status output
                    note: the CLI is also installed to /usr/local/bin/wsl-webauthn-pam
     uninstall    Remove a credential or all components (root)
                    --user <NAME>         remove one user's record (default)
@@ -181,6 +185,12 @@ COMMANDS:
 GLOBAL:
     -h, --help       Print this help
     -V, --version    Print the version
+
+VERBOSITY (`enroll`/`install` only):
+    Default prints only actionable status. `-v`/`--verbose` adds resolved config and
+    provisioning detail; `--quiet` (alias `-q`) suppresses all non-error status. The
+    two are mutually exclusive. `probe`/`status`/`verify`/`unregister`/`uninstall`
+    and `--dry-run` always print their full output.
 
 NOTE:
     A value that begins with `-` must use the `--flag=value` form; in the
@@ -331,6 +341,120 @@ fn verify_error_code(_error: &VerifyError) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// Verbosity / status output
+// ---------------------------------------------------------------------------
+
+/// How much human-readable status the `enroll`/`install` flows print.
+///
+/// `probe`/`status`/`verify`/`unregister`/`uninstall` are always [`Normal`]: inspection
+/// and plan output is their purpose, and their flags never consult this value.
+///
+/// [`Normal`]: Verbosity::Normal
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Verbosity {
+    /// `--quiet`/`-q`: emit only errors/warnings (stderr) and interactive prompt text.
+    Quiet,
+    /// Default: actionable status, but no implementation detail.
+    #[default]
+    Normal,
+    /// `-v`/`--verbose`: [`Normal`] plus resolved config and provisioning detail.
+    ///
+    /// [`Normal`]: Verbosity::Normal
+    Verbose,
+}
+
+/// The output seam threaded through the enroll/install flows.
+///
+/// Every human-readable stdout line on those two flows goes through one of the two
+/// methods, so a single value decides the whole level. Diagnostics (`eprintln!`)
+/// intentionally bypass it: warnings and stable `error[...]` tokens always print.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Ui {
+    verbosity: Verbosity,
+}
+
+impl Ui {
+    /// Build a [`Ui`] for a verbosity level.
+    pub(crate) fn new(verbosity: Verbosity) -> Ui {
+        Ui { verbosity }
+    }
+
+    /// Actionable status: printed unless `--quiet`.
+    pub(crate) fn status(&self, args: std::fmt::Arguments<'_>) {
+        if self.shows_status() {
+            self.emit(args);
+        }
+    }
+
+    /// Implementation detail: printed only with `-v`/`--verbose`.
+    pub(crate) fn detail(&self, args: std::fmt::Arguments<'_>) {
+        if self.shows_detail() {
+            self.emit(args);
+        }
+    }
+
+    /// Render and print one line.
+    ///
+    /// In test builds an active capture sink (see [`capture_status_lines`]) also records
+    /// the line, so a test can assert what a whole flow emitted at each level. Production
+    /// has no sink and prints straight to stdout.
+    fn emit(&self, args: std::fmt::Arguments<'_>) {
+        #[cfg(test)]
+        CAPTURED.with(|captured| {
+            if let Some(lines) = captured.borrow_mut().as_mut() {
+                lines.push(args.to_string());
+            }
+        });
+        println!("{args}");
+    }
+
+    /// Whether an actionable status line is shown at this level.
+    pub(crate) fn shows_status(&self) -> bool {
+        self.verbosity != Verbosity::Quiet
+    }
+
+    /// Whether an implementation-detail line is shown at this level.
+    pub(crate) fn shows_detail(&self) -> bool {
+        self.verbosity == Verbosity::Verbose
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only sink recording every line emitted through [`Ui`]. `None` (the default)
+    /// means no capture is active; see [`capture_status_lines`].
+    static CAPTURED: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` while recording every [`Ui`] line into a buffer, and return both the result and
+/// the recorded lines. Test-only; installs a per-thread sink so parallel tests do not
+/// interfere.
+#[cfg(test)]
+pub(crate) fn capture_status_lines<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+    CAPTURED.with(|captured| *captured.borrow_mut() = Some(Vec::new()));
+    let result = f();
+    let lines = CAPTURED.with(|captured| captured.borrow_mut().take().unwrap_or_default());
+    (result, lines)
+}
+
+/// Print an actionable status line through a [`Ui`].
+#[macro_export]
+macro_rules! status {
+    ($ui:expr, $($arg:tt)*) => {
+        $ui.status(format_args!($($arg)*))
+    };
+}
+
+/// Print an implementation-detail line through a [`Ui`].
+#[macro_export]
+macro_rules! detail {
+    ($ui:expr, $($arg:tt)*) => {
+        $ui.detail(format_args!($($arg)*))
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Argument parsing
 // ---------------------------------------------------------------------------
 
@@ -382,7 +506,10 @@ enum Command {
 enum Parsed {
     Help,
     Version,
-    Run(Command),
+    Run {
+        command: Command,
+        verbosity: Verbosity,
+    },
 }
 
 /// Every flag the parser recognizes, independent of which subcommand consumes it.
@@ -405,6 +532,8 @@ enum Flag {
     WinMnt,
     ModuleDir,
     ArtifactDir,
+    Verbose,
+    Quiet,
 }
 
 impl Flag {
@@ -424,6 +553,8 @@ impl Flag {
             Flag::WinMnt => "--win-mnt",
             Flag::ModuleDir => "--module-dir",
             Flag::ArtifactDir => "--artifact-dir",
+            Flag::Verbose => "-v/--verbose",
+            Flag::Quiet => "-q/--quiet",
         }
     }
 }
@@ -441,6 +572,8 @@ fn allowed_flags(subcommand: &str) -> Option<&'static [Flag]> {
             Flag::User,
             Flag::Bridge,
             Flag::WinMnt,
+            Flag::Verbose,
+            Flag::Quiet,
         ]),
         "unregister" => Some(&[Flag::User, Flag::Yes]),
         "probe" => Some(&[Flag::Bridge, Flag::WinMnt]),
@@ -455,6 +588,8 @@ fn allowed_flags(subcommand: &str) -> Option<&'static [Flag]> {
             Flag::ModuleDir,
             Flag::WinMnt,
             Flag::ArtifactDir,
+            Flag::Verbose,
+            Flag::Quiet,
         ]),
         "uninstall" => Some(&[
             Flag::User,
@@ -473,14 +608,40 @@ fn allowed_flags(subcommand: &str) -> Option<&'static [Flag]> {
 /// Returns `Err(message)` for a usage error (the caller prints usage and exits `2`).
 /// `-h`/`--help` is honored for every subcommand.
 fn parse(args: &[String]) -> Result<Parsed, String> {
-    let Some(first) = args.first() else {
+    // Peel any leading verbosity flags (`wsl-webauthn-pam -v install`) before the
+    // subcommand; they are re-attached to the sub-arguments so `parse_sub` still enforces
+    // the per-subcommand allow-list, making `-v probe` a usage error rather than a
+    // silently ignored argument.
+    let mut leading: Vec<String> = Vec::new();
+    let mut start = 0usize;
+    while let Some(arg) = args.get(start) {
+        if is_verbosity_flag(arg) {
+            leading.push(arg.clone());
+            start += 1;
+        } else {
+            break;
+        }
+    }
+    let Some(first) = args.get(start) else {
         return Err("missing subcommand".to_string());
     };
     match first.as_str() {
         "-h" | "--help" | "help" => Ok(Parsed::Help),
         "-V" | "--version" => Ok(Parsed::Version),
-        name => parse_sub(name, &args[1..]),
+        name => {
+            // Prepend the peeled flags so a missing value at the end of the original
+            // argument list still reports the real cause (`--user requires a value`)
+            // rather than blaming the re-attached `-v`.
+            let mut sub_args: Vec<String> = leading;
+            sub_args.extend(args[start + 1..].iter().cloned());
+            parse_sub(name, &sub_args)
+        }
     }
+}
+
+/// Whether `arg` is one of the verbosity flags recognized before the subcommand.
+fn is_verbosity_flag(arg: &str) -> bool {
+    matches!(arg, "-v" | "--verbose" | "-q" | "--quiet")
 }
 
 /// Parse one subcommand's flags.
@@ -514,6 +675,8 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
     let mut win_mnt: Option<PathBuf> = None;
     let mut module_dir: Option<PathBuf> = None;
     let mut artifact_dir: Option<PathBuf> = None;
+    let mut verbose = false;
+    let mut quiet = false;
     // Recognized flags in the order seen; checked against the allow-list after the loop.
     // Deferring the check keeps `-h`/`--help` reachable in any position.
     let mut seen: Vec<Flag> = Vec::new();
@@ -575,6 +738,14 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
                 seen.push(Flag::ArtifactDir);
                 artifact_dir = Some(PathBuf::from(take_value(args, &mut i, "--artifact-dir")?));
             }
+            "-v" | "--verbose" => {
+                seen.push(Flag::Verbose);
+                verbose = true;
+            }
+            "-q" | "--quiet" => {
+                seen.push(Flag::Quiet);
+                quiet = true;
+            }
             // There are no positional arguments; `--` is accepted only as a trailing
             // no-op terminator, and anything after it is a usage error.
             "--" => {
@@ -624,6 +795,20 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
         reject(flag)?;
     }
 
+    // `-v`/`--quiet` are opposites; accepting both would make the level ambiguous.
+    if verbose && quiet {
+        return Err(format!(
+            "`{name}` accepts only one of -v/--verbose and --quiet"
+        ));
+    }
+    let verbosity = if quiet {
+        Verbosity::Quiet
+    } else if verbose {
+        Verbosity::Verbose
+    } else {
+        Verbosity::Normal
+    };
+
     // Only allowed flags can be set at this point; map them into the concrete command.
     let cmd = match name {
         "enroll" => Command::Enroll {
@@ -664,7 +849,10 @@ fn parse_sub(name: &str, args: &[String]) -> Result<Parsed, String> {
         // `allowed_flags` already rejected any name outside this set.
         _ => unreachable!("allowed_flags accepted an unknown subcommand"),
     };
-    Ok(Parsed::Run(cmd))
+    Ok(Parsed::Run {
+        command: cmd,
+        verbosity,
+    })
 }
 
 /// Consume the value for a flag in the `--flag value` form.
@@ -729,7 +917,7 @@ fn main() -> ExitCode {
             println!("wsl-webauthn-pam {}", env!("CARGO_PKG_VERSION"));
             EXIT_OK
         }
-        Ok(Parsed::Run(command)) => match run(command) {
+        Ok(Parsed::Run { command, verbosity }) => match run(command, verbosity) {
             Ok(code) => code,
             Err(error) => {
                 eprintln!("error[{}]: {error:#}", error_code(&error));
@@ -741,7 +929,8 @@ fn main() -> ExitCode {
 }
 
 /// Dispatch a parsed command.
-fn run(command: Command) -> anyhow::Result<i32> {
+fn run(command: Command, verbosity: Verbosity) -> anyhow::Result<i32> {
+    let ui = Ui::new(verbosity);
     match command {
         Command::Enroll {
             replace,
@@ -751,14 +940,14 @@ fn run(command: Command) -> anyhow::Result<i32> {
             bridge,
             win_mnt,
         } => {
-            let code = cmd_enroll(replace, allow_unattested, user, bridge, win_mnt)?;
+            let code = cmd_enroll(replace, allow_unattested, user, bridge, win_mnt, &ui)?;
             // Enabling is a separate step from the ceremony, so `cmd_enroll` never mutates
             // PAM configuration. On success (and unless suppressed) turn the profile on.
             if code == EXIT_OK && !no_enable {
                 let commands = installer::RealCommands;
                 let pam_auth_update =
                     installer::CommandRunner::available(&commands, "pam-auth-update");
-                installer::enable_after_enroll(&commands, pam_auth_update)?;
+                installer::enable_after_enroll(&commands, pam_auth_update, &ui)?;
             }
             Ok(code)
         }
@@ -787,6 +976,7 @@ fn run(command: Command) -> anyhow::Result<i32> {
             },
             yes,
             non_interactive,
+            &ui,
         ),
         Command::Uninstall {
             user,
@@ -1002,22 +1192,25 @@ fn cmd_enroll(
     user: Option<String>,
     bridge: Option<PathBuf>,
     win_mnt: Option<PathBuf>,
+    ui: &Ui,
 ) -> anyhow::Result<i32> {
     require_root("enroll")?;
     let target = resolve_target_user(user)?;
     let config = resolve_bridge(bridge, win_mnt)?;
     config.warn_config_error();
 
-    println!(
+    detail!(
+        ui,
         "Enrolling \"{}\" (uid {}) with Windows Hello",
-        target.name, target.uid
+        target.name,
+        target.uid
     );
-    println!("  bridge:  {}", config.bridge.display());
-    println!("  win_mnt: {}", config.win_mnt.display());
+    detail!(ui, "  bridge:  {}", config.bridge.display());
+    detail!(ui, "  win_mnt: {}", config.win_mnt.display());
     if allow_unattested {
-        println!("  policy:  AllowUnattested (--allow-unattested)");
+        detail!(ui, "  policy:  AllowUnattested (--allow-unattested)");
     } else {
-        println!("  policy:  Strict");
+        detail!(ui, "  policy:  Strict");
     }
 
     if !config.bridge.exists() {
@@ -1044,7 +1237,10 @@ fn cmd_enroll(
                 uv_platform_available,
                 api_version,
             } => {
-                println!("  probe:   Windows Hello available (api_version {api_version})");
+                detail!(
+                    ui,
+                    "  probe:   Windows Hello available (api_version {api_version})"
+                );
                 if !uv_platform_available {
                     bail!(
                         "no user-verifying platform authenticator is available; enroll Windows Hello \
@@ -1064,7 +1260,7 @@ fn cmd_enroll(
     // 2. Capture the Windows identity (non-fatal).
     let identity = capture_windows_identity(&config.win_mnt);
     match &identity {
-        Some(id) => println!("  windows: {}", id.account),
+        Some(id) => detail!(ui, "  windows: {}", id.account),
         None => eprintln!("warning: could not determine the Windows account (whoami.exe failed)"),
     }
 
@@ -1072,7 +1268,7 @@ fn cmd_enroll(
     //
     // Last point before the ceremony that can explain a pause which otherwise looks like
     // a hang: the Windows Hello dialog may open behind the terminal.
-    print_enroll_advisory();
+    print_enroll_advisory(ui);
     let policy = if allow_unattested {
         AttestationPolicy::AllowUnattested
     } else {
@@ -1090,7 +1286,7 @@ fn cmd_enroll(
                 _ => {}
             }
             if let Some(line) = ceremony_progress_line(event, Some((step.get().max(1), 2))) {
-                println!("{line}");
+                status!(ui, "{line}");
             }
         };
         enroll_checked(
@@ -1145,13 +1341,14 @@ fn cmd_enroll(
     }
 
     let short = short_credential_id(&outcome.credential_id);
-    println!();
-    println!("Enrolled \"{}\" successfully.", target.name);
-    println!("  format:     {}", outcome.attestation.format);
-    println!("  mode:       {}", record.attestation.mode);
-    println!("  aaguid:     {}", record.aaguid);
-    println!("  credential: {short}");
-    println!(
+    status!(ui, "");
+    status!(ui, "Enrolled \"{}\" successfully.", target.name);
+    detail!(ui, "  format:     {}", outcome.attestation.format);
+    detail!(ui, "  mode:       {}", record.attestation.mode);
+    detail!(ui, "  aaguid:     {}", record.aaguid);
+    detail!(ui, "  credential: {short}");
+    detail!(
+        ui,
         "  saved:      {}",
         store
             .credentials_dir()
@@ -1549,9 +1746,11 @@ fn cmd_unregister(user: Option<String>, yes: bool) -> anyhow::Result<i32> {
     require_root("unregister")?;
     let target = resolve_target_user(user)?;
     // Share the per-user removal logic with `uninstall` (one user at a time).
+    let ui = Ui::default();
     let prompter = installer::StdPrompter {
         assume_yes: yes,
         non_interactive: false,
+        ui: &ui,
     };
     installer::uninstall_user(&Store::system(), &target.name, yes, &prompter)
 }
@@ -2203,14 +2402,17 @@ mod tests {
         let parsed = parse(&args(&["enroll"])).unwrap();
         assert_eq!(
             parsed,
-            Parsed::Run(Command::Enroll {
-                replace: false,
-                allow_unattested: false,
-                no_enable: false,
-                user: None,
-                bridge: None,
-                win_mnt: None,
-            })
+            Parsed::Run {
+                command: Command::Enroll {
+                    replace: false,
+                    allow_unattested: false,
+                    no_enable: false,
+                    user: None,
+                    bridge: None,
+                    win_mnt: None,
+                },
+                verbosity: Verbosity::Normal,
+            }
         );
     }
 
@@ -2226,14 +2428,17 @@ mod tests {
                 "alice"
             ]))
             .unwrap(),
-            Parsed::Run(Command::Enroll {
-                replace: true,
-                allow_unattested: true,
-                no_enable: true,
-                user: Some("alice".into()),
-                bridge: None,
-                win_mnt: None,
-            })
+            Parsed::Run {
+                command: Command::Enroll {
+                    replace: true,
+                    allow_unattested: true,
+                    no_enable: true,
+                    user: Some("alice".into()),
+                    bridge: None,
+                    win_mnt: None,
+                },
+                verbosity: Verbosity::Normal,
+            }
         );
         assert_eq!(
             parse(&args(&[
@@ -2243,14 +2448,17 @@ mod tests {
                 "--bridge=/x/y.exe"
             ]))
             .unwrap(),
-            Parsed::Run(Command::Enroll {
-                replace: false,
-                allow_unattested: false,
-                no_enable: false,
-                user: Some("bob".into()),
-                bridge: Some(PathBuf::from("/x/y.exe")),
-                win_mnt: Some(PathBuf::from("/mnt/d")),
-            })
+            Parsed::Run {
+                command: Command::Enroll {
+                    replace: false,
+                    allow_unattested: false,
+                    no_enable: false,
+                    user: Some("bob".into()),
+                    bridge: Some(PathBuf::from("/x/y.exe")),
+                    win_mnt: Some(PathBuf::from("/mnt/d")),
+                },
+                verbosity: Verbosity::Normal,
+            }
         );
     }
 
@@ -2270,14 +2478,17 @@ mod tests {
         // The `--flag=value` form may carry a value that begins with `-`.
         assert_eq!(
             parse(&args(&["enroll", "--user=-weird"])).unwrap(),
-            Parsed::Run(Command::Enroll {
-                replace: false,
-                allow_unattested: false,
-                no_enable: false,
-                user: Some("-weird".into()),
-                bridge: None,
-                win_mnt: None,
-            })
+            Parsed::Run {
+                command: Command::Enroll {
+                    replace: false,
+                    allow_unattested: false,
+                    no_enable: false,
+                    user: Some("-weird".into()),
+                    bridge: None,
+                    win_mnt: None,
+                },
+                verbosity: Verbosity::Normal,
+            }
         );
     }
 
@@ -2294,10 +2505,13 @@ mod tests {
     fn parse_dash_y_is_yes() {
         assert_eq!(
             parse(&args(&["unregister", "-y"])).unwrap(),
-            Parsed::Run(Command::Unregister {
-                user: None,
-                yes: true,
-            })
+            Parsed::Run {
+                command: Command::Unregister {
+                    user: None,
+                    yes: true,
+                },
+                verbosity: Verbosity::Normal,
+            }
         );
     }
 
@@ -2305,6 +2519,75 @@ mod tests {
     fn parse_unknown_flag_is_error() {
         assert!(parse(&args(&["enroll", "--nope"])).is_err());
         assert!(parse(&args(&["bogus"])).is_err());
+    }
+
+    /// The verbosity seam gates status and detail independently at each level.
+    #[test]
+    fn ui_visibility_levels() {
+        let quiet = Ui::new(Verbosity::Quiet);
+        assert!(!quiet.shows_status());
+        assert!(!quiet.shows_detail());
+
+        let normal = Ui::new(Verbosity::Normal);
+        assert!(normal.shows_status());
+        assert!(!normal.shows_detail());
+
+        let verbose = Ui::new(Verbosity::Verbose);
+        assert!(verbose.shows_status());
+        assert!(verbose.shows_detail());
+    }
+
+    /// Verbosity flags are accepted (both positions) on `enroll`/`install`, map to the
+    /// right level, reject on the other subcommands, and cannot be combined.
+    #[test]
+    fn parse_verbosity_flags() {
+        // Trailing form.
+        assert_eq!(
+            parse(&args(&["enroll", "-v"])).unwrap(),
+            Parsed::Run {
+                command: Command::Enroll {
+                    replace: false,
+                    allow_unattested: false,
+                    no_enable: false,
+                    user: None,
+                    bridge: None,
+                    win_mnt: None,
+                },
+                verbosity: Verbosity::Verbose,
+            }
+        );
+        assert_eq!(
+            parse(&args(&["install", "--quiet"])).unwrap(),
+            Parsed::Run {
+                command: Command::Install {
+                    allow_unattested: false,
+                    skip_enroll: false,
+                    dry_run: false,
+                    non_interactive: false,
+                    yes: false,
+                    module_dir: None,
+                    win_mnt: None,
+                    artifact_dir: None,
+                },
+                verbosity: Verbosity::Quiet,
+            }
+        );
+        // Leading form (`wsl-webauthn-pam -v install`) and the `-q` alias.
+        let Parsed::Run { verbosity, .. } = parse(&args(&["-v", "install"])).unwrap() else {
+            panic!("expected a run command");
+        };
+        assert_eq!(verbosity, Verbosity::Verbose);
+        let Parsed::Run { verbosity, .. } = parse(&args(&["-q", "enroll"])).unwrap() else {
+            panic!("expected a run command");
+        };
+        assert_eq!(verbosity, Verbosity::Quiet);
+        // Combining the two is a usage error.
+        assert!(parse(&args(&["enroll", "-v", "--quiet"])).is_err());
+        assert!(parse(&args(&["-v", "--quiet", "install"])).is_err());
+        // Rejected where it has no meaning (the table test covers this too).
+        assert!(parse(&args(&["probe", "-v"])).is_err());
+        assert!(parse(&args(&["status", "--quiet"])).is_err());
+        assert!(parse(&args(&["verify", "-q"])).is_err());
     }
 
     #[test]
@@ -2396,6 +2679,8 @@ mod tests {
                     "--user",
                     "--bridge",
                     "--win-mnt",
+                    "--verbose",
+                    "--quiet",
                 ],
             ),
             ("unregister", &["--user", "--yes"]),
@@ -2412,6 +2697,8 @@ mod tests {
                     "--module-dir",
                     "--win-mnt",
                     "--artifact-dir",
+                    "--verbose",
+                    "--quiet",
                 ],
             ),
             (
@@ -2446,6 +2733,8 @@ mod tests {
             "--win-mnt",
             "--module-dir",
             "--artifact-dir",
+            "--verbose",
+            "--quiet",
         ];
 
         for (sub, allowed) in expected {
@@ -2488,16 +2777,19 @@ mod tests {
     fn parse_uninstall_and_install() {
         assert_eq!(
             parse(&args(&["install"])).unwrap(),
-            Parsed::Run(Command::Install {
-                allow_unattested: false,
-                skip_enroll: false,
-                dry_run: false,
-                non_interactive: false,
-                yes: false,
-                module_dir: None,
-                win_mnt: None,
-                artifact_dir: None,
-            })
+            Parsed::Run {
+                command: Command::Install {
+                    allow_unattested: false,
+                    skip_enroll: false,
+                    dry_run: false,
+                    non_interactive: false,
+                    yes: false,
+                    module_dir: None,
+                    win_mnt: None,
+                    artifact_dir: None,
+                },
+                verbosity: Verbosity::Normal,
+            }
         );
         assert_eq!(
             parse(&args(&[
@@ -2514,38 +2806,47 @@ mod tests {
                 "/art",
             ]))
             .unwrap(),
-            Parsed::Run(Command::Install {
-                allow_unattested: true,
-                skip_enroll: true,
-                dry_run: true,
-                non_interactive: true,
-                yes: true,
-                module_dir: Some(PathBuf::from("/usr/lib/x/security")),
-                win_mnt: Some(PathBuf::from("/mnt/d")),
-                artifact_dir: Some(PathBuf::from("/art")),
-            })
+            Parsed::Run {
+                command: Command::Install {
+                    allow_unattested: true,
+                    skip_enroll: true,
+                    dry_run: true,
+                    non_interactive: true,
+                    yes: true,
+                    module_dir: Some(PathBuf::from("/usr/lib/x/security")),
+                    win_mnt: Some(PathBuf::from("/mnt/d")),
+                    artifact_dir: Some(PathBuf::from("/art")),
+                },
+                verbosity: Verbosity::Normal,
+            }
         );
         assert_eq!(
             parse(&args(&["uninstall", "--user", "alice"])).unwrap(),
-            Parsed::Run(Command::Uninstall {
-                user: Some("alice".into()),
-                all: false,
-                non_interactive: false,
-                yes: false,
-                module_dir: None,
-                win_mnt: None,
-            })
+            Parsed::Run {
+                command: Command::Uninstall {
+                    user: Some("alice".into()),
+                    all: false,
+                    non_interactive: false,
+                    yes: false,
+                    module_dir: None,
+                    win_mnt: None,
+                },
+                verbosity: Verbosity::Normal,
+            }
         );
         assert_eq!(
             parse(&args(&["uninstall", "--all", "--yes"])).unwrap(),
-            Parsed::Run(Command::Uninstall {
-                user: None,
-                all: true,
-                non_interactive: false,
-                yes: true,
-                module_dir: None,
-                win_mnt: None,
-            })
+            Parsed::Run {
+                command: Command::Uninstall {
+                    user: None,
+                    all: true,
+                    non_interactive: false,
+                    yes: true,
+                    module_dir: None,
+                    win_mnt: None,
+                },
+                verbosity: Verbosity::Normal,
+            }
         );
     }
 
@@ -3488,6 +3789,8 @@ mod tests {
             "--win-mnt",
             "--module-dir",
             "--artifact-dir",
+            "--verbose",
+            "--quiet",
         ];
         for &flag in &all {
             assert!(

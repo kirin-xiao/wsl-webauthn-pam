@@ -48,6 +48,12 @@ Linux side.
   credential is verified, instead of offering a separate, default-off enable
   step. `enroll` gains `--no-enable`. A failed or skipped enrollment leaves the
   profile disabled and prints the exact recovery commands.
+- `enroll` and `install` now print only actionable status by default. A new
+  `-v`/`--verbose` flag adds the resolved config and per-step provisioning detail
+  that used to print unconditionally, and `--quiet`/`-q` suppresses all non-error
+  status for scripted use. The two flags are mutually exclusive, are accepted only
+  by `enroll`/`install`, and never change stable error tokens or exit codes.
+  `probe`/`status`/`verify` and `--dry-run` output is unchanged.
 - The pinned RP ID is now `wsl-webauthn-pam` (the personal `io.github.kirin-xiao`
   segment is dropped from the `Passkey for …` line the Windows dialog shows).
   The `rpIdHash` therefore changes: **existing users must re-enroll**, and the old

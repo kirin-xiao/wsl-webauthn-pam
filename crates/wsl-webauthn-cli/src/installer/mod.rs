@@ -58,7 +58,7 @@ use wsl_webauthn_store::{CONFIG_MODE, Config, Store};
 use crate::confparse;
 use crate::fsutil;
 // Shared CLI constants (single definitions in the crate root, `main.rs`).
-use crate::{DEFAULT_WIN_MNT, EXIT_FAIL, EXIT_OK, WHOAMI_DEADLINE};
+use crate::{DEFAULT_WIN_MNT, EXIT_FAIL, EXIT_OK, Ui, WHOAMI_DEADLINE, detail, status};
 
 /// The `pam-auth-update` profile text, embedded from the repository's single source of
 /// truth (`pam-config` at the workspace root). This path is relative to this file
@@ -310,11 +310,15 @@ pub(crate) trait Enroller {
 }
 
 /// Production enroller: reuses the CLI's `enroll` implementation.
-pub(crate) struct RealEnroller;
+pub(crate) struct RealEnroller<'a> {
+    /// Carries the install's verbosity so the in-process enrollment prints at the same
+    /// level as the surrounding provisioning.
+    pub(crate) ui: &'a Ui,
+}
 
-impl Enroller for RealEnroller {
+impl Enroller for RealEnroller<'_> {
     fn enroll(&self, allow_unattested: bool) -> anyhow::Result<i32> {
-        crate::cmd_enroll(false, allow_unattested, None, None, None)
+        crate::cmd_enroll(false, allow_unattested, None, None, None, self.ui)
     }
 }
 
@@ -326,21 +330,28 @@ pub(crate) trait Prompter {
 }
 
 /// The production prompter: reads from stdin unless `--yes`/`--non-interactive`.
-pub(crate) struct StdPrompter {
+pub(crate) struct StdPrompter<'a> {
     /// `--yes`: answer yes to every question.
     pub assume_yes: bool,
     /// `--non-interactive`: never read stdin; use the question's default.
     pub non_interactive: bool,
+    /// Verbosity; under `--quiet` the non-interactive `[yes]`/`[no]` echo is suppressed
+    /// (an actual stdin prompt is still printed, or the operator could not answer).
+    pub ui: &'a Ui,
 }
 
-impl Prompter for StdPrompter {
+impl Prompter for StdPrompter<'_> {
     fn confirm(&self, question: &str, default: bool) -> anyhow::Result<bool> {
         if self.assume_yes {
-            println!("{question} [yes]");
+            status!(self.ui, "{question} [yes]");
             return Ok(true);
         }
         if self.non_interactive {
-            println!("{question} [{}]", if default { "yes" } else { "no" });
+            status!(
+                self.ui,
+                "{question} [{}]",
+                if default { "yes" } else { "no" }
+            );
             return Ok(default);
         }
         loop {
@@ -969,6 +980,7 @@ fn provision_bridge(
     win_mnt: &Path,
     source: &Path,
     rollback: &mut Rollback,
+    ui: &Ui,
 ) -> anyhow::Result<PathBuf> {
     let local = resolve_local_appdata(interop, win_mnt)?;
     let dest_win = confparse::windows_join(&local, WIN_BRIDGE_SUBPATH);
@@ -991,7 +1003,8 @@ fn provision_bridge(
 
     let hash = fsutil::sha256_hex_file(&dest)
         .with_context(|| format!("hashing the installed bridge at {}", dest.display()))?;
-    println!(
+    detail!(
+        ui,
         "  bridge:      {} (sha256 {})",
         dest.display(),
         fsutil::short_hash(&hash)
@@ -1005,6 +1018,7 @@ fn provision_config(
     win_mnt: &Path,
     bridge_path: &Path,
     rollback: &mut Rollback,
+    ui: &Ui,
 ) -> anyhow::Result<()> {
     ensure_dir(
         &paths.etc_wsl_webauthn,
@@ -1021,7 +1035,7 @@ fn provision_config(
     if let Some(action) = undo {
         rollback.push(action);
     }
-    println!("  config:      {}", config.display());
+    detail!(ui, "  config:      {}", config.display());
 
     let creds = paths.credentials_dir();
     ensure_dir(
@@ -1031,7 +1045,7 @@ fn provision_config(
         rollback,
         "credentials directory",
     )?;
-    println!("  credentials: {}", creds.display());
+    detail!(ui, "  credentials: {}", creds.display());
     Ok(())
 }
 
@@ -1040,6 +1054,7 @@ fn provision_module(
     module_dir: &Path,
     source: &Path,
     rollback: &mut Rollback,
+    ui: &Ui,
 ) -> anyhow::Result<PathBuf> {
     let dest = module_dir.join(MODULE_NAME);
     let undo = prepare_write(&dest)?;
@@ -1048,12 +1063,16 @@ fn provision_module(
     if let Some(action) = undo {
         rollback.push(action);
     }
-    println!("  module:      {}", dest.display());
+    detail!(ui, "  module:      {}", dest.display());
     Ok(dest)
 }
 
 /// Install the `pam-configs` profile with the embedded bytes.
-fn provision_profile(paths: &InstallPaths, rollback: &mut Rollback) -> anyhow::Result<PathBuf> {
+fn provision_profile(
+    paths: &InstallPaths,
+    rollback: &mut Rollback,
+    ui: &Ui,
+) -> anyhow::Result<PathBuf> {
     ensure_dir(
         &paths.pam_configs,
         0o755,
@@ -1068,7 +1087,7 @@ fn provision_profile(paths: &InstallPaths, rollback: &mut Rollback) -> anyhow::R
     if let Some(action) = undo {
         rollback.push(action);
     }
-    println!("  profile:     {}", dest.display());
+    detail!(ui, "  profile:     {}", dest.display());
     Ok(dest)
 }
 
@@ -1114,6 +1133,7 @@ fn provision_cli(
     paths: &InstallPaths,
     source: &Path,
     rollback: &mut Rollback,
+    ui: &Ui,
 ) -> anyhow::Result<PathBuf> {
     ensure_bin_dir(&paths.bin_dir, paths.owner_uid, rollback, "bin directory")?;
     let dest = paths.bin_dir.join(CLI_NAME);
@@ -1135,7 +1155,7 @@ fn provision_cli(
             CLI_MODE
         );
     }
-    println!("  cli:         {}", dest.display());
+    detail!(ui, "  cli:         {}", dest.display());
     Ok(dest)
 }
 
@@ -1288,7 +1308,11 @@ pub(crate) fn detect_legacy(paths: &InstallPaths) -> Legacy {
 ///
 /// This runs *after* [`Rollback::commit`], so a later failure can never roll the rewrite
 /// back into the stale `pam_wsl_hello` state.
-fn migrate_rewrite_pam_d(paths: &InstallPaths, prompter: &dyn Prompter) -> anyhow::Result<usize> {
+fn migrate_rewrite_pam_d(
+    paths: &InstallPaths,
+    prompter: &dyn Prompter,
+    ui: &Ui,
+) -> anyhow::Result<usize> {
     if !paths.pam_d.is_dir() {
         return Ok(0);
     }
@@ -1310,7 +1334,7 @@ fn migrate_rewrite_pam_d(paths: &InstallPaths, prompter: &dyn Prompter) -> anyho
             continue;
         };
         if md.file_type().is_symlink() {
-            println!("  skipping symlinked pam.d file {}", path.display());
+            detail!(ui, "  skipping symlinked pam.d file {}", path.display());
             continue;
         }
         if !md.is_file() {
@@ -1338,7 +1362,7 @@ fn migrate_rewrite_pam_d(paths: &InstallPaths, prompter: &dyn Prompter) -> anyho
             path.display()
         );
         if !prompter.confirm(&question, true)? {
-            println!("  left {} unchanged", path.display());
+            detail!(ui, "  left {} unchanged", path.display());
             continue;
         }
         if !unsafe_controls.is_empty() {
@@ -1359,7 +1383,8 @@ fn migrate_rewrite_pam_d(paths: &InstallPaths, prompter: &dyn Prompter) -> anyho
                 true,
             )?;
             if !normalize {
-                println!(
+                detail!(
+                    ui,
                     "  left {} unchanged: its unsafe control needs manual repair",
                     path.display()
                 );
@@ -1372,7 +1397,12 @@ fn migrate_rewrite_pam_d(paths: &InstallPaths, prompter: &dyn Prompter) -> anyho
             .with_context(|| format!("writing backup {}", backup.display()))?;
         fsutil::atomic_write(&path, &updated, mode)
             .with_context(|| format!("rewriting {}", path.display()))?;
-        println!("  rewrote {} (backup {})", path.display(), backup.display());
+        detail!(
+            ui,
+            "  rewrote {} (backup {})",
+            path.display(),
+            backup.display()
+        );
         rewritten += 1;
     }
     Ok(rewritten)
@@ -1386,10 +1416,12 @@ fn migrate_remove_legacy(
     prompter: &dyn Prompter,
     pam_auth_update: bool,
     non_interactive: bool,
+    ui: &Ui,
 ) -> anyhow::Result<()> {
     if legacy.profile.is_some() {
         if !pam_auth_update {
-            println!(
+            detail!(
+                ui,
                 "  `pam-auth-update` not found; deregister the legacy profile by removing \
                  its file below (or by hand)."
             );
@@ -1403,7 +1435,7 @@ fn migrate_remove_legacy(
                 non_interactive,
             ) {
                 Ok(status) if status.success => {
-                    println!("  pam-auth-update --remove wsl-hello: done");
+                    detail!(ui, "  pam-auth-update --remove wsl-hello: done");
                 }
                 Ok(status) => eprintln!(
                     "warning: pam-auth-update --remove wsl-hello exited {:?}",
@@ -1421,7 +1453,7 @@ fn migrate_remove_legacy(
         )?
     {
         match fsutil::remove_file(profile) {
-            Ok(()) => println!("  removed {}", profile.display()),
+            Ok(()) => detail!(ui, "  removed {}", profile.display()),
             Err(e) => eprintln!("warning: could not remove {}: {e}", profile.display()),
         }
     }
@@ -1431,7 +1463,7 @@ fn migrate_remove_legacy(
             true,
         )? {
             match fsutil::remove_file(module) {
-                Ok(()) => println!("  removed {}", module.display()),
+                Ok(()) => detail!(ui, "  removed {}", module.display()),
                 Err(e) => eprintln!("warning: could not remove {}: {e}", module.display()),
             }
         }
@@ -1443,7 +1475,7 @@ fn migrate_remove_legacy(
         )?
     {
         match fsutil::remove_tree(dir) {
-            Ok(()) => println!("  removed {}", dir.display()),
+            Ok(()) => detail!(ui, "  removed {}", dir.display()),
             Err(e) => eprintln!("warning: could not remove {}: {e}", dir.display()),
         }
     }
@@ -1470,9 +1502,9 @@ fn manual_enable_steps(paths: &InstallPaths) -> Vec<String> {
 }
 
 /// Print [`manual_enable_steps`].
-fn print_manual_enable_steps(paths: &InstallPaths) {
+fn print_manual_enable_steps(paths: &InstallPaths, ui: &Ui) {
     for line in manual_enable_steps(paths) {
-        println!("{line}");
+        status!(ui, "{line}");
     }
 }
 
@@ -1494,9 +1526,10 @@ pub(crate) fn enable_profile(
     commands: &dyn CommandRunner,
     pam_auth_update: bool,
     non_interactive: bool,
+    ui: &Ui,
 ) -> anyhow::Result<bool> {
     if !pam_auth_update {
-        print_manual_enable_steps(paths);
+        print_manual_enable_steps(paths, ui);
         return Ok(false);
     }
     match commands.run(
@@ -1505,7 +1538,10 @@ pub(crate) fn enable_profile(
         non_interactive,
     ) {
         Ok(status) if status.success => {
-            println!("Enabled the PAM profile (`pam-auth-update --enable wsl-webauthn`).");
+            status!(
+                ui,
+                "Enabled the PAM profile (`pam-auth-update --enable wsl-webauthn`)."
+            );
             Ok(true)
         }
         Ok(status) => {
@@ -1527,34 +1563,70 @@ pub(crate) fn enable_profile(
 ///
 /// WSL has no virtual console to fall back to, so the recovery path is a Windows-side
 /// root shell; for non-WSL Linux the classic TTY route is offered too.
-fn print_lockout_guidance(enroll_cmd: &str) {
-    println!();
-    println!("Lockout safety:");
-    println!("  * Once enabled, the profile is fail-through ([success=end default=ignore]):");
-    println!("    a failed or absent Hello attempt falls back to the next method, normally");
-    println!("    your password. Keep the account's local password working.");
-    println!("  * The profile is not enabled yet; run `sudo pam-auth-update` and");
-    println!("    select \"WSL WebAuthn authentication\" when you are ready.");
-    println!("  * Enroll a credential before relying on the module: `sudo {enroll_cmd} enroll`");
-    println!("  * Manual alternative (add to /etc/pam.d/common-auth above the password line):");
-    println!("        auth sufficient pam_wsl_webauthn.so");
-    println!("  * If sudo/su breaks, recover from outside the broken login:");
-    println!("      WSL: from a Windows terminal, open a root shell for this distro;");
-    println!("           it bypasses PAM entirely:");
-    println!("             wsl.exe -d <distro> -u root");
-    println!("             # then edit /etc/pam.d/* (or run");
-    println!("             #   pam-auth-update --remove wsl-webauthn)");
-    println!("      Other Linux: sign in on another TTY/console (Ctrl-Alt-F2) and");
-    println!("           remove that line.");
+fn print_lockout_guidance(enroll_cmd: &str, ui: &Ui) {
+    status!(ui, "");
+    status!(ui, "Lockout safety:");
+    status!(
+        ui,
+        "  * Once enabled, the profile is fail-through ([success=end default=ignore]):"
+    );
+    status!(
+        ui,
+        "    a failed or absent Hello attempt falls back to the next method, normally"
+    );
+    status!(
+        ui,
+        "    your password. Keep the account's local password working."
+    );
+    status!(
+        ui,
+        "  * The profile is not enabled yet; run `sudo pam-auth-update` and"
+    );
+    status!(
+        ui,
+        "    select \"WSL WebAuthn authentication\" when you are ready."
+    );
+    status!(
+        ui,
+        "  * Enroll a credential before relying on the module: `sudo {enroll_cmd} enroll`"
+    );
+    status!(
+        ui,
+        "  * Manual alternative (add to /etc/pam.d/common-auth above the password line):"
+    );
+    status!(ui, "        auth sufficient pam_wsl_webauthn.so");
+    status!(
+        ui,
+        "  * If sudo/su breaks, recover from outside the broken login:"
+    );
+    status!(
+        ui,
+        "      WSL: from a Windows terminal, open a root shell for this distro;"
+    );
+    status!(ui, "           it bypasses PAM entirely:");
+    status!(ui, "             wsl.exe -d <distro> -u root");
+    status!(ui, "             # then edit /etc/pam.d/* (or run");
+    status!(
+        ui,
+        "             #   pam-auth-update --remove wsl-webauthn)"
+    );
+    status!(
+        ui,
+        "      Other Linux: sign in on another TTY/console (Ctrl-Alt-F2) and"
+    );
+    status!(ui, "           remove that line.");
 }
 
 /// Print the one-line success message after enrollment and a successful enable.
-fn print_enable_success(enroll_cmd: &str) {
-    println!();
-    println!("Done. `sudo` now uses Windows Hello.");
-    println!("  If you decline the Hello prompt, sudo falls back to your password.");
-    println!("  Test it:  sudo -k; sudo true");
-    println!("  Add another user later:  sudo {enroll_cmd} enroll");
+fn print_enable_success(enroll_cmd: &str, ui: &Ui) {
+    status!(ui, "");
+    status!(ui, "Done. `sudo` now uses Windows Hello.");
+    status!(
+        ui,
+        "  If you decline the Hello prompt, sudo falls back to your password."
+    );
+    status!(ui, "  Test it:  sudo -k; sudo true");
+    status!(ui, "  Add another user later:  sudo {enroll_cmd} enroll");
 }
 
 /// Enable the PAM profile after a successful standalone `enroll`.
@@ -1565,19 +1637,29 @@ fn print_enable_success(enroll_cmd: &str) {
 pub(crate) fn enable_after_enroll(
     commands: &dyn CommandRunner,
     pam_auth_update: bool,
+    ui: &Ui,
 ) -> anyhow::Result<()> {
     let paths = InstallPaths::system();
-    let enabled = enable_profile(&paths, commands, pam_auth_update, false)?;
+    let enabled = enable_profile(&paths, commands, pam_auth_update, false, ui)?;
     if enabled {
         let enroll_cmd = paths.bin_dir.join(CLI_NAME);
-        print_enable_success(&enroll_cmd.display().to_string());
+        print_enable_success(&enroll_cmd.display().to_string(), ui);
     } else if pam_auth_update {
         // enable_profile's helper call failed (non-zero exit or spawn error), or the
         // profile is not registered with pam-auth-update (e.g. a manual install).
-        println!();
-        println!("The credential is enrolled, but the PAM profile is not enabled.");
-        println!("Enable it with `sudo pam-auth-update --enable wsl-webauthn`, or add");
-        println!("`auth sufficient pam_wsl_webauthn.so` to the relevant /etc/pam.d service.");
+        status!(ui, "");
+        status!(
+            ui,
+            "The credential is enrolled, but the PAM profile is not enabled."
+        );
+        status!(
+            ui,
+            "Enable it with `sudo pam-auth-update --enable wsl-webauthn`, or add"
+        );
+        status!(
+            ui,
+            "`auth sufficient pam_wsl_webauthn.so` to the relevant /etc/pam.d service."
+        );
     }
     // When `pam-auth-update` is absent, enable_profile already printed the manual
     // `/etc/pam.d` steps.
@@ -1624,7 +1706,10 @@ fn print_dry_run(paths: &InstallPaths, module_dir: &Path, pam_auth_update: bool)
              (after a successful enrollment)"
         );
     } else {
-        print_manual_enable_steps(paths);
+        // `--dry-run` output is a complete plan and is not verbosity-gated; print the
+        // manual steps at `Normal` even when `--quiet` was also passed.
+        let ui = Ui::new(crate::Verbosity::Normal);
+        print_manual_enable_steps(paths, &ui);
     }
     // Name the installed CLI so a `--dry-run` shows the real post-install command.
     println!("  cli:         {}", paths.bin_dir.join(CLI_NAME).display());
@@ -1662,10 +1747,10 @@ fn next_steps_lines(enroll_cmd: &str, enrolled: bool, pam_auth_update: bool) -> 
 }
 
 /// Print what the operator must do next.
-fn print_next_steps(enroll_cmd: &str, enrolled: bool, pam_auth_update: bool) {
-    println!();
+fn print_next_steps(enroll_cmd: &str, enrolled: bool, pam_auth_update: bool, ui: &Ui) {
+    status!(ui, "");
     for line in next_steps_lines(enroll_cmd, enrolled, pam_auth_update) {
-        println!("{line}");
+        status!(ui, "{line}");
     }
 }
 
@@ -1681,17 +1766,29 @@ pub(crate) fn install_with(
     prompter: &dyn Prompter,
     enroller: &dyn Enroller,
     opts: &InstallOptions,
+    ui: &Ui,
 ) -> anyhow::Result<i32> {
     let win_mnt = resolve_win_mnt(paths, opts.win_mnt.as_deref());
     let artifacts = resolve_artifacts(opts.artifact_dir.as_deref())?;
     let module_dir = resolve_module_dir(paths, opts.module_dir.as_deref())?;
 
-    println!("wsl-webauthn-pam installer");
-    println!("  win_mnt:     {}", win_mnt.display());
-    println!("  module dir:  {}", module_dir.display());
-    println!("  module src:  {}", artifacts.module.display());
-    println!("  bridge src:  {}", artifacts.bridge.display());
-    println!();
+    // `--dry-run` output is its own contract (see `print_dry_run`): keep its header
+    // unconditional so the plan stays complete regardless of verbosity.
+    if opts.dry_run {
+        println!("wsl-webauthn-pam installer");
+        println!("  win_mnt:     {}", win_mnt.display());
+        println!("  module dir:  {}", module_dir.display());
+        println!("  module src:  {}", artifacts.module.display());
+        println!("  bridge src:  {}", artifacts.bridge.display());
+        println!();
+    } else {
+        detail!(ui, "wsl-webauthn-pam installer");
+        detail!(ui, "  win_mnt:     {}", win_mnt.display());
+        detail!(ui, "  module dir:  {}", module_dir.display());
+        detail!(ui, "  module src:  {}", artifacts.module.display());
+        detail!(ui, "  bridge src:  {}", artifacts.bridge.display());
+        detail!(ui, "");
+    }
 
     // Detect `pam-auth-update` up front (it may be absent on RHEL/Fedora), so the flow
     // can print manual `/etc/pam.d` steps instead of a bare warning.
@@ -1711,17 +1808,17 @@ pub(crate) fn install_with(
         eprintln!("warning: interop sanity check (`whoami.exe`) failed: {e}");
         eprintln!("         (continuing; the same interop is used for the bridge at enroll time)");
     }
-    let bridge_dest = provision_bridge(interop, &win_mnt, &artifacts.bridge, &mut rollback)?;
+    let bridge_dest = provision_bridge(interop, &win_mnt, &artifacts.bridge, &mut rollback, ui)?;
     // 2. Linux config + credentials dir.
-    provision_config(paths, &win_mnt, &bridge_dest, &mut rollback)?;
+    provision_config(paths, &win_mnt, &bridge_dest, &mut rollback, ui)?;
     // 3. Our own CLI, so the guidance printed later names a command that exists. The
     // running executable is the binary the operator invoked.
     let running_cli =
         std::env::current_exe().context("resolving the running CLI to install it to PATH")?;
-    let cli_dest = provision_cli(paths, &running_cli, &mut rollback)?;
+    let cli_dest = provision_cli(paths, &running_cli, &mut rollback, ui)?;
     // 4. New module and profile FIRST (a stale reference would mean lockout).
-    let module_dest = provision_module(&module_dir, &artifacts.module, &mut rollback)?;
-    let profile_dest = provision_profile(paths, &mut rollback)?;
+    let module_dest = provision_module(&module_dir, &artifacts.module, &mut rollback, ui)?;
+    let profile_dest = provision_profile(paths, &mut rollback, ui)?;
     // 5. Verify before touching anything legacy.
     verify_installed(
         paths,
@@ -1730,8 +1827,8 @@ pub(crate) fn install_with(
         &profile_dest,
         &bridge_dest,
     )?;
-    println!();
-    println!("Installed and verified {}.", module_dest.display());
+    detail!(ui, "");
+    detail!(ui, "Installed and verified {}.", module_dest.display());
 
     // The provisioning is complete and verified. Commit the rollback here: every step
     // after this point (legacy cleanup, prompts, enrollment) must never be undone by
@@ -1744,22 +1841,25 @@ pub(crate) fn install_with(
     // 6. Legacy migration, only after our module/profile are verified.
     let legacy = detect_legacy(paths);
     if legacy.is_present() {
-        println!();
-        println!("Legacy WSL-Hello-sudo installation detected:");
+        detail!(ui, "");
+        detail!(ui, "Legacy WSL-Hello-sudo installation detected:");
         for module in &legacy.modules {
-            println!("  legacy module: {}", module.display());
+            detail!(ui, "  legacy module: {}", module.display());
         }
         if let Some(dir) = &legacy.config_dir {
-            println!("  legacy config: {}", dir.display());
+            detail!(ui, "  legacy config: {}", dir.display());
         }
         if let Some(profile) = &legacy.profile {
-            println!("  legacy profile: {}", profile.display());
+            detail!(ui, "  legacy profile: {}", profile.display());
         }
-        println!("The legacy PEM trust anchor is NEVER imported; a fresh enrollment is required.");
+        detail!(
+            ui,
+            "The legacy PEM trust anchor is NEVER imported; a fresh enrollment is required."
+        );
         // (a) rewrite /etc/pam.d references BEFORE any old-module removal.
-        let rewritten = migrate_rewrite_pam_d(paths, prompter)?;
+        let rewritten = migrate_rewrite_pam_d(paths, prompter, ui)?;
         if rewritten > 0 {
-            println!("Rewrote {rewritten} pam.d file(s).");
+            detail!(ui, "Rewrote {rewritten} pam.d file(s).");
         }
         // (b)/(c) deregister the profile and remove the old module/config.
         migrate_remove_legacy(
@@ -1768,10 +1868,14 @@ pub(crate) fn install_with(
             prompter,
             pam_auth_update,
             opts.non_interactive,
+            ui,
         )?;
-        println!();
-        println!("Legacy cleanup complete. A FRESH enrollment is required (old credentials");
-        println!("are not migrated): run `sudo {enroll_cmd}`.");
+        detail!(ui, "");
+        detail!(
+            ui,
+            "Legacy cleanup complete. A FRESH enrollment is required (old credentials"
+        );
+        detail!(ui, "are not migrated): run `sudo {enroll_cmd}`.");
     }
 
     // 7. Offer to set up Windows Hello (enroll + enable) as a single action.
@@ -1782,50 +1886,51 @@ pub(crate) fn install_with(
     // password line if the credential is later unusable.
     if opts.skip_enroll {
         // Provision only; a later `enroll` enables the profile on success.
-        print_lockout_guidance(&enroll_cmd);
-        print_next_steps(&enroll_cmd, false, pam_auth_update);
+        print_lockout_guidance(&enroll_cmd, ui);
+        print_next_steps(&enroll_cmd, false, pam_auth_update, ui);
         return Ok(EXIT_OK);
     }
 
-    println!();
+    status!(ui, "");
     let enroll_now = prompter.confirm(
         "Set up Windows Hello for sudo now (enroll a credential and enable it)?",
         true,
     )?;
     if !enroll_now {
-        print_lockout_guidance(&enroll_cmd);
-        print_next_steps(&enroll_cmd, false, pam_auth_update);
+        print_lockout_guidance(&enroll_cmd, ui);
+        print_next_steps(&enroll_cmd, false, pam_auth_update, ui);
         return Ok(EXIT_OK);
     }
 
     // Invoke the enrollment logic in-process. The config and bridge installed above are
     // what `cmd_enroll` resolves.
-    println!();
+    status!(ui, "");
     match enroller.enroll(opts.allow_unattested) {
         Ok(EXIT_OK) => {
             // Enable only now that a credential exists. If enabling fails, the profile
             // stays off and the manual steps below are the fix.
-            let enabled = enable_profile(paths, commands, pam_auth_update, opts.non_interactive)?;
+            let enabled =
+                enable_profile(paths, commands, pam_auth_update, opts.non_interactive, ui)?;
             if enabled {
-                print_enable_success(&enroll_cmd);
+                print_enable_success(&enroll_cmd, ui);
                 Ok(EXIT_OK)
             } else {
-                print_lockout_guidance(&enroll_cmd);
-                print_next_steps(&enroll_cmd, true, pam_auth_update);
+                print_lockout_guidance(&enroll_cmd, ui);
+                print_next_steps(&enroll_cmd, true, pam_auth_update, ui);
                 Ok(EXIT_OK)
             }
         }
         Ok(code) => {
             // Enrollment reported an operational failure (it prints its own reason).
             eprintln!("warning: enrollment did not complete; the profile is left disabled.");
-            print_lockout_guidance(&enroll_cmd);
-            print_next_steps(&enroll_cmd, false, pam_auth_update);
+            print_lockout_guidance(&enroll_cmd, ui);
+            print_next_steps(&enroll_cmd, false, pam_auth_update, ui);
             Ok(code)
         }
         Err(error) => {
             eprintln!("warning: enrollment failed: {error:#}");
-            print_lockout_guidance(&enroll_cmd);
-            print_next_steps(&enroll_cmd, false, pam_auth_update);
+            print_lockout_guidance(&enroll_cmd, ui);
+            print_next_steps(&enroll_cmd, false, pam_auth_update, ui);
             Ok(EXIT_FAIL)
         }
     }
@@ -1836,20 +1941,23 @@ pub(crate) fn cmd_install(
     opts: InstallOptions,
     assume_yes: bool,
     non_interactive: bool,
+    ui: &Ui,
 ) -> anyhow::Result<i32> {
     crate::require_root("install")?;
     let paths = InstallPaths::system();
     let prompter = StdPrompter {
         assume_yes,
         non_interactive,
+        ui,
     };
     install_with(
         &paths,
         &RealInterop,
         &RealCommands,
         &prompter,
-        &RealEnroller,
+        &RealEnroller { ui },
         &opts,
+        ui,
     )
 }
 
@@ -2223,9 +2331,12 @@ pub(crate) fn cmd_uninstall(
     non_interactive: bool,
 ) -> anyhow::Result<i32> {
     crate::require_root("uninstall")?;
+    // `uninstall` is not verbosity-gated; a default `Ui` keeps its prompt echo unchanged.
+    let ui = Ui::default();
     let prompter = StdPrompter {
         assume_yes: yes,
         non_interactive,
+        ui: &ui,
     };
     if all {
         let paths = InstallPaths::system();
