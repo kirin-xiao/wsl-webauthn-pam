@@ -276,8 +276,28 @@ impl Harness {
         commands: &dyn CommandRunner,
         opts: &InstallOptions,
     ) -> anyhow::Result<i32> {
+        self.run_install_with(opts, prompter, enroller, commands, &Ui::default())
+    }
+
+    /// Like [`Harness::run_install`] but with an explicit [`Ui`], for verbosity tests.
+    fn run_install_with(
+        &self,
+        opts: &InstallOptions,
+        prompter: &dyn Prompter,
+        enroller: &dyn Enroller,
+        commands: &dyn CommandRunner,
+        ui: &Ui,
+    ) -> anyhow::Result<i32> {
         let interop = self.interop();
-        install_with(&self.paths, &interop, commands, prompter, enroller, opts)
+        install_with(
+            &self.paths,
+            &interop,
+            commands,
+            prompter,
+            enroller,
+            opts,
+            ui,
+        )
     }
 }
 
@@ -333,6 +353,7 @@ fn install_reads_win_mnt_from_wsl_conf() {
         &ScriptedPrompter::always(true),
         &MockEnroller::default(),
         &opts,
+        &Ui::default(),
     )
     .unwrap();
 
@@ -581,6 +602,156 @@ fn install_provisions_everything() {
     );
 }
 
+/// `--quiet` must not change what the install *does*: the same artifacts and the same
+/// helper calls, only the stdout narration is suppressed. Runs Normal then Quiet against
+/// the *same* harness so path-bearing files (the config) are directly comparable.
+#[test]
+fn quiet_install_provisions_identically_and_still_enrolls() {
+    let h = Harness::new();
+
+    let mut opts = h.opts();
+    opts.skip_enroll = false;
+    let normal_code = h
+        .run_install_with(
+            &opts,
+            &ScriptedPrompter::always(true),
+            &MockEnroller::default(),
+            &MockCommands {
+                success: true,
+                ..MockCommands::default()
+            },
+            &Ui::new(crate::Verbosity::Normal),
+        )
+        .unwrap();
+    assert_eq!(normal_code, EXIT_OK);
+
+    // Snapshot everything the installer wrote.
+    let files = [
+        h.paths.config_path(),
+        h.module_dir.join(MODULE_NAME),
+        h.paths.profile_path(),
+        h.paths.bin_dir.join(CLI_NAME),
+    ];
+    let before: Vec<(PathBuf, Vec<u8>, u32)> = files
+        .iter()
+        .map(|p| (p.clone(), std::fs::read(p).unwrap(), mode_of(p)))
+        .collect();
+    let creds_mode = mode_of(&h.paths.credentials_dir());
+
+    // Re-run the identical flow at Quiet.
+    let quiet_enroller = MockEnroller::default();
+    let quiet_commands = MockCommands {
+        success: true,
+        ..MockCommands::default()
+    };
+    let quiet_code = h
+        .run_install_with(
+            &opts,
+            &ScriptedPrompter::always(true),
+            &quiet_enroller,
+            &quiet_commands,
+            &Ui::new(crate::Verbosity::Quiet),
+        )
+        .unwrap();
+    assert_eq!(quiet_code, EXIT_OK);
+    // Enrollment still happened under `--quiet` (the in-process enroller ran).
+    assert!(
+        !quiet_enroller.called.borrow().is_empty(),
+        "quiet must not skip enrollment"
+    );
+    // The enable helper still ran.
+    assert!(
+        quiet_commands
+            .calls
+            .borrow()
+            .iter()
+            .any(|(p, _)| p == "pam-auth-update"),
+        "quiet must not skip enabling"
+    );
+    // Every provisioned file is byte- and mode-identical to the normal run.
+    for (path, bytes, mode) in before {
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "contents differ for {}",
+            path.display()
+        );
+        assert_eq!(mode_of(&path), mode, "mode differs for {}", path.display());
+    }
+    assert_eq!(
+        mode_of(&h.paths.credentials_dir()),
+        creds_mode,
+        "credentials dir mode differs"
+    );
+}
+
+/// `--quiet` must actually suppress stdout (not just avoid changing behavior), and `-v`
+/// must add detail. Uses the test-only capture sink on [`Ui`].
+#[test]
+fn verbosity_actually_gates_stdout() {
+    // `skip_enroll` ends the flow with the `Lockout safety:` / next-steps status blocks.
+    let quiet = Harness::new();
+    let (code, quiet_lines) = crate::capture_status_lines(|| {
+        quiet
+            .run_install_with(
+                &quiet.opts(),
+                &ScriptedPrompter::always(true),
+                &MockEnroller::default(),
+                &MockCommands::default(),
+                &Ui::new(crate::Verbosity::Quiet),
+            )
+            .unwrap()
+    });
+    assert_eq!(code, EXIT_OK);
+    assert!(
+        quiet_lines.is_empty(),
+        "quiet install emitted stdout: {quiet_lines:?}"
+    );
+
+    let normal = Harness::new();
+    let (_, normal_lines) = crate::capture_status_lines(|| {
+        normal
+            .run_install_with(
+                &normal.opts(),
+                &ScriptedPrompter::always(true),
+                &MockEnroller::default(),
+                &MockCommands::default(),
+                &Ui::new(crate::Verbosity::Normal),
+            )
+            .unwrap()
+    });
+    assert!(
+        normal_lines.iter().any(|l| l.contains("Lockout safety")),
+        "normal install must print actionable status: {normal_lines:?}"
+    );
+    // The provisioning header and per-path lines are detail, not status.
+    assert!(
+        !normal_lines.iter().any(|l| l.contains("bridge src")),
+        "normal must not print detail: {normal_lines:?}"
+    );
+
+    let verbose = Harness::new();
+    let (_, verbose_lines) = crate::capture_status_lines(|| {
+        verbose
+            .run_install_with(
+                &verbose.opts(),
+                &ScriptedPrompter::always(true),
+                &MockEnroller::default(),
+                &MockCommands::default(),
+                &Ui::new(crate::Verbosity::Verbose),
+            )
+            .unwrap()
+    });
+    assert!(
+        verbose_lines.iter().any(|l| l.contains("bridge src")),
+        "verbose must print the header detail: {verbose_lines:?}"
+    );
+    assert!(
+        verbose_lines.iter().any(|l| l.contains("config:")),
+        "verbose must print per-path detail: {verbose_lines:?}"
+    );
+}
+
 /// The post-install guidance must name the installed absolute path, so the printed
 /// command is runnable regardless of `PATH`.
 #[test]
@@ -671,7 +842,14 @@ fn provision_config_writes_store_serialized_toml() {
     let h = Harness::new();
     // `provision_config` needs the config directory's parent to exist; the harness root does.
     let mut rollback = Rollback::new();
-    provision_config(&h.paths, &h.win_mnt, &h.bridge_dest(), &mut rollback).unwrap();
+    provision_config(
+        &h.paths,
+        &h.win_mnt,
+        &h.bridge_dest(),
+        &mut rollback,
+        &Ui::default(),
+    )
+    .unwrap();
 
     let expected = wsl_webauthn_store::Config {
         bridge_path: h.bridge_dest(),
@@ -849,7 +1027,7 @@ fn enable_after_enroll_calls_pam_auth_update() {
         success: true,
         ..MockCommands::default()
     };
-    enable_after_enroll(&commands, true).unwrap();
+    enable_after_enroll(&commands, true, &Ui::default()).unwrap();
     assert!(
         commands.calls.borrow().iter().any(|(p, a)| {
             p == "pam-auth-update" && a == &["--enable".to_string(), PROFILE_NAME.to_string()]

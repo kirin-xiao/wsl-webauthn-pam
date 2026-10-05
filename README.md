@@ -122,6 +122,12 @@ invoking one. The profile is deliberately enabled **only after a credential is
 verified**; a skipped, declined, or failed enrollment leaves it disabled and
 prints the exact recovery commands.
 
+`enroll` and `install` print only actionable status by default. Add
+`-v`/`--verbose` to see the resolved config and each provisioning step, or
+`--quiet`/`-q` to suppress all non-error status in scripts. The two are mutually
+exclusive and are accepted only by `enroll`/`install`; `probe`/`status`/`verify`
+and `--dry-run` always print their full output.
+
 ### From source
 
 ```sh
@@ -293,8 +299,8 @@ code is `0` on success, `1` on operational failure, `2` on usage error.
 
 | Command | What it does | Root? | Key options |
 |---|---|---|---|
-| `install` | Provision the bridge, config, module, profile, and CLI | yes | `--skip-enroll`, `--dry-run`, `--yes`, `--non-interactive`, `--allow-unattested`, `--artifact-dir`, `--module-dir`, `--win-mnt` |
-| `enroll` | Run the Windows Hello ceremony for one Linux user, then enable the profile | yes | `--replace`, `--allow-unattested`, `--no-enable`, `--user <NAME>` |
+| `install` | Provision the bridge, config, module, profile, and CLI | yes | `--skip-enroll`, `--dry-run`, `--yes`, `--non-interactive`, `--allow-unattested`, `--artifact-dir`, `--module-dir`, `--win-mnt`, `-v`/`--quiet` |
+| `enroll` | Run the Windows Hello ceremony for one Linux user, then enable the profile | yes | `--replace`, `--allow-unattested`, `--no-enable`, `--user <NAME>`, `-v`/`--quiet` |
 | `unregister` | Remove one user's credential record | yes | `--user <NAME>`, `--yes` |
 | `uninstall` | Remove a credential or all components | yes | `--user <NAME>` or `--all` (also removes the CLI), `--yes`, `--non-interactive` |
 | `probe` | Report interop and Hello availability, check the bridge pin | no | `--bridge`, `--win-mnt` |
