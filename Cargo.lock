@@ -1059,7 +1059,7 @@ checksum = "f17a85883d4e6d00e8a97c586de764dabcc06133f7f1d55dce5cdc070ad7fe59"
 
 [[package]]
 name = "wsl-webauthn-bridge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde_json",
  "wsl-webauthn-protocol",
@@ -1067,7 +1067,7 @@ dependencies = [
 
 [[package]]
 name = "wsl-webauthn-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "ciborium",
@@ -1085,7 +1085,7 @@ dependencies = [
 
 [[package]]
 name = "wsl-webauthn-pam"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ciborium",
  "libc",
@@ -1102,7 +1102,7 @@ dependencies = [
 
 [[package]]
 name = "wsl-webauthn-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "serde",
@@ -1112,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "wsl-webauthn-runner"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "serde_json",
@@ -1125,7 +1125,7 @@ dependencies = [
 
 [[package]]
 name = "wsl-webauthn-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "serde",
@@ -1138,7 +1138,7 @@ dependencies = [
 
 [[package]]
 name = "wsl-webauthn-verifier"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "ciborium",

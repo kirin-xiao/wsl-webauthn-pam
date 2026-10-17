@@ -38,10 +38,29 @@ endif
 
 # The local release layout mirrors release.yaml exactly — the tarball root is a
 # single `wsl-webauthn-pam-<version>-<arch>/` directory, and SHA256SUMS covers
-# the tarballs (not the files inside them).
+# the tarballs (not the files inside them). `make deb` builds the matching
+# Debian/Ubuntu package from the same binaries.
 PKG_DIR := wsl-webauthn-pam-$(VERSION)-$(ARCH)
 STAGE_DIR := build/$(PKG_DIR)
 TARBALL := build/$(PKG_DIR).tar.gz
+# Whichever bridge `make bridge` produced. The native `target/release` build wins
+# when present (that is what `bridge` does when `cargo.exe` is available), so a
+# stale leftover cross-build cannot be packaged by mistake. Recursive (`=`, not
+# `:=`) so it is evaluated after the prerequisites have actually built it.
+BRIDGE_EXE = $(firstword $(wildcard target/release/WSLWebAuthnBridge.exe target/$(GNU_TARGET)/release/WSLWebAuthnBridge.exe))
+
+# A Debian version may not contain '-', so a pre-release VERSION (0.2.0-rc1) maps
+# to 0.2.0~rc1, the same mapping release.yaml applies.
+DEB_VERSION := $(shell printf '%s' '$(VERSION)' | tr '-' '~')
+# The .deb's own architecture label and the multiarch security-directory triplet,
+# derived from the same single ARCH input the tarball name uses.
+DEB_ARCH_LABEL := $(if $(filter x86_64,$(ARCH)),amd64,arm64)
+PAM_TRIPLET := $(if $(filter x86_64,$(ARCH)),x86_64-linux-gnu,aarch64-linux-gnu)
+DEB_FILE := build/deb/wsl-webauthn-pam_$(DEB_VERSION)_$(DEB_ARCH_LABEL).deb
+
+# nfpm packs the .deb (and, later, rpm/apk/arch): a single static Go binary. It is
+# fetched and checksum-verified by the same pinned helper CI uses.
+NFPM ?= $(shell command -v nfpm 2>/dev/null || echo "$(HOME)/.local/bin/nfpm")
 
 # actionlint is not packaged everywhere; fetch a pinned release into ~/.local/bin.
 # The tarball is verified against a per-(os, arch) SHA-256 below, taken from the
@@ -52,7 +71,7 @@ ACTIONLINT ?= $(HOME)/.local/bin/actionlint
 
 WORKFLOWS := .github/workflows/ci.yaml .github/workflows/release.yaml
 
-.PHONY: all bridge test check fmt clippy deny machete pam-profile crlf lint-actions bootstrap shellcheck release clean
+.PHONY: all bridge test check fmt clippy deny machete pam-profile crlf lint-actions bootstrap shellcheck release deb clean
 
 # Default: Linux module + CLI (linked against libpam0g-dev) and the Windows exe.
 all:
@@ -112,7 +131,16 @@ pam-profile:
 shellcheck:
 	@if command -v shellcheck >/dev/null 2>&1; then \
 		shellcheck -s sh bootstrap.sh scripts/test-bootstrap.sh \
-			crates/wsl-webauthn-pam/tests/c_host/provision_and_drive.sh; \
+			crates/wsl-webauthn-pam/tests/c_host/provision_and_drive.sh \
+			.github/scripts/build-glibc-floor.sh \
+			.github/scripts/check-glibc-floor.sh \
+			.github/scripts/build-deb.sh \
+			.github/scripts/check-deb-layout.sh \
+			.github/scripts/build-apt-repo.sh \
+			.github/scripts/install-nfpm.sh \
+			packaging/debian/postinst \
+			packaging/debian/prerm \
+			packaging/debian/postrm; \
 		shellcheck -s bash spike/build_testrp.sh; \
 	else \
 		echo ">> shellcheck not installed; skipping (apt-get install shellcheck)"; \
@@ -185,6 +213,25 @@ release: all
 	@echo ">> release assembled: $(TARBALL)"
 	@echo ">> checksums:          build/SHA256SUMS"
 	@tar -tzf $(TARBALL) | head -1
+
+# Build the Debian/Ubuntu package from the host-built binaries. This uses the
+# host's glibc, not the release floor: the *released* .deb is assembled in the
+# glibc-2.31 container by release.yaml. Use this to inspect the package layout.
+deb: all $(NFPM)
+	@if [ -z "$(ARCH)" ]; then \
+		echo ">> unsupported host arch '$(HOST_ARCH)' (expected x86_64/amd64/aarch64/arm64)" >&2; \
+		exit 1; \
+	fi
+	@if [ -z "$(BRIDGE_EXE)" ]; then \
+		echo ">> WSLWebAuthnBridge.exe not found; run 'make bridge' first" >&2; exit 1; \
+	fi
+	@mkdir -p build/deb
+	sh .github/scripts/build-deb.sh $(ARCH) $(DEB_VERSION) target/release $(BRIDGE_EXE) build/deb
+	sh .github/scripts/check-deb-layout.sh $(DEB_FILE) $(PAM_TRIPLET)
+	@echo ">> deb: $(DEB_FILE)"
+
+$(NFPM):
+	sh .github/scripts/install-nfpm.sh "$(dir $(NFPM))"
 
 clean:
 	$(CARGO) clean

@@ -16,7 +16,7 @@ independent rewrite of
 [WSL-Hello-sudo](https://github.com/nullpo-head/WSL-Hello-sudo) (see
 [Prior art](#prior-art)).
 
-> **Status.** 0.1.0 is the initial release. Windows Hello credentials from
+> **Status.** 0.2.0 is the current release. Windows Hello credentials from
 > WSL-Hello-sudo are **not** migrated: the legacy key is never imported and
 > every user re-enrolls from scratch.
 
@@ -41,7 +41,7 @@ Pass options through to the installer, or pin a release:
 
 ```sh
 curl -fsSL .../bootstrap.sh | sudo bash -s -- --allow-unattested
-curl -fsSL .../bootstrap.sh | sudo bash -s -- --version v0.1.0
+curl -fsSL .../bootstrap.sh | sudo bash -s -- --version v0.2.0
 ```
 
 To read the script before running it:
@@ -100,6 +100,53 @@ pam-auth-update --remove wsl-webauthn   # or: edit /etc/pam.d/* by hand
   `libpam0g-dev` on Debian/Ubuntu.
 
 ## Other ways to install
+
+### Debian/Ubuntu package (apt)
+
+A signed apt repository is published to GitHub Pages. Debian 11+ and Ubuntu
+20.04+ are supported (the binaries are built against glibc 2.31); `amd64` and
+`arm64` are both served.
+
+```sh
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://kirin-xiao.github.io/wsl-webauthn-pam/wsl-webauthn-pam-archive-keyring.gpg \
+  | sudo tee /etc/apt/keyrings/wsl-webauthn-pam.gpg >/dev/null
+sudo tee /etc/apt/sources.list.d/wsl-webauthn-pam.sources >/dev/null <<'EOF'
+Types: deb
+URIs: https://kirin-xiao.github.io/wsl-webauthn-pam
+Suites: stable
+Components: main
+Architectures: amd64 arm64
+Signed-By: /etc/apt/keyrings/wsl-webauthn-pam.gpg
+EOF
+sudo apt update && sudo apt install wsl-webauthn-pam
+```
+
+`apt` installs the Linux side only — the PAM module, the CLI, and the
+`pam-auth-update` profile (left disabled). The Windows bridge still has to reach
+the Windows side, and enrollment is still interactive, so run:
+
+```sh
+sudo wsl-webauthn-pam install --skip-enroll --artifact-dir /usr/lib/wsl-webauthn-pam
+sudo wsl-webauthn-pam enroll
+```
+
+`install` copies the bundled bridge onto the Windows side and writes
+`/etc/wsl_webauthn/config`; `--skip-enroll` keeps it from offering to enroll in
+the same step (which would make the following `enroll` fail with
+`already-exists`). `enroll` enables the profile once a credential is verified.
+
+Note that `install` also copies the CLI to `/usr/local/bin`, which shadows the
+packaged `/usr/bin` copy on `PATH` — harmless for operation, but a later
+`apt remove` does not remove that copy.
+
+To install a `.deb` straight from the release page instead:
+
+```sh
+curl -fsSLO https://github.com/kirin-xiao/wsl-webauthn-pam/releases/latest/download/wsl-webauthn-pam_0.2.0_amd64.deb
+gh attestation verify wsl-webauthn-pam_0.2.0_amd64.deb -R kirin-xiao/wsl-webauthn-pam  # optional
+sudo apt install ./wsl-webauthn-pam_0.2.0_amd64.deb
+```
 
 ### Two commands (pre-provision)
 

@@ -59,6 +59,10 @@ Consent phishing — making the user approve a ceremony they did not intend — 
 - **Compromised Windows session.** It already implies Linux root via `wsl.exe -u root`; the module is not a boundary against it (see [attacker capabilities](#2-attacker-with-a-compromised-windows-session)).
 - **Compromised TPM / platform.** Platform behavior is trusted as-is.
 - **Physical/OS-level attacks on Windows** below the WebAuthn boundary.
+- **Compromise of the release pipeline or the apt signing key.** A stolen
+  `APT_GPG_PRIVATE_KEY` or a compromised release workflow can distribute a
+  malicious package; the mitigations (protected environment, SLSA attestation,
+  pinned toolchain) reduce but do not eliminate this.
 
 ---
 
@@ -74,6 +78,8 @@ Consent phishing — making the user approve a ceremony they did not intend — 
 | AAGUID allow-list | `08987058-cadc-4b81-b6e1-30de50dcbe96` (software TPM), `9ddd1817-af5a-4672-a2b9-3e3dd95000a9` (hardware TPM) | `STRICT_AAGUIDS` |
 | Bridge binary | SHA-256 recorded at enrollment, re-checked on every authentication | credential record `bridge_sha256`; runner checks the held descriptor it executes (`Runner::expected_sha256`, `proc::TrustedFile::sha256`) |
 | COSE algorithms | `{-7 ES256, -257 RS256, -8 EdDSA}` | `crates/wsl-webauthn-verifier/src/cose.rs` |
+| apt signing key | one ed25519 key signs the repository's `InRelease`/`Release.gpg`; the public keyring is published at the repository root | CI secret `APT_GPG_PRIVATE_KEY` (scope it to the `github-pages` environment to require protection); `.github/scripts/build-apt-repo.sh` |
+| Release tool pins | `nfpm` 2.48.0 (per-arch SHA-256), `actionlint` 1.7.12, every action pinned to a commit SHA | `.github/scripts/install-nfpm.sh`, `Makefile`, `.github/workflows/` |
 
 `verify_attestation` always uses the pinned fingerprint; the bundled root certificate is trusted **only** after its bytes hash to that pin (`crates/wsl-webauthn-verifier/src/ms_root.rs`). A test-only seam (`verify_attestation_with_anchor`, under the `test-anchor` feature) substitutes a synthetic root for tests; downstream crates never enable it.
 
@@ -169,3 +175,10 @@ The RP ID is a **scoping/display** mechanism, not a browser-grade origin guarant
 - Builds use `--locked`; third-party CI actions are pinned to commit SHAs; `cargo-deny` checks advisories, licenses, and sources (`deny.toml`).
 - **RUSTSEC-2023-0071** (non-constant-time RSA private-key operations in `rsa`) is knowingly accepted: it reaches us only through public-key-only RS256 / attestation verification, no RSA private key exists in the project, and the PAM path is local and never network-reachable (rationale in `deny.toml`).
 - Real-machine attestation vectors are **never committed** — they contain machine-linked key material and live only in the git-ignored `tests/vectors/local/`.
+
+### Distribution integrity
+
+- **glibc floor.** The released Linux module and CLI are compiled inside Ubuntu 20.04 (glibc 2.31), not on the newest runner, and the built ELF is asserted against that floor (`.github/scripts/check-glibc-floor.sh`). A dependency that starts requiring a newer symbol fails the release instead of shipping a binary that cannot load on Debian 11 / Ubuntu 20.04.
+- **Two independent checks for the .deb.** apt authenticates the *index*: the repository metadata is GPG-signed (`InRelease` / `Release.gpg`) by a key stored only as a CI secret — scope it to the `github-pages` environment so the deploy job needs an approval — and users pin that key with `Signed-By=`. The *bytes* are authenticated separately by `actions/attest-build-provenance`; `gh attestation verify wsl-webauthn-pam_<version>_amd64.deb -R kirin-xiao/wsl-webauthn-pam` checks the SLSA provenance. Neither channel is trusted on its own. The keyring is fetched from the same origin as the repository, so a first install is trust-on-first-use; comparing the published key fingerprint out of band closes that.
+- **A package can never silently enroll.** `postinst` only registers the `Default: no` profile and prints the next step; it never edits `/etc/pam.d`, never runs the enrollment ceremony, and never fails when no Windows host is reachable. Binding a credential to a Windows account is always an explicit, interactive `enroll`.
+- **Package files vs installer files.** The package installs the module, the CLI (at `/usr/bin`), and the profile. The CLI's `install` subcommand is unchanged: it re-copies byte-identical module/profile files and additionally copies the CLI to `/usr/local/bin`, which shadows the packaged one on `PATH`. Bridge integrity is unchanged — the pin is recorded from the bytes `install` actually copies out of a root-owned artifact directory, so it detects a later swap of the running `.exe` rather than vouching for where those bytes came from.

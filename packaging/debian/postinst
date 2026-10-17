@@ -1,0 +1,27 @@
+#!/bin/sh
+# Debian/Ubuntu postinst: register the shipped pam-auth-update profile.
+#
+# This runs as root, non-interactively, and often with no Windows host in reach
+# (containers, image builds, CI). It must therefore never enroll, never edit
+# /etc/pam.d by hand, and never fail the install. The profile is `Default: no`,
+# so `--package` only records it: nothing is enabled until `enroll` has verified
+# a Windows Hello credential and turns it on.
+set -e
+
+case "${1:-}" in
+    configure)
+        if command -v pam-auth-update >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive pam-auth-update --package || true
+        fi
+
+        cat <<'EOF'
+wsl-webauthn-pam: installed, but not enabled yet.
+  Next:  sudo wsl-webauthn-pam install --skip-enroll --artifact-dir /usr/lib/wsl-webauthn-pam
+         sudo wsl-webauthn-pam enroll
+  `install` copies the Windows bridge onto the Windows side; `enroll` then
+  enables the profile after the Windows Hello ceremony succeeds.
+EOF
+        ;;
+esac
+
+exit 0

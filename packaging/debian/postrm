@@ -1,0 +1,19 @@
+#!/bin/sh
+# Debian/Ubuntu postrm: refresh the pam-auth-update stack after removal.
+#
+# The profile itself is deregistered earlier, by prerm (while the profile and the
+# module are still on disk). This is the follow-up sync once dpkg has removed the
+# files. /etc/wsl_webauthn (the config and per-user credential records) is
+# deliberately left in place: it is runtime state created by the CLI, not package
+# data, and removing a package must not destroy an enrolled credential.
+set -e
+
+case "${1:-}" in
+    remove | purge)
+        if command -v pam-auth-update >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive pam-auth-update --package || true
+        fi
+        ;;
+esac
+
+exit 0

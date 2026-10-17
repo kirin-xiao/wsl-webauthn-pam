@@ -10,7 +10,7 @@
 # Usage:
 #   curl -fsSL https://github.com/kirin-xiao/wsl-webauthn-pam/releases/latest/download/bootstrap.sh | sudo bash
 #   curl -fsSL .../releases/latest/download/bootstrap.sh | sudo bash -s -- --allow-unattested
-#   ./bootstrap.sh --version v0.1.0
+#   ./bootstrap.sh --version v0.2.0
 #
 # Anything after `--version <tag>` (or `--version=<tag>`) is forwarded to
 # `wsl-webauthn-pam install`. The `WSL_WEBAUTHN_VERSION` environment variable may
@@ -33,7 +33,7 @@ Usage:
   bootstrap.sh [--version <tag>] [install options...]
 
 Options:
-  --version <tag>   Install a specific release tag (e.g. v0.1.0).
+  --version <tag>   Install a specific release tag (e.g. v0.2.0).
                     Default: the latest release.
   -h, --help        Show this help.
 

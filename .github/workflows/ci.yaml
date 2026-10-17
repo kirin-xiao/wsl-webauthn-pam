@@ -17,6 +17,8 @@ name: CI
 #   windows     windows-latest (msvc): bridge clippy + unit tests
 #   windows-gnu ubuntu: cross-build WSLWebAuthnBridge.exe for x86_64-pc-windows-gnu
 #   aarch64     ubuntu-24.04-arm: native release build (really links the cdylib)
+#   package     linux: glibc-floor build, .deb build, and .deb install smoke
+#                      in Debian 12 / Ubuntu 22.04 containers
 #   cargo-deny  supply-chain: advisories / bans / licenses / sources
 #   machete     lint for genuinely unused manifest dependencies
 #   actionlint  lint the workflow YAML itself
@@ -318,6 +320,105 @@ jobs:
             || { echo "::error::$so is not an aarch64 object"; exit 1; }
           sha256sum "$so" target/release/wsl-webauthn-pam
 
+  # The shipped Linux artifacts carry a glibc floor (Ubuntu 20.04 / Debian 11,
+  # glibc 2.31). Building on `ubuntu-latest` would silently raise it to that
+  # runner's glibc and make the result unloadable on Debian 12 / Ubuntu 22.04 —
+  # exactly the distros the .deb exists for. So this job reproduces the release
+  # build in the floor container, asserts the ELF against the floor, then packages
+  # the .deb and *installs* it in the floor distro and the two just above it.
+  package:
+    name: linux (glibc floor + .deb install smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: build module + CLI (glibc 2.31 container)
+        run: sh .github/scripts/build-glibc-floor.sh
+
+      - name: assert the glibc floor
+        run: >
+          sh .github/scripts/check-glibc-floor.sh 2.31
+          target/release/libpam_wsl_webauthn.so
+          target/release/wsl-webauthn-pam
+
+      # The .deb stages the Windows bridge as the `--artifact-dir` the installer
+      # expects, so cross-build it the way the windows-gnu job does. The glibc
+      # container left `target/` root-owned, so the bridge build gets its own
+      # target directory (outside the workspace, which the job user owns).
+      - name: Install Rust + windows-gnu target
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Install mingw-w64
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+
+      - name: build bridge (x86_64-pc-windows-gnu)
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/bridge-target
+        run: >
+          cargo build --release --locked -p wsl-webauthn-bridge
+          --target x86_64-pc-windows-gnu
+
+      - name: install nfpm (pinned, checksum-verified)
+        run: |
+          set -eu
+          sh .github/scripts/install-nfpm.sh "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: build the .deb
+        run: |
+          set -eu
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          sh .github/scripts/build-deb.sh x86_64 "$version" target/release \
+            "$RUNNER_TEMP/bridge-target/x86_64-pc-windows-gnu/release/WSLWebAuthnBridge.exe" \
+            dist
+
+      - name: verify the package layout
+        run: |
+          set -eu
+          for deb in dist/*.deb; do
+            echo "--- $deb ---"
+            dpkg-deb -I "$deb"
+          done
+          sh .github/scripts/check-deb-layout.sh "$(ls dist/*.deb)" x86_64-linux-gnu
+
+      # Real end-to-end check of the package on the floor distro and the two just
+      # above it: dpkg accepts it, the module lands in the directory the host's
+      # own libpam actually searches, its dynamic dependencies resolve (glibc
+      # floor + libpam), and the CLI's verifier passes inside the target distro.
+      - name: install the .deb in Ubuntu 20.04, Debian 12, and Ubuntu 22.04
+        run: |
+          set -eu
+          deb=$(ls dist/*.deb)
+          base=$(basename "$deb")
+          for image in ubuntu:20.04 debian:12 ubuntu:22.04; do
+            echo "=== $image ==="
+            docker run --rm -e DEB="/dist/$base" -v "$PWD/dist:/dist:ro" "$image" \
+              bash -euxo pipefail -c '
+                apt-get update -qq
+                apt-get install -y -qq "$DEB"
+                # The directory the system libpam searches for modules by
+                # basename (/lib/<triplet>/security under pre-1.5 pam, otherwise
+                # /usr/lib/...; the same directory under merged /usr). This is the
+                # assertion that catches a module installed where PAM never looks.
+                securedir=$(dirname "$(dpkg -L libpam-modules | grep "security/pam_unix.so$" | head -n1)")
+                test -f "$securedir/pam_wsl_webauthn.so"
+                # `install` reads the artifact module with a no-follow read, so it
+                # must be a regular file, not a symlink.
+                test -f /usr/lib/wsl-webauthn-pam/pam_wsl_webauthn.so
+                test ! -L /usr/lib/wsl-webauthn-pam/pam_wsl_webauthn.so
+                ldd "$securedir/pam_wsl_webauthn.so"
+                if ldd "$securedir/pam_wsl_webauthn.so" | grep -q "not found"; then
+                  echo "unresolved dependencies in the installed module" >&2
+                  exit 1
+                fi
+                out="$(wsl-webauthn-pam verify)"
+                echo "$out"
+                printf "%s\n" "$out" | grep -q "^verify: PASS$"
+              '
+          done
+
   cargo-deny:
     name: cargo-deny (supply chain)
     runs-on: ubuntu-latest
@@ -391,6 +492,16 @@ jobs:
           shellcheck -s sh scripts/test-bootstrap.sh
           shellcheck -s sh crates/wsl-webauthn-pam/tests/c_host/provision_and_drive.sh
           shellcheck -s bash spike/build_testrp.sh
+          # Packaging + release helpers, and the Debian maintainer scripts.
+          shellcheck -s sh .github/scripts/build-glibc-floor.sh
+          shellcheck -s sh .github/scripts/check-glibc-floor.sh
+          shellcheck -s sh .github/scripts/build-deb.sh
+          shellcheck -s sh .github/scripts/check-deb-layout.sh
+          shellcheck -s sh .github/scripts/build-apt-repo.sh
+          shellcheck -s sh .github/scripts/install-nfpm.sh
+          shellcheck -s sh packaging/debian/postinst
+          shellcheck -s sh packaging/debian/prerm
+          shellcheck -s sh packaging/debian/postrm
 
       - name: hermetic bootstrap tests
         run: sh scripts/test-bootstrap.sh

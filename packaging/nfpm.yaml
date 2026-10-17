@@ -1,0 +1,125 @@
+# nfpm spec for the Debian/Ubuntu package.
+#
+# Built by .github/scripts/build-deb.sh (CI) or `make deb` (local).
+#
+# Environment expansion in nfpm is field-dependent, and the split matters:
+#   * top-level `name`/`arch`/`version`/`homepage`/`maintainer`/`description` and
+#     every `depends` entry are always expanded;
+#   * `contents` entries only expand with `expand: true`;
+#   * `scripts:` is never expanded and is read relative to the working directory,
+#     so those paths are literal and nfpm is always run from the repository root.
+#
+# Environment (set by build-deb.sh):
+#   DEB_ARCH     amd64 | arm64
+#   DEB_VERSION  Debian version string (a pre-release dash already mapped to `~`)
+#   LINUX_DIR    directory with libpam_wsl_webauthn.so and wsl-webauthn-pam
+#   BRIDGE       path to WSLWebAuthnBridge.exe
+#   PAM_TRIPLET  x86_64-linux-gnu | aarch64-linux-gnu
+#
+# Layout rationale:
+#   * The module is installed under the multiarch security directory, as
+#     `pam_wsl_webauthn.so` — the exact name the shipped pam-configs profile
+#     loads by basename. Every supported distro is merged-/usr (bullseye and
+#     newer), so this path resolves through the `/lib` symlink too; on the rare
+#     non-merged system the CLI's `install` re-detects the real security
+#     directory from the host's own libpam and copies the module there.
+#   * /usr/lib/wsl-webauthn-pam/ is the `--artifact-dir` the (unchanged) `install`
+#     subcommand expects: it must hold a module and the Windows bridge. Both must
+#     be REGULAR FILES, never symlinks — the installer reads the module with a
+#     no-follow read and refuses a symlinked source (pinned by the
+#     `install_rolls_back_partial_state_on_module_failure` test), so a symlinked
+#     artifact would make every packaged `install` roll back. The module is
+#     therefore shipped twice: dpkg-owned in the security directory, and again as
+#     the installer's input.
+name: wsl-webauthn-pam
+arch: ${DEB_ARCH}
+version: ${DEB_VERSION}
+# The version is passed pre-normalised (see build-deb.sh), so nfpm must not
+# re-interpret it.
+version_schema: none
+maintainer: kirin-xiao <kirin-xiao@users.noreply.github.com>
+description: Windows Hello (WebAuthn) passwordless authentication for sudo and su inside WSL2
+homepage: https://github.com/kirin-xiao/wsl-webauthn-pam
+license: MIT
+section: admin
+priority: optional
+depends:
+  # glibc floor: the binaries are built on Ubuntu 20.04 (glibc 2.31) and gated by
+  # .github/scripts/check-glibc-floor.sh. Debian 11 / Ubuntu 20.04 and newer
+  # satisfy it.
+  - libc6 (>= 2.31)
+  - libgcc-s1
+  - libpam0g
+  # Provides pam-auth-update, which the maintainer scripts use.
+  - libpam-runtime
+contents:
+  # The PAM module, as the name the profile loads.
+  - src: ${LINUX_DIR}/libpam_wsl_webauthn.so
+    dst: /usr/lib/${PAM_TRIPLET}/security/pam_wsl_webauthn.so
+    expand: true
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  # ... and the same bytes as the installer's artifact input. A regular file, not
+  # a symlink — see the layout note above.
+  - src: ${LINUX_DIR}/libpam_wsl_webauthn.so
+    dst: /usr/lib/wsl-webauthn-pam/pam_wsl_webauthn.so
+    expand: true
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  # The CLI. dpkg owns /usr/bin; `install` still copies a second copy to
+  # /usr/local/bin if the user runs it (see README).
+  - src: ${LINUX_DIR}/wsl-webauthn-pam
+    dst: /usr/bin/wsl-webauthn-pam
+    expand: true
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
+  # The Windows helper, staged for `install` to copy onto the Windows side.
+  - src: ${BRIDGE}
+    dst: /usr/lib/wsl-webauthn-pam/WSLWebAuthnBridge.exe
+    expand: true
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  # The pam-auth-update profile, byte-identical to the repo's pam-config (the CLI
+  # embeds the same bytes and a unit test pins them together).
+  - src: pam-config
+    dst: /usr/share/pam-configs/wsl-webauthn
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  - src: README.md
+    dst: /usr/share/doc/wsl-webauthn-pam/README.md
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  - src: LICENSE
+    dst: /usr/share/doc/wsl-webauthn-pam/LICENSE
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  - src: packaging/debian/copyright
+    dst: /usr/share/doc/wsl-webauthn-pam/copyright
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+scripts:
+  postinstall: packaging/debian/postinst
+  # prerm (not just postrm) deregisters the profile while the module and profile
+  # are still on disk, which is the order pam-auth-update(8) requires.
+  preremove: packaging/debian/prerm
+  postremove: packaging/debian/postrm
+deb:
+  # xz is the Debian default and is readable by every dpkg in the target set
+  # (zstd would exclude Debian 11's dpkg).
+  compression: xz

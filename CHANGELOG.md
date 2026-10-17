@@ -5,6 +5,37 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.2.0 — 2026-10-17
+
+Package distribution. The Linux module and CLI are now built against a declared
+glibc floor and shipped as Debian/Ubuntu packages from a signed apt repository,
+alongside the existing tarball and `bootstrap.sh` install paths.
+
+### Added
+
+- Debian/Ubuntu packages (`wsl-webauthn-pam_<version>_{amd64,arm64}.deb`), built
+  from the release binaries by `nfpm` from `packaging/nfpm.yaml`: the PAM module
+  in the multiarch security directory, the CLI at `/usr/bin`, the
+  `pam-auth-update` profile (left disabled), and the Windows bridge staged under
+  `/usr/lib/wsl-webauthn-pam/` for the installer's `--artifact-dir`. The
+  `postinst` registers the profile and never enrolls.
+- A GPG-signed apt repository (`Release`/`InRelease` plus a published keyring)
+  deployed to GitHub Pages by the `apt-repo` release job, rebuilt from every
+  released `.deb` on each run. `make deb` builds the package locally.
+- SLSA build-provenance attestation now also covers the `.deb` files, and
+  `SHA256SUMS` includes them.
+- A `package` CI job that reproduces the glibc-floor build, asserts the floor,
+  builds the `.deb`, and install-tests it in Debian 12 and Ubuntu 22.04
+  containers (`wsl-webauthn-pam verify` must pass).
+
+### Changed
+
+- The released Linux module and CLI are compiled against a declared **glibc 2.31**
+  floor (in an Ubuntu 20.04 container) instead of the runner's glibc, and a CI
+  gate fails the release if a dependency raises the floor. The tarball and the
+  `.deb` now load on Debian 11+, Ubuntu 20.04+, and RHEL/Rocky/Alma 9.
+- Version bumped to 0.2.0.
+
 ## 0.1.0 — 2026-10-02
 
 Initial release: authenticate `sudo`/`su` on WSL via the Windows Hello WebAuthn

@@ -1,0 +1,23 @@
+#!/bin/sh
+# Debian/Ubuntu prerm: deregister the pam-auth-update profile.
+#
+# pam-auth-update(8) is explicit that a profile must be removed *before* the
+# modules it references leave the disk, "to ensure that PAM is in a consistent
+# and usable state at all times" (libpam-runtime's own prerm carries this as its
+# documented template: `pam-auth-update --package --remove <profile>`). Removing
+# in postrm instead would leave a window where the generated /etc/pam.d stack
+# names a module dpkg has already deleted, which is a lockout risk.
+#
+# Only `remove` is handled: on `upgrade` the profile must stay registered, or
+# postinst's `--package` refresh would not re-enable a profile the user had
+# turned on, silently dropping `sudo` back to the password.
+set -e
+
+case "${1:-}" in
+    remove)
+        if command -v pam-auth-update >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive pam-auth-update --package --remove wsl-webauthn || true
+        fi        ;;
+esac
+
+exit 0
