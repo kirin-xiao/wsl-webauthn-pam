@@ -811,7 +811,7 @@ checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
 name = "wsl-webauthn-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "serde",
@@ -821,7 +821,7 @@ dependencies = [
 
 [[package]]
 name = "wsl-webauthn-verifier"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "ciborium",
