@@ -122,6 +122,14 @@ EOF
 sudo apt update && sudo apt install wsl-webauthn-pam
 ```
 
+The repository is signed by the ed25519 key `AE1D A898 2786 7B0D 7415 BBEE 5834 B868 04A5 D3AF`
+(expires 2028-10-16). The keyring is fetched from the same origin as the
+repository, so confirm you got the right key before trusting it:
+
+```sh
+gpg --show-keys --with-fingerprint /etc/apt/keyrings/wsl-webauthn-pam.gpg
+```
+
 `apt` installs the Linux side only — the PAM module, the CLI, and the
 `pam-auth-update` profile (left disabled). The Windows bridge still has to reach
 the Windows side, and enrollment is still interactive, so run:

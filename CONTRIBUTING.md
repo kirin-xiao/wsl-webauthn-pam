@@ -96,10 +96,11 @@ builds the tarballs, the `.deb`s, and the signed apt repository.
   fails closed if the signature does not verify. Publishing needs two secrets —
   `APT_GPG_PRIVATE_KEY` (an ASCII-armored ed25519 private key) and, for a
   passphrase-protected key, `APT_GPG_PASSPHRASE`. Declare them on the
-  `github-pages` environment (with required reviewers) so only the `apt-repo` job
-  can read them; GitHub Pages must be set to deploy **from GitHub Actions**.
-  Pre-release tags are excluded from the repository, which only ever serves the
-  stable suite.
+  `github-pages` environment so only the `apt-repo` job can read them, and add
+  required reviewers there to gate a release behind an approval. The signing
+  key's fingerprint is published in the README. GitHub Pages must be set to
+  deploy **from GitHub Actions**. Pre-release tags are excluded from the
+  repository, which only ever serves the stable suite.
 - **Version bumps.** Bump `version` in `Cargo.toml`, refresh `Cargo.lock`
   (`cargo metadata` rewrites only the workspace members' versions), and add a
   `CHANGELOG.md` entry. The release workflow refuses a tag whose base version
