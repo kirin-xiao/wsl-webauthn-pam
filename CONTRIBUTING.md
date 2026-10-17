@@ -107,6 +107,34 @@ builds the tarballs, the `.deb`s, and the signed apt repository.
   does not match `Cargo.toml`. Pre-release tags (`v0.2.0-rc1`) map to a Debian
   `0.2.0~rc1` automatically.
 
+### First-time repository setup
+
+One-off, from a checkout with an authenticated `gh` (replace `OWNER/REPO`):
+
+```sh
+# 1. A dedicated signing key, in a throwaway keyring. ed25519 verifies on every
+#    supported apt (Ubuntu 20.04+ / Debian 11+). Never commit the private key.
+export GNUPGHOME=$(mktemp -d); chmod 700 "$GNUPGHOME"
+gpg --batch --pinentry-mode loopback --passphrase '' --quick-generate-key \
+    "wsl-webauthn-pam apt signing <you@example.com>" ed25519 sign 2y
+FPR=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')
+
+# 2. Environment + secret, scoped so only the apt-repo job reads the key.
+gh api --method PUT /repos/OWNER/REPO/environments/github-pages
+gpg --batch --pinentry-mode loopback --passphrase '' --armor --export-secret-keys "$FPR" \
+  | gh secret set APT_GPG_PRIVATE_KEY --env github-pages -R OWNER/REPO
+
+# 3. Pages from Actions, and allow the release tag to deploy. Enabling Pages
+#    pins the github-pages environment's deployment policy to the default
+#    branch, so a tag push is rejected ("Tag vX.Y.Z is not allowed to deploy to
+#    github-pages") until the tag pattern is allowed too.
+gh api --method POST /repos/OWNER/REPO/pages -f build_type=workflow
+gh api --method POST /repos/OWNER/REPO/environments/github-pages/deployment-branch-policies \
+    -f name='v*' -f type=tag
+
+# 4. Publish the fingerprint from step 1 in README.md and SECURITY.md.
+```
+
 ## Pull requests
 
 - Use **Conventional Commits** (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`,
