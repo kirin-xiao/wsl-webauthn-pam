@@ -162,8 +162,12 @@ where
     F: FnOnce() -> c_int,
 {
     // Replace the default stderr-printing panic hook with one that logs to syslog
-    // before `catch_unwind` can observe the panic.
+    // before `catch_unwind` can observe the panic. It chains to whatever hook the host
+    // installed and only suppresses panics raised inside the scope entered below.
     logger::install_panic_hook();
+    // Attribute panics raised by this call to the module. The guard is dropped after
+    // `catch_unwind` has caught the unwind, so it covers the whole `body`.
+    let _scope = logger::enter_module_scope();
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
         Ok(code) => code,
         Err(_) => {
@@ -195,7 +199,7 @@ unsafe fn collect_args(argc: c_int, argv: *const *const c_char) -> Vec<String> {
         // SAFETY: the caller guarantees `argc` valid pointers at `argv`.
         let ptr = unsafe { *argv.add(i) };
         if let Some(s) = unsafe { bindings::cstr_to_str(ptr) } {
-            out.push(s.to_string());
+            out.push(s);
         }
     }
     out
@@ -362,6 +366,9 @@ mod tests {
     fn panic_in_guarded_logs_to_syslog_and_not_to_stderr() {
         // Ensure the production syslog hook (not the default stderr hook) is installed.
         logger::install_panic_hook();
+        // Reset this thread's recorder so the assertion below sees this panic's record
+        // only. Under `cfg(test)` the in-process recorder is always the sink.
+        logger::begin_capture();
 
         let stderr = capture_stderr(|| {
             let code = guarded("panic-hook-test", || panic!("L8-1 stderr sentinel"));
@@ -371,6 +378,25 @@ mod tests {
         assert!(
             !stderr.contains("L8-1 stderr sentinel") && !stderr.contains("panicked"),
             "the panic payload must not reach stderr, got: {stderr:?}"
+        );
+        // A no-op hook would also keep stderr clean, so assert the audit record itself:
+        // exactly one LOG_CRIT line naming the module.
+        let records = logger::captured();
+        let owned: Vec<_> = records
+            .iter()
+            .filter(|(priority, msg)| {
+                *priority == LOG_CRIT && msg.contains("panic in pam_wsl_webauthn")
+            })
+            .collect();
+        assert_eq!(
+            owned.len(),
+            1,
+            "the hook must emit exactly one LOG_CRIT record for an in-scope panic, got {records:?}"
+        );
+        assert!(
+            owned[0].1.contains("L8-1 stderr sentinel"),
+            "the record must carry the payload, got: {:?}",
+            owned[0].1
         );
     }
 

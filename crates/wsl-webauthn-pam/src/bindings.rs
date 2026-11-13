@@ -164,17 +164,28 @@ unsafe extern "C" {
     pub fn closelog();
 }
 
-/// Read a `*const c_char` as a `&str`, returning `None` for null or non-UTF-8.
+/// Copy a `*const c_char` into an owned `String`, returning `None` for null or
+/// non-UTF-8 input.
+///
+/// The copy happens here, so the returned value borrows nothing from the pointer. An
+/// earlier signature returned `Option<&'a str>` with an unconstrained lifetime, which
+/// let a caller tie the borrow to a lifetime unrelated to the C owner's; the owned
+/// return removes that hazard while keeping the same null/non-UTF-8 → `None` contract.
 ///
 /// # Safety
 ///
-/// `ptr` must be null or point at a valid NUL-terminated C string.
-pub unsafe fn cstr_to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
+/// `ptr` must be null or point at a valid NUL-terminated C string. The string must stay
+/// valid for the duration of this call; it is not retained afterwards.
+pub unsafe fn cstr_to_str(ptr: *const c_char) -> Option<String> {
     if ptr.is_null() {
         return None;
     }
-    // SAFETY: the caller guarantees a valid NUL-terminated string.
-    unsafe { CStr::from_ptr(ptr) }.to_str().ok()
+    // SAFETY: the caller guarantees a valid NUL-terminated string; `to_str` copies it
+    // into an owned `String` before the pointer can be invalidated.
+    unsafe { CStr::from_ptr(ptr) }
+        .to_str()
+        .ok()
+        .map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -202,6 +213,29 @@ mod tests {
         assert_eq!(size_of::<pam_conv>(), 16);
         assert_eq!(offset_of!(pam_conv, conv), 0);
         assert_eq!(offset_of!(pam_conv, appdata_ptr), 8);
+    }
+
+    #[test]
+    fn cstr_to_str_null_is_none() {
+        // SAFETY: a null pointer is explicitly allowed by the contract.
+        assert_eq!(unsafe { cstr_to_str(std::ptr::null()) }, None);
+    }
+
+    #[test]
+    fn cstr_to_str_copies_valid_utf8() {
+        // SAFETY: `c"…"` is a valid NUL-terminated C string.
+        let copied = unsafe { cstr_to_str(c"user name".as_ptr()) };
+        assert_eq!(copied, Some("user name".to_string()));
+    }
+
+    #[test]
+    fn cstr_to_str_non_utf8_is_none() {
+        // A NUL-terminated byte string whose single byte before the terminator is not
+        // valid UTF-8. `CStr::to_str` must reject it rather than lossily replace it.
+        static INVALID: &[u8] = b"\xff\0";
+        // SAFETY: `INVALID` is NUL-terminated and outlives the call.
+        let decoded = unsafe { cstr_to_str(INVALID.as_ptr().cast()) };
+        assert_eq!(decoded, None);
     }
 
     #[test]

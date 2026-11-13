@@ -119,6 +119,51 @@ fn cdylib_exports_all_six_pam_symbols() {
     }
 }
 
+/// The module installs a process-wide panic hook whose closure lives in this cdylib, so
+/// the mapping must survive a host `dlclose`. `build.rs` links it with `-z nodelete`,
+/// which sets `DF_1_NODELETE` (GNU ld/lld) and, on older binutils, a `NODELETE` flag on
+/// the `FLAGS` line. Strip and thin LTO do not touch dynamic flags.
+#[test]
+fn cdylib_is_marked_nodelete() {
+    let Some(lib) = locate_library() else {
+        gate::enforce(
+            "libpam_wsl_webauthn.so not found; run `cargo build -p wsl-webauthn-pam` \
+             to exercise this link-flag check",
+        );
+        return;
+    };
+
+    let output = match std::process::Command::new("readelf")
+        .arg("-d")
+        .arg(&lib)
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => {
+            // readelf is not part of the Rust toolchain; its absence is environmental,
+            // not a module defect.
+            eprintln!(
+                "SKIP: cannot run readelf ({error}); not verifying DF_1_NODELETE on {}",
+                lib.display()
+            );
+            return;
+        }
+    };
+    assert!(
+        output.status.success(),
+        "readelf -d {} failed: {}",
+        lib.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dynamic = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        dynamic.contains("NODELETE"),
+        "{} must be linked with -z nodelete (DF_1_NODELETE) so the panic hook's code is \
+         never unmapped by dlclose; readelf -d said:\n{dynamic}",
+        lib.display()
+    );
+}
+
 fn dlerror_string() -> String {
     unsafe {
         let ptr = libc::dlerror();
