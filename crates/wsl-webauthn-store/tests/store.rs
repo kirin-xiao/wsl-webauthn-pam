@@ -12,8 +12,8 @@ use tempfile::TempDir;
 
 use wsl_webauthn_store::{
     AttestationRecord, BASE_MODE, CONFIG_MODE, Config, CredentialRecord, DIR_MODE, FILE_MODE,
-    MODE_STRICT, MODE_UNATTESTED_OPT_IN, Store, StoreError, WindowsIdentity, current_euid,
-    validate_username,
+    InvalidRecord, MODE_STRICT, MODE_UNATTESTED_OPT_IN, Store, StoreError, WindowsIdentity,
+    current_euid, validate_username,
 };
 
 /// Byte-for-byte golden encoding of [`sample_record("alice")`] (schema version 1).
@@ -389,6 +389,55 @@ fn remove_refuses_symlinked_record() {
     ));
 }
 
+#[test]
+fn list_refuses_symlinked_credentials_dir() {
+    let (d, store) = fresh();
+    let real = d.path().join("real-creds");
+    fs::create_dir(&real).unwrap();
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).unwrap();
+    symlink(&real, store.credentials_dir()).unwrap();
+    assert!(matches!(
+        store.list(),
+        Err(StoreError::SymlinkedPath { .. })
+    ));
+}
+
+#[test]
+fn remove_refuses_symlinked_credentials_dir() {
+    let (d, store) = fresh();
+    let real = d.path().join("real-creds");
+    fs::create_dir(&real).unwrap();
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).unwrap();
+    write_private(&real.join("alice.json"), b"{}");
+    symlink(&real, store.credentials_dir()).unwrap();
+    assert!(matches!(
+        store.remove("alice"),
+        Err(StoreError::SymlinkedPath { .. })
+    ));
+    // The record behind the link must be untouched.
+    assert!(real.join("alice.json").exists());
+}
+
+#[test]
+fn list_refuses_credentials_path_that_is_a_file() {
+    let (_d, store) = fresh();
+    write_private(&store.credentials_dir(), b"not a directory");
+    assert!(matches!(
+        store.list(),
+        Err(StoreError::NotRegularFile { .. })
+    ));
+}
+
+#[test]
+fn remove_refuses_credentials_path_that_is_a_file() {
+    let (_d, store) = fresh();
+    write_private(&store.credentials_dir(), b"not a directory");
+    assert!(matches!(
+        store.remove("alice"),
+        Err(StoreError::NotRegularFile { .. })
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // Ownership / mode hardening
 // ---------------------------------------------------------------------------
@@ -637,6 +686,85 @@ fn load_records_with_malformed_b64url_are_corrupt() {
     let mut bad_key = sample_record("alice");
     bad_key.cose_public_key = "====".into();
     write_record_json(&dir.join("alice.json"), &bad_key);
+    assert!(matches!(
+        store.load("alice"),
+        Err(StoreError::Corrupt { .. })
+    ));
+}
+
+#[test]
+fn record_validate_accepts_lowercase_digests_and_absent_leaf() {
+    // The sample uses 64 lowercase hex characters for both fields.
+    assert!(sample_record("alice").validate().is_ok());
+
+    // `leaf_sha256` is optional (an `unattested-opt-in`/`none` attestation has none).
+    let mut no_leaf = sample_record("alice");
+    no_leaf.attestation.leaf_sha256 = None;
+    assert!(no_leaf.validate().is_ok());
+}
+
+#[test]
+fn record_validate_rejects_uppercase_digest() {
+    // Uppercase is exactly 64 characters, so a length-only check would let it through;
+    // `hex32_decode` requires lowercase.
+    let mut upper_leaf = sample_record("alice");
+    upper_leaf.attestation.leaf_sha256 = Some("AB".repeat(32));
+    match upper_leaf.validate() {
+        Err(InvalidRecord::BadDigest { field }) => assert_eq!(field, "attestation.leaf_sha256"),
+        other => panic!("expected BadDigest for leaf_sha256, got {other:?}"),
+    }
+
+    let mut upper_bridge = sample_record("alice");
+    upper_bridge.bridge_sha256 = "CD".repeat(32);
+    match upper_bridge.validate() {
+        Err(InvalidRecord::BadDigest { field }) => assert_eq!(field, "bridge_sha256"),
+        other => panic!("expected BadDigest for bridge_sha256, got {other:?}"),
+    }
+}
+
+#[test]
+fn record_validate_rejects_wrong_length_digest() {
+    for short in [String::new(), "ab".repeat(31), "0".repeat(63)] {
+        let mut rec = sample_record("alice");
+        rec.attestation.leaf_sha256 = Some(short.clone());
+        assert!(
+            rec.validate().is_err(),
+            "{short:?} must be rejected as leaf"
+        );
+    }
+    for long in ["ab".repeat(33), "0".repeat(65)] {
+        let mut rec = sample_record("alice");
+        rec.bridge_sha256 = long.clone();
+        assert!(
+            rec.validate().is_err(),
+            "{long:?} must be rejected as bridge_sha256"
+        );
+    }
+    // A short non-hex string (before the protocol change this decoded) is refused too.
+    let mut rec = sample_record("alice");
+    rec.bridge_sha256 = "deadbeef".into();
+    assert!(rec.validate().is_err());
+}
+
+#[test]
+fn save_and_load_reject_uppercase_digest() {
+    // The writer must not persist a digest the reader would reject, and a hand-edited
+    // uppercase digest must not load clean.
+    let (_d, store) = fresh();
+    let mut rec = sample_record("alice");
+    rec.attestation.leaf_sha256 = Some("AB".repeat(32));
+    assert!(matches!(
+        store.save_atomic(&rec, false),
+        Err(StoreError::Encode { .. })
+    ));
+    assert!(!store.credentials_dir().join("alice.json").exists());
+
+    let dir = store.credentials_dir();
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut on_disk = sample_record("alice");
+    on_disk.bridge_sha256 = "CD".repeat(32);
+    write_record_json(&dir.join("alice.json"), &on_disk);
     assert!(matches!(
         store.load("alice"),
         Err(StoreError::Corrupt { .. })

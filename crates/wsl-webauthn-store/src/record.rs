@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use wsl_webauthn_protocol::hex32_decode;
+
 /// Current on-disk record schema version.
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -35,6 +37,14 @@ pub enum InvalidRecord {
     /// `attestation.verified` was `false` while `attestation.mode` claimed [`MODE_STRICT`].
     #[error("attestation.mode {MODE_STRICT:?} requires verified = true")]
     StrictNotVerified,
+    /// A hex digest field was not exactly 64 lowercase hex characters.
+    ///
+    /// The message names the offending field so a hand-edited record is diagnosable.
+    #[error("{field} is not a 64-character lowercase hex SHA-256 digest")]
+    BadDigest {
+        /// The offending record field (`attestation.leaf_sha256` or `bridge_sha256`).
+        field: &'static str,
+    },
 }
 
 /// A single Linux user's enrolled credential (one record per user).
@@ -84,7 +94,8 @@ impl CredentialRecord {
 
     /// Validate the invariants the store documents for a record but that serde alone
     /// cannot express: `attestation.mode` must be [`MODE_STRICT`] or
-    /// [`MODE_UNATTESTED_OPT_IN`], and a strict record must be `verified`.
+    /// [`MODE_UNATTESTED_OPT_IN`], a strict record must be `verified`, `bridge_sha256`
+    /// must be a digest, and `attestation.leaf_sha256`, when present, must be one too.
     pub fn validate(&self) -> Result<(), InvalidRecord> {
         if !valid_attestation_mode(&self.attestation.mode) {
             return Err(InvalidRecord::AttestationMode(
@@ -94,8 +105,27 @@ impl CredentialRecord {
         if self.attestation.mode == MODE_STRICT && !self.attestation.verified {
             return Err(InvalidRecord::StrictNotVerified);
         }
+        if let Some(digest) = &self.attestation.leaf_sha256 {
+            validate_digest("attestation.leaf_sha256", digest)?;
+        }
+        // `bridge_sha256` is required: the PAM module decodes it on every authentication
+        // and fails closed when it is not a digest, so an empty or malformed value would
+        // persist a record that can never authenticate. Reject it here instead.
+        validate_digest("bridge_sha256", &self.bridge_sha256)?;
         Ok(())
     }
+}
+
+/// Require `value` to be exactly 64 lowercase hex characters (a SHA-256 digest).
+///
+/// `hex32_decode` is the protocol crate's strict decoder: it rejects uppercase, wrong
+/// lengths, and non-hex characters, and is the same decoder the PAM module uses to pin
+/// `bridge_sha256`.
+fn validate_digest(field: &'static str, value: &str) -> Result<(), InvalidRecord> {
+    if hex32_decode(value).is_none() {
+        return Err(InvalidRecord::BadDigest { field });
+    }
+    Ok(())
 }
 
 /// Attestation facts recorded for a credential.
