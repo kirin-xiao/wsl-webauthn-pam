@@ -117,6 +117,9 @@ The verifier is `#![forbid(unsafe_code)]` and non-panicking on every parse path.
 
 **No test seam in shipped artifacts.** `Deps::panic_probe` is a no-op trait default that no production implementation overrides, so no shipped module can panic through it. The audit sink is chosen at **runtime**: the `syslog` path is always compiled (present as an undefined `nm` symbol in both the release and `--all-targets` `.so`), so no build profile produces a module that silently loses its `authpriv` path. A process switches to an in-process recorder only if code calls `logger::enable_capture` (test harnesses) or sets the hidden `WSL_WEBAUTHN_TEST_CAPTURE` marker, and the marker is ignored under an `AT_SECURE` privilege transition; no production code path enables either.
 
+**Panic diagnostics never reach the user, and never outlive the module.** The module chains to the host's panic hook rather than replacing it: only a panic raised inside its own guarded call is logged to `LOG_AUTHPRIV` and withheld from the host's hook, because that payload (including its source path) must not reach the invoking user's terminal; every other panic is delegated, so a host panic is neither mislabelled as this module's nor lost. The module is linked `DF_1_NODELETE`: the hook closure lives in its text, so a host `dlclose` followed by a panic would otherwise call an unmapped vtable.
+<!-- INVARIANT: PAM-PANIC-HOOK-CHAINS -->
+
 ---
 
 ## Enrollment security properties

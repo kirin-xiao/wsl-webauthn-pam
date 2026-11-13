@@ -5,6 +5,64 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+Hardening pass over the whole workspace. Nothing here changes the wire format, the
+credential record schema, or the CLI surface; the fixes close gaps between documented
+invariants and their enforcement, and the PAM/store changes are defence in depth rather
+than responses to an exploitable flaw (the store and `pam.d` paths are root-owned, so the
+paths they close already required root to abuse).
+
+### Fixed
+
+- `pam_wsl_webauthn.so` no longer replaces the host process's panic hook. It saves the
+  host's hook, logs only panics raised inside its own guarded call to `LOG_AUTHPRIV`, and
+  delegates everything else, so a panic elsewhere in sshd/sudo is no longer mislabelled as
+  this module's and the host keeps its own diagnostics. The module is linked
+  `DF_1_NODELETE`: the hook closure lives in its text, and a host `dlclose` followed by a
+  panic would otherwise call an unmapped vtable.
+- The store installs records with `renameat`/`linkat` relative to the held,
+  identity-checked `credentials` descriptor instead of re-resolving absolute paths,
+  closing the directory-swap window two comments claimed was already closed. A failed
+  temp-file cleanup no longer turns a successful install into a reported failure, and
+  `Store::remove` re-checks the opened directory's `(dev, ino)`.
+- Records are validated as the PAM module reads them: `bridge_sha256` must be a
+  64-character lowercase hex digest, and `attestation.leaf_sha256` is checked when
+  present. An empty `bridge_sha256` previously passed store validation but could never
+  authenticate, and an uppercase digest was accepted by both sides despite being outside
+  the documented format.
+- The installer refuses a symlinked `/etc/pam.d` instead of rewriting through it, and
+  treats only `NotFound` as "absent" during legacy detection, module discovery, and the
+  post-uninstall PAM scan. Previously `EACCES`/`EIO`/`ELOOP` could silently skip a
+  migration or hide a leftover reference, and uninstall could print success while the
+  module remained installed. A failed `waitpid` no longer leaves an unreaped helper.
+- The CLI reports entropy failures as ordinary errors instead of unwinding, and refuses a
+  pre-epoch clock instead of recording `enrolled_at` as `1970-01-01T00:00:00Z`.
+- `WSLWebAuthnBridge.exe` reports a Rust-side panic during dispatch as an in-band
+  `{"op":"*","ok":false,"error":"internal"}` frame, matching the documented contract.
+- The verifier compares the public `rpIdHash` with plain equality. The hand-rolled
+  constant-time helper it replaced protected nothing: no secret is compared on the Linux
+  side, and the signature check is constant-time inside the curve implementation.
+
+### Changed
+
+- `protocol::OkFlag` is public with a private field, so `Response`'s variants are nameable
+  and the crate-wide `#![allow(private_interfaces)]` is gone, while a contradictory `ok`
+  still cannot be constructed outside the crate.
+- A shared strict `protocol::hex32_encode`/`hex32_decode` replaces three hand-rolled hex
+  codecs; uppercase is rejected everywhere, matching what every writer emits.
+- `encode_frame` rejects a payload larger than `u32::MAX` rather than truncating the
+  length prefix.
+- `Store::record_path` documents and asserts its username precondition; the PAM
+  `cstr_to_str` helper returns an owned `String` instead of an unbounded borrow.
+- The bridge's `wide_ptr_to_string` safety contract now states the readable-extent
+  obligation it actually relies on.
+
+### Removed
+
+- A dead serialization fallback in `build_client_data` and an unused-import `allow` in the
+  PAM logic module.
+
 ## 0.2.0 — 2026-10-17
 
 Package distribution. The Linux module and CLI are now built against a declared
