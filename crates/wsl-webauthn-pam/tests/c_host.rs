@@ -115,16 +115,29 @@ fn locate_library() -> Option<PathBuf> {
 }
 
 /// Locate a built example binary (`target/<profile>/examples/<name>`).
+///
+/// The test executable's own directory is not a reliable base: depending on the cargo
+/// version it lives in `target/<profile>/deps/` or — as of cargo 1.100's build-dir layout
+/// — in `target/<profile>/build/<package>-<hash>/out/`. Search every ancestor for
+/// `examples/<name>`, then fall back to the workspace target directory.
 fn locate_example(name: &str) -> Option<PathBuf> {
     let mut candidates = Vec::new();
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(deps_dir) = exe.parent()
-        && let Some(profile_dir) = deps_dir.parent()
-    {
-        candidates.push(profile_dir.join("examples").join(name));
-        if let Some(target_dir) = profile_dir.parent() {
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors().skip(1) {
+            candidates.push(ancestor.join("examples").join(name));
+        }
+    }
+    if let Some(manifest) = std::env::var_os("CARGO_MANIFEST_DIR") {
+        let crate_dir = PathBuf::from(manifest);
+        if let Some(workspace) = crate_dir.parent().and_then(|p| p.parent()) {
             for profile in ["debug", "release"] {
-                candidates.push(target_dir.join(profile).join("examples").join(name));
+                candidates.push(
+                    workspace
+                        .join("target")
+                        .join(profile)
+                        .join("examples")
+                        .join(name),
+                );
             }
         }
     }
