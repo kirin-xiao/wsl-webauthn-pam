@@ -1314,7 +1314,7 @@ fn cmd_enroll(
             fsutil::short_hash(&bridge_sha256)
         );
     }
-    let enrolled_at = format_rfc3339(SystemTime::now());
+    let enrolled_at = format_rfc3339(SystemTime::now())?;
     let record = build_record(
         &target,
         &outcome,
@@ -1574,7 +1574,7 @@ fn run_ceremony(
     target: &UserInfo,
     progress: Option<&wsl_webauthn_runner::ProgressSink<'_>>,
 ) -> anyhow::Result<CeremonyOutcome> {
-    let challenge = random_bytes(CHALLENGE_BYTES);
+    let challenge = random_bytes(CHALLENGE_BYTES)?;
     let client_data = build_client_data(ClientDataKind::Create, &challenge)
         .context("building enrollment clientDataJSON")?;
 
@@ -2005,8 +2005,11 @@ fn summarize_record(record: &CredentialRecord) -> String {
 fn cmd_verify() -> anyhow::Result<i32> {
     use ecdsa::signature::Signer as _;
 
-    // A fresh ES256 credential key.
-    let signing_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+    // A fresh ES256 credential key, from the same fallible entropy path as the challenges.
+    let key_bytes = random_bytes(32)?;
+    let secret_key = p256::SecretKey::from_slice(&key_bytes)
+        .context("building the self-test signing key from OS entropy")?;
+    let signing_key = p256::ecdsa::SigningKey::from(secret_key);
     let cose_key = p256_cose_key(&signing_key)?;
 
     let credential_id: Vec<u8> = vec![
@@ -2015,7 +2018,7 @@ fn cmd_verify() -> anyhow::Result<i32> {
     let aaguid = STRICT_AAGUID_SELF_TEST;
 
     // ---- enrollment: build a `packed` self-attestation ----
-    let enroll_challenge = random_bytes(CHALLENGE_BYTES);
+    let enroll_challenge = random_bytes(CHALLENGE_BYTES)?;
     let enroll_client_data = build_client_data(ClientDataKind::Create, &enroll_challenge)?;
     let enroll_auth_data = attested_auth_data(&cose_key, &credential_id, &aaguid);
 
@@ -2074,7 +2077,7 @@ fn cmd_verify() -> anyhow::Result<i32> {
     }
 
     // ---- assertion: sign authData || SHA-256(clientData) ----
-    let assert_challenge = random_bytes(CHALLENGE_BYTES);
+    let assert_challenge = random_bytes(CHALLENGE_BYTES)?;
     let assert_client_data = build_client_data(ClientDataKind::Get, &assert_challenge)?;
     let assert_auth_data = plain_auth_data();
     let assert_signed = {
@@ -2279,11 +2282,17 @@ fn parse_windows_sid(stdout: &[u8]) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Fill a `Vec<u8>` with OS entropy.
-fn random_bytes(len: usize) -> Vec<u8> {
+///
+/// Fallible on purpose: `rand_core` 0.6's `fill_bytes` panics when the OS entropy source
+/// fails, and a CLI panic unwinds instead of using the documented exit codes. The PAM
+/// module maps the same failure to `PAM_AUTHINFO_UNAVAIL`; here it is an ordinary error.
+fn random_bytes(len: usize) -> anyhow::Result<Vec<u8>> {
     use rand::RngCore as _;
     let mut buf = vec![0u8; len];
-    rand::rngs::OsRng.fill_bytes(&mut buf);
-    buf
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut buf)
+        .map_err(|e| anyhow!("could not obtain {len} bytes of OS entropy: {e}"))?;
+    Ok(buf)
 }
 
 /// A short, non-reversible preview of a credential id.
@@ -2339,18 +2348,29 @@ fn render_runner_error(error: &wsl_webauthn_runner::RunnerError) -> String {
 /// Implemented with leap-year-accurate civil-from-days arithmetic (Howard Hinnant's
 /// algorithm) so the CLI needs no date crate. Sub-second precision is not required by
 /// the record schema and is not emitted.
-fn format_rfc3339(time: SystemTime) -> String {
+///
+/// Errors on a pre-epoch clock instead of recording epoch: `enrolled_at` is audit data,
+/// and a false `1970-01-01T00:00:00Z` would be indistinguishable from a real enrollment
+/// at the epoch.
+fn format_rfc3339(time: SystemTime) -> anyhow::Result<String> {
     let secs = time
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .map_err(|_| {
+            anyhow!(
+                "the system clock is before the Unix epoch; refusing to record a false \
+                 enrollment time"
+            )
+        })?
+        .as_secs() as i64;
     let days = secs.div_euclid(86_400);
     let secs_of_day = secs.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);
     let hour = secs_of_day / 3_600;
     let minute = (secs_of_day % 3_600) / 60;
     let second = secs_of_day % 60;
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+    Ok(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
+    ))
 }
 
 /// Convert days since the Unix epoch to a (year, month, day) civil date.
@@ -2941,7 +2961,7 @@ mod tests {
 
     #[test]
     fn rfc3339_epoch() {
-        assert_eq!(format_rfc3339(UNIX_EPOCH), "1970-01-01T00:00:00Z");
+        assert_eq!(format_rfc3339(UNIX_EPOCH).unwrap(), "1970-01-01T00:00:00Z");
     }
 
     #[test]
@@ -2949,7 +2969,18 @@ mod tests {
         // 2026-10-01T12:34:56Z
         let secs = 1_790_858_096u64;
         let time = UNIX_EPOCH + Duration::from_secs(secs);
-        assert_eq!(format_rfc3339(time), "2026-10-01T12:34:56Z");
+        assert_eq!(format_rfc3339(time).unwrap(), "2026-10-01T12:34:56Z");
+    }
+
+    #[test]
+    fn rfc3339_rejects_pre_epoch_clock() {
+        // A clock before the epoch must not be audited as 1970-01-01T00:00:00Z.
+        let before = UNIX_EPOCH - Duration::from_secs(1);
+        let err = format_rfc3339(before).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("before the Unix epoch"),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -3560,6 +3591,9 @@ mod tests {
     }
 
     fn sample_record(user: &str, uid: u32) -> CredentialRecord {
+        // The store validates that `bridge_sha256` is a 64-character lowercase hex digest.
+        const BRIDGE_SHA256: &str =
+            "0000000000000000000000000000000000000000000000000000000000000000";
         let outcome = EnrollOutcome {
             credential_id: vec![7, 7, 7, 7],
             cose_public_key: es256_cose_bytes(),
@@ -3581,7 +3615,7 @@ mod tests {
             AttestationPolicy::Strict,
             None,
             Path::new("/mnt/c/bridge.exe"),
-            "abc123",
+            BRIDGE_SHA256,
             "2026-10-01T00:00:00Z",
         )
         .unwrap()

@@ -15,6 +15,8 @@
 
 #![allow(dead_code)]
 
+pub mod artifacts;
+
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;

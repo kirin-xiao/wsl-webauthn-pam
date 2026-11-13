@@ -19,21 +19,9 @@ use p256::ecdsa::SigningKey as P256SigningKey;
 use p256::ecdsa::signature::Signer as _;
 use sha2::{Digest as _, Sha256};
 
-use wsl_webauthn_protocol::{MAX_REQUEST_BYTES, Request, Response, b64u_encode, read_frame};
-
-fn hex32(s: &str) -> Option<[u8; 32]> {
-    let b = s.as_bytes();
-    if b.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        let hi = (b[2 * i] as char).to_digit(16)?;
-        let lo = (b[2 * i + 1] as char).to_digit(16)?;
-        *byte = ((hi << 4) | lo) as u8;
-    }
-    Some(out)
-}
+use wsl_webauthn_protocol::{
+    MAX_REQUEST_BYTES, Request, Response, b64u_encode, hex32_decode, read_frame,
+};
 
 fn main() -> std::process::ExitCode {
     let key_hex = match std::env::var("WSLWT_TEST_SIGNING_KEY") {
@@ -43,8 +31,8 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     };
-    let Some(secret) = hex32(&key_hex) else {
-        eprintln!("dyn_assert_bridge: WSLWT_TEST_SIGNING_KEY must be 64 hex chars");
+    let Some(secret) = hex32_decode(&key_hex) else {
+        eprintln!("dyn_assert_bridge: WSLWT_TEST_SIGNING_KEY must be 64 lowercase hex chars");
         return std::process::ExitCode::from(2);
     };
     let cred_id = match std::env::var("WSLWT_TEST_CRED_ID") {

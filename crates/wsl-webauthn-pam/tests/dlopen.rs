@@ -20,62 +20,15 @@
 
 mod gate;
 
+#[path = "support/artifacts.rs"]
+mod artifacts;
+
 use std::ffi::{CString, c_void};
 use std::path::PathBuf;
 
-/// Locate the built cdylib.
-///
-/// `cargo test` builds the `cdylib` into `target/<profile>/deps/` (next to the test
-/// binaries); `cargo build` puts it at `target/<profile>/`. Both are checked, along
-/// with the alternate profile, resolved from the running test binary and from
-/// `CARGO_MANIFEST_DIR`.
+/// Locate the built cdylib, independently of cargo's artifact layout.
 fn locate_library() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-
-    if let Ok(exe) = std::env::current_exe() {
-        // `target/<profile>/deps/<test>-<hash>`.
-        if let Some(deps_dir) = exe.parent() {
-            candidates.push(deps_dir.join("libpam_wsl_webauthn.so"));
-            if let Some(profile_dir) = deps_dir.parent() {
-                candidates.push(profile_dir.join("libpam_wsl_webauthn.so"));
-                if let Some(target_dir) = profile_dir.parent() {
-                    for profile in ["debug", "release"] {
-                        candidates.push(target_dir.join(profile).join("libpam_wsl_webauthn.so"));
-                        candidates.push(
-                            target_dir
-                                .join(profile)
-                                .join("deps")
-                                .join("libpam_wsl_webauthn.so"),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    // Fallback: the workspace target dir relative to this crate (`<ws>/crates/<crate>`).
-    if let Some(manifest) = std::env::var_os("CARGO_MANIFEST_DIR") {
-        let crate_dir = PathBuf::from(manifest);
-        if let Some(workspace) = crate_dir.parent().and_then(|p| p.parent()) {
-            for profile in ["debug", "release"] {
-                candidates.push(
-                    workspace
-                        .join("target")
-                        .join(profile)
-                        .join("libpam_wsl_webauthn.so"),
-                );
-                candidates.push(
-                    workspace
-                        .join("target")
-                        .join(profile)
-                        .join("deps")
-                        .join("libpam_wsl_webauthn.so"),
-                );
-            }
-        }
-    }
-
-    candidates.into_iter().find(|p| p.exists())
+    artifacts::locate_library()
 }
 
 #[test]
@@ -117,6 +70,51 @@ fn cdylib_exports_all_six_pam_symbols() {
     unsafe {
         libc::dlclose(handle);
     }
+}
+
+/// The module installs a process-wide panic hook whose closure lives in this cdylib, so
+/// the mapping must survive a host `dlclose`. `build.rs` links it with `-z nodelete`,
+/// which sets `DF_1_NODELETE` (GNU ld/lld) and, on older binutils, a `NODELETE` flag on
+/// the `FLAGS` line. Strip and thin LTO do not touch dynamic flags.
+#[test]
+fn cdylib_is_marked_nodelete() {
+    let Some(lib) = locate_library() else {
+        gate::enforce(
+            "libpam_wsl_webauthn.so not found; run `cargo build -p wsl-webauthn-pam` \
+             to exercise this link-flag check",
+        );
+        return;
+    };
+
+    let output = match std::process::Command::new("readelf")
+        .arg("-d")
+        .arg(&lib)
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => {
+            // readelf is not part of the Rust toolchain; its absence is environmental,
+            // not a module defect.
+            eprintln!(
+                "SKIP: cannot run readelf ({error}); not verifying DF_1_NODELETE on {}",
+                lib.display()
+            );
+            return;
+        }
+    };
+    assert!(
+        output.status.success(),
+        "readelf -d {} failed: {}",
+        lib.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dynamic = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        dynamic.contains("NODELETE"),
+        "{} must be linked with -z nodelete (DF_1_NODELETE) so the panic hook's code is \
+         never unmapped by dlclose; readelf -d said:\n{dynamic}",
+        lib.display()
+    );
 }
 
 fn dlerror_string() -> String {

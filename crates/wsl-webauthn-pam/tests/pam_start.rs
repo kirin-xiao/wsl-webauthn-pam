@@ -95,49 +95,9 @@ unsafe extern "C" fn conversation(
     PAM_SUCCESS
 }
 
-/// Locate the built cdylib (mirrors `tests/dlopen.rs`; no `CI` dependence).
+/// Locate the built cdylib, independently of cargo's artifact layout.
 fn locate_library() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(deps_dir) = exe.parent()
-    {
-        candidates.push(deps_dir.join("libpam_wsl_webauthn.so"));
-        if let Some(profile_dir) = deps_dir.parent() {
-            candidates.push(profile_dir.join("libpam_wsl_webauthn.so"));
-            if let Some(target_dir) = profile_dir.parent() {
-                for profile in ["debug", "release"] {
-                    candidates.push(target_dir.join(profile).join("libpam_wsl_webauthn.so"));
-                    candidates.push(
-                        target_dir
-                            .join(profile)
-                            .join("deps")
-                            .join("libpam_wsl_webauthn.so"),
-                    );
-                }
-            }
-        }
-    }
-    if let Some(manifest) = std::env::var_os("CARGO_MANIFEST_DIR") {
-        let crate_dir = PathBuf::from(manifest);
-        if let Some(workspace) = crate_dir.parent().and_then(|p| p.parent()) {
-            for profile in ["debug", "release"] {
-                candidates.push(
-                    workspace
-                        .join("target")
-                        .join(profile)
-                        .join("libpam_wsl_webauthn.so"),
-                );
-                candidates.push(
-                    workspace
-                        .join("target")
-                        .join(profile)
-                        .join("deps")
-                        .join("libpam_wsl_webauthn.so"),
-                );
-            }
-        }
-    }
-    candidates.into_iter().find(|p| p.exists())
+    support::artifacts::locate_library()
 }
 
 fn strerror(pamh: *mut pam_handle_t, rc: c_int) -> String {

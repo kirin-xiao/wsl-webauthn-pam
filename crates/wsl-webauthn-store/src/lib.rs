@@ -40,13 +40,22 @@
 //!   Parsing uses `deny_unknown_fields`, so a record carrying unexpected keys is
 //!   [`StoreError::Corrupt`] (strict, fail-closed). [`CredentialRecord::validate`] also
 //!   enforces the cross-field invariants serde cannot express: `attestation.mode` must be
-//!   `"strict"` or `"unattested-opt-in"`, and a `"strict"` record must be `verified`.
+//!   `"strict"` or `"unattested-opt-in"`, a `"strict"` record must be `verified`, and the
+//!   `attestation.leaf_sha256` / `bridge_sha256` digests, when present, must be exactly 64
+//!   lowercase hex characters (an uppercase or truncated digest is
+//!   [`StoreError::Corrupt`] on load and [`StoreError::Encode`] on save).
 //!   `enrolled_at` is stored but not re-validated here (the verifier/PAM trust only the
 //!   cryptographic fields).
 //! * Writes are atomic: `mkstemp` in the target directory (`.tmp-XXXXXX`), `fchmod 0600`,
-//!   `fsync` the file, then `rename` over the target (or `link` when `replace == false`),
-//!   then `fsync` the directory **on every success path** (durability of the rename). A
-//!   temp file is removed on every error path.
+//!   `fsync` the file, then `renameat` over the target (or `linkat` when `replace ==
+//!   false`) **relative to the held, identity-checked directory descriptor**, then
+//!   `fsync` the directory **on every success path** (durability of the rename). Going
+//!   through the descriptor, not the absolute paths, means a directory swapped in at the
+//!   same path cannot receive the record: the temp name does not exist in the held
+//!   directory, so the install fails `ENOENT` (the temp create is still path-based, for
+//!   want of an `*at` `mkstemp`). A temp file is removed on every error path; after a
+//!   successful `linkat` a failed temp cleanup is ignored, because the record is already
+//!   installed and a leftover `.tmp-*` (root-only `0700` directory) is harmless.
 //!
 //! # JSON schema (`schema_version: 1`)
 //!
@@ -91,7 +100,6 @@
 mod record;
 mod sys;
 
-use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -374,9 +382,17 @@ impl Store {
         self.base.join("config")
     }
 
-    /// `<base>/credentials/<username>.json` (username must already be validated).
+    /// `<base>/credentials/<username>.json`.
+    ///
+    /// `username` must already satisfy [`validate_username`]: every caller validates
+    /// first, so this is a defensive assertion (debug builds panic on a violation) rather
+    /// than an input check that returns an error.
     #[must_use]
     pub fn record_path(&self, username: &str) -> PathBuf {
+        debug_assert!(
+            validate_username(username).is_ok(),
+            "record_path requires a username that passed validate_username"
+        );
         self.credentials_dir().join(format!("{username}.json"))
     }
 
@@ -488,9 +504,12 @@ impl Store {
     /// Ensure `<base>/credentials` exists with mode `0700` and the expected owner,
     /// creating it (and `fchmod`ing to defeat umask) if missing.
     ///
-    /// Returns an ownership/mode-validated `O_DIRECTORY|O_NOFOLLOW` handle used to
-    /// `fsync` the directory entry after installing a file, so callers never re-resolve
-    /// the path against a potentially swapped directory.
+    /// Returns an ownership/mode-validated `O_DIRECTORY|O_NOFOLLOW` handle. It is held for
+    /// the whole install: the temp file is installed (`renameat`/`linkat`) and the
+    /// directory entry is `fsynced` **relative to this descriptor**, so the install cannot
+    /// be redirected into a directory swapped in at the same path. The path is still used
+    /// to *create* the temp file (see [`Store::save_atomic`]); a swap before that create
+    /// makes the descriptor-relative install fail `ENOENT`, which is fail-closed.
     fn ensure_credentials_dir(&self) -> Result<sys::Fd, StoreError> {
         let dir = self.credentials_dir();
         match sys::lstat(&dir) {
@@ -654,14 +673,16 @@ impl Store {
     /// undoing a newer enrollment.
     ///
     /// The write itself follows [`Store::save_atomic`]'s atomic discipline
-    /// (`mkstemp`→`0600`→`fsync`→`rename`→`fsync(dir)`, temp removed on error). The
-    /// `(dev, ino)` compared immediately before the `rename` is the identity captured at
-    /// load time, so the guarded interval is the whole load→check span. The residual is
-    /// the few instructions between the `fstatat` and the `rename`, plus the theoretical
-    /// reuse of `expected`'s inode number by an enrollment that completes inside the
-    /// load→check window; closing that fully would need an inode-generation field or a
-    /// held lock, and it is accepted because the store is root-owned `0700` and the only
-    /// actors are root.
+    /// (`mkstemp`→`0600`→`fsync`→`renameat`→`fsync(dir)`, temp removed on error), with
+    /// both install names resolved relative to the held, identity-checked `credentials`
+    /// descriptor, so a swapped directory cannot receive the record. The `(dev, ino)`
+    /// compared immediately before the `renameat` is the identity captured at load time,
+    /// so the guarded interval is the whole load→check span. The residual is the few
+    /// instructions between the `fstatat` and the `renameat` within the *same* held
+    /// directory, plus the theoretical reuse of `expected`'s inode number by an enrollment
+    /// that completes inside the load→check window; closing that fully would need an
+    /// inode-generation field or a held lock, and it is accepted because the store is
+    /// root-owned `0700` and the only actors are root.
     pub fn update_if_unchanged(
         &self,
         record: &CredentialRecord,
@@ -691,6 +712,8 @@ impl Store {
             message: e.to_string(),
         })?;
 
+        // Path-based temp create; see `save_atomic`: if the directory was swapped since the
+        // descriptor check, the descriptor-relative install below fails `ENOENT`.
         let (fd, temp_path) = sys::mkstemp_in(&dir).map_err(|e| self.io(&dir, e))?;
         let temp = PathBuf::from(temp_path);
         let result = self.write_and_install(&Install {
@@ -741,8 +764,9 @@ impl Store {
         })?;
         self.check_base()?;
         // Re-validate ownership/mode of the destination directory *before* creating a
-        // temp file in it; the returned identity-checked handle is used for the final
-        // directory fsync, so a swapped directory cannot be silently written into.
+        // temp file in it. The returned identity-checked handle then binds the install and
+        // the final directory `fsync` to *that* directory; a directory swapped in at the
+        // same path afterwards cannot receive the record (see `write_and_install`).
         let dir_fd = self.ensure_credentials_dir()?;
 
         let dir = self.credentials_dir();
@@ -765,6 +789,11 @@ impl Store {
             message: e.to_string(),
         })?;
 
+        // Deliberately path-based: there is no `*at` form of `mkstemp`. If the directory is
+        // swapped between the descriptor check above and this create, the temp file lands
+        // in the *replacement* directory while the held descriptor still names the original
+        // one, so the descriptor-relative `renameat`/`linkat` below fails `ENOENT` and
+        // nothing is installed — fail-closed rather than a write into a swapped directory.
         let (fd, temp_path) = sys::mkstemp_in(&dir).map_err(|e| self.io(&dir, e))?;
         let temp = PathBuf::from(temp_path);
         let result = self.write_and_install(&Install {
@@ -789,17 +818,37 @@ impl Store {
         sys::fchmod(install.fd.raw(), install.mode).map_err(|e| self.io(install.temp, e))?;
         sys::write_all(install.fd.raw(), install.contents).map_err(|e| self.io(install.temp, e))?;
         sys::fsync(install.fd.raw()).map_err(|e| self.io(install.temp, e))?;
+        // Install both names relative to the held, identity-checked directory descriptor.
+        // Resolving them against the descriptor (rather than re-walking the absolute paths)
+        // means a directory swapped in at the same path cannot receive the install: the
+        // temp name does not exist in the *held* directory, so the call fails `ENOENT`.
+        let (Some(temp_name), Some(target_name)) =
+            (install.temp.file_name(), install.target.file_name())
+        else {
+            return Err(self.io(
+                install.target,
+                io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"),
+            ));
+        };
         // `Install` holds the only owned `Fd`; dropping it closes the descriptor exactly
         // once.
         if install.replace {
             if let Some(expected) = install.expected_identity {
                 self.ensure_record_unchanged(install, expected)?;
             }
-            sys::rename(install.temp, install.target).map_err(|e| self.io(install.target, e))?;
+            sys::renameat(install.dir_fd.raw(), temp_name, target_name)
+                .map_err(|e| self.io(install.target, e))?;
         } else {
-            match sys::link(install.temp, install.target) {
+            match sys::linkat(install.dir_fd.raw(), temp_name, target_name) {
                 Ok(()) => {
-                    sys::remove_file(install.temp).map_err(|e| self.io(install.temp, e))?;
+                    // Contract: once the link succeeds the install has succeeded. The temp
+                    // name is only a second link to the same inode, so a failed unlink
+                    // (`EACCES`/`EROFS`/`EIO`) must not turn a successful install into an
+                    // error — otherwise callers would assume nothing was written. A
+                    // leftover `.tmp-*` is harmless in the root-owned `0700` directory and
+                    // is best-effort cleanup here, exactly like the failure paths in
+                    // `save_atomic`/`update_if_unchanged`. Never unlink the target here.
+                    let _ = sys::unlinkat(install.dir_fd.raw(), temp_name);
                 }
                 Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
                     return Err(StoreError::AlreadyExists {
@@ -818,7 +867,7 @@ impl Store {
 
     /// Refuse a conditional install when the target no longer resolves to `expected`.
     ///
-    /// Runs immediately before the replacing `rename`, `fstatat`ing the single-component
+    /// Runs immediately before the replacing `renameat`, `fstatat`ing the single-component
     /// name relative to the held, identity-checked `credentials` directory. A missing
     /// target or a different `(dev, ino)` is [`StoreError::RecordChanged`]; a symlink or
     /// non-regular file is refused as [`StoreError::SymlinkedPath`] /
@@ -865,8 +914,11 @@ impl Store {
     /// Remove the record for `username`, returning `false` if there was none.
     ///
     /// Refuses a symlinked `credentials` directory, a symlinked record, and an insecure
-    /// base directory. Unlike [`Store::load`], the record's own ownership/mode are not
-    /// re-checked, so an administrator can clean up a mis-owned record.
+    /// base directory. The directory is opened `O_NOFOLLOW` and its `(dev, ino)` compared
+    /// with the earlier `lstat`, so a directory swapped in mid-operation is
+    /// [`StoreError::PathChanged`] instead of having the unlink redirected into it.
+    /// Unlike [`Store::load`], the record's own ownership/mode are not re-checked, so an
+    /// administrator can clean up a mis-owned record.
     pub fn remove(&self, username: &str) -> Result<bool, StoreError> {
         validate_username(username)?;
         match self.check_base() {
@@ -876,25 +928,35 @@ impl Store {
             Err(e) => return Err(e),
         }
         let dir = self.credentials_dir();
-        match sys::lstat(&dir) {
+        let before = match sys::lstat(&dir) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(self.io(&dir, e)),
-            Ok(st) => {
-                if st.is_symlink() {
-                    return Err(StoreError::SymlinkedPath { path: dir });
-                }
-                if !st.is_dir() {
-                    return Err(StoreError::NotRegularFile { path: dir });
-                }
-            }
+            Ok(st) => st,
+        };
+        if before.is_symlink() {
+            return Err(StoreError::SymlinkedPath { path: dir });
+        }
+        if !before.is_dir() {
+            return Err(StoreError::NotRegularFile { path: dir });
         }
 
-        let target = self.record_path(username);
         // Hold the directory open and unlink relative to it, so the symlink check and the
-        // unlink refer to the same directory even under a concurrent swap.
+        // unlink refer to the same directory even under a concurrent swap. Re-check the
+        // opened descriptor's identity against the `lstat` above (mirroring
+        // `open_checked_dir`), so a directory swapped between the two is refused instead
+        // of having the unlink redirected into it.
         let dfd = sys::open_dir(&dir).map_err(|e| self.io(&dir, e))?;
-        let file_name = format!("{username}.json");
-        let name = OsStr::new(&file_name);
+        let after = sys::fstat(dfd.raw()).map_err(|e| self.io(&dir, e))?;
+        if after.dev != before.dev || after.ino != before.ino {
+            return Err(StoreError::PathChanged { path: dir });
+        }
+        let target = self.record_path(username);
+        // `record_path` always ends in `<username>.json`; refuse rather than panic if that
+        // ever stops holding (this is a library, so an invariant violation must not abort
+        // the caller's process).
+        let Some(name) = target.file_name() else {
+            return Err(StoreError::InvalidUsername);
+        };
         match sys::fstatat_nofollow(dfd.raw(), name) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(self.io(&target, e)),
@@ -916,6 +978,20 @@ impl Store {
     /// A missing base or `credentials` directory yields an empty list. An insecure base
     /// is refused as [`StoreError::InsecureBase`]. Non-regular files, symlinks, and
     /// names that fail [`validate_username`] are skipped.
+    ///
+    /// # Residual: the directory is re-resolved by path
+    ///
+    /// Unlike [`Store::load`] and the write path, this is the one operation that is not
+    /// descriptor-bound: `lstat` checks the `credentials` directory, but the subsequent
+    /// listing goes through `std::fs::read_dir(&dir)`, which re-resolves the path (the
+    /// standard library exposes no `fdopendir`/`readdir` over a held descriptor). A
+    /// directory swapped between the check and the listing is therefore not detected by a
+    /// `(dev, ino)` recheck, and [`Store::check_base`] is the only guard. That is accepted
+    /// because `list` is read-only and advisory (an operator-facing inventory, never an
+    /// authentication decision), it returns only filtered names, and a hostile swap
+    /// requires write access to the root-owned base directory — the very condition
+    /// `check_base` refuses. Closing it properly needs a `readdir` wrapper in the audited
+    /// syscall module.
     pub fn list(&self) -> Result<Vec<String>, StoreError> {
         match self.check_base() {
             Ok(_) => {}
@@ -1004,8 +1080,9 @@ impl Store {
             }
             Err(e) => return Err(e),
         };
-        // Hold an identity-checked base descriptor for the final fsync. The base has no
-        // exact-mode requirement, so this mirrors `open_checked_dir` without imposing one.
+        // Hold an identity-checked base descriptor for the descriptor-relative install and
+        // the final fsync. The base has no exact-mode requirement, so this mirrors
+        // `open_checked_dir` without imposing one.
         let base_fd = sys::open_dir(&self.base).map_err(|e| self.io(&self.base, e))?;
         let after = sys::fstat(base_fd.raw()).map_err(|e| self.io(&self.base, e))?;
         if after.uid != self.owner_uid || after.perm_bits() & 0o022 != 0 {
@@ -1023,6 +1100,8 @@ impl Store {
         }
 
         let toml_bytes = config.to_toml().into_bytes();
+        // Path-based temp create; see `save_atomic`: a directory swapped since the
+        // descriptor check makes the descriptor-relative install fail `ENOENT`.
         let (fd, temp_path) = sys::mkstemp_in(&self.base).map_err(|e| self.io(&self.base, e))?;
         let temp = PathBuf::from(temp_path);
         let result = self.write_and_install(&Install {
@@ -1073,4 +1152,135 @@ pub fn current_euid() -> u32 {
 /// The real uid of the calling process.
 pub fn current_uid() -> u32 {
     sys::getuid()
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests that need a private seam.
+    //!
+    //! The bulk of the store's tests are integration tests in `tests/store.rs`; these few
+    //! exist only because they must drive an internal step that the public API cannot reach
+    //! deterministically (a stale directory descriptor).
+
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A `credentials` directory swapped after its descriptor was identity-checked must
+    /// make the descriptor-relative install fail closed, and must never place a record in
+    /// the replacement directory (nor in the directory that was swapped away).
+    ///
+    /// This exercises the install step directly: `save_atomic` cannot be used, because a
+    /// single-threaded test cannot reliably time a swap between its `lstat` and its
+    /// `open`, and a whole-base swap is not the window being tested. Holding a genuine
+    /// descriptor for the *old* directory and installing relative to it is the
+    /// deterministic equivalent, modelled on the CLI's
+    /// `atomic_write_rejects_swapped_parent_dir`.
+    #[test]
+    fn install_rejects_swapped_credentials_dir() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Store::with_owner(tmp.path(), sys::geteuid());
+
+        // Create and identity-check the real `credentials` directory, as `save_atomic` does.
+        let dir_fd = store.ensure_credentials_dir().expect("checked dir");
+        let dir = store.credentials_dir();
+
+        // Swap it: rename the checked directory away (renaming rather than removing keeps
+        // its inode alive, so the replacement cannot be handed the same `(dev, ino)`), then
+        // recreate the same path as a fresh directory. This is the attacker's move between
+        // the directory check and the install.
+        let original = tmp.path().join("original-credentials");
+        std::fs::rename(&dir, &original).expect("swap away");
+        std::fs::create_dir(&dir).expect("replacement");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let target = store.record_path("alice");
+
+        // `replace == false` (the `linkat` branch): the temp name does not exist in the held
+        // directory, so the install must fail and install nothing anywhere.
+        let (fd, temp_path) = sys::mkstemp_in(&dir).expect("temp in replacement dir");
+        let temp = PathBuf::from(temp_path);
+        let err = store
+            .write_and_install(&Install {
+                fd,
+                temp: &temp,
+                target: &target,
+                contents: b"{}",
+                replace: false,
+                dir_fd: &dir_fd,
+                mode: FILE_MODE,
+                dir_path: &dir,
+                expected_identity: None,
+            })
+            .expect_err("install through a stale descriptor must fail");
+        match &err {
+            StoreError::Io { source, .. } => {
+                assert_eq!(
+                    source.raw_os_error(),
+                    Some(libc::ENOENT),
+                    "the temp name does not exist in the held directory: {source}"
+                );
+            }
+            other => panic!("expected an i/o error from the stale install, got {other:?}"),
+        }
+        assert!(
+            !target.exists(),
+            "no record may appear in the replacement directory"
+        );
+        assert!(
+            !original.join("alice.json").exists(),
+            "no record may appear in the swapped-away directory"
+        );
+        let _ = sys::remove_file(&temp);
+
+        // `replace == true` (the `renameat` branch) must fail the same way.
+        let (fd, temp_path) = sys::mkstemp_in(&dir).expect("temp in replacement dir");
+        let temp = PathBuf::from(temp_path);
+        let err = store
+            .write_and_install(&Install {
+                fd,
+                temp: &temp,
+                target: &target,
+                contents: b"{}",
+                replace: true,
+                dir_fd: &dir_fd,
+                mode: FILE_MODE,
+                dir_path: &dir,
+                expected_identity: None,
+            })
+            .expect_err("replacing install through a stale descriptor must fail");
+        match &err {
+            StoreError::Io { source, .. } => assert_eq!(
+                source.raw_os_error(),
+                Some(libc::ENOENT),
+                "the temp name does not exist in the held directory: {source}"
+            ),
+            other => panic!("expected an i/o error from the stale install, got {other:?}"),
+        }
+        assert!(!target.exists());
+        let _ = sys::remove_file(&temp);
+
+        // Control: a descriptor opened on the *replacement* directory accepts the same
+        // install, pinning the failure above on the stale identity rather than on anything
+        // else (the temp create is path-based and would otherwise mask the real check).
+        let fresh_fd = store
+            .ensure_credentials_dir()
+            .expect("replacement is valid");
+        let (fd, temp_path) = sys::mkstemp_in(&dir).expect("temp");
+        let temp = PathBuf::from(temp_path);
+        store
+            .write_and_install(&Install {
+                fd,
+                temp: &temp,
+                target: &target,
+                contents: b"{}",
+                replace: false,
+                dir_fd: &fresh_fd,
+                mode: FILE_MODE,
+                dir_path: &dir,
+                expected_identity: None,
+            })
+            .expect("install through a current descriptor succeeds");
+        assert!(target.exists(), "the control install must write the record");
+    }
 }

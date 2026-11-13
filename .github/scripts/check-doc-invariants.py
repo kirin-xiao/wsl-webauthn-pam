@@ -520,6 +520,28 @@ INVARIANTS = [
         "marker": True,
     },
     {
+        "id": "PAM-PANIC-HOOK-CHAINS",
+        "level": "high",
+        "claims": [
+            (COBR, "chains to the host's panic hook"),
+        ],
+        "tests": [
+            {
+                "name": "panic_hook_chains_to_the_host_hook_and_suppresses_only_its_own_panics",
+                "expect": ["foreign_panic_count()", "captured()", "PAM_ABORT"],
+                "forbid": ["PAM_SUCCESS"],
+                "file": "crates/wsl-webauthn-pam/tests/panic_hook.rs",
+            },
+        ],
+        "static": [
+            (
+                "crates/wsl-webauthn-pam/build.rs",
+                "-Wl,-z,nodelete",
+            ),
+        ],
+        "marker": True,
+    },
+    {
         "id": "PAM-FAIL-DELAY",
         "level": "medium",
         "claims": [(COBR, "pam_fail_delay(pamh, 2_000_000)")],

@@ -5,15 +5,18 @@
 //!
 //! Syscalls used:
 //! * `open(2)` / `openat(2)` — `O_RDONLY|O_NOFOLLOW|O_NOCTTY|O_CLOEXEC` credential reads
-//!   and `O_DIRECTORY|…` directory handles for `fsync`/`rename`.
+//!   and `O_DIRECTORY|…` directory handles for `fsync`/install.
 //! * `fstat(2)` — ownership/mode checks on an opened fd (post-open, TOCTOU-safe).
 //! * `mkstemp(3)` — create a uniquely named temp file in the target directory.
-//! * `fchmod(2)` / `fsync(2)` / `rename(2)` — atomic, root-owned writes.
-//! * `unlink(2)` — temp cleanup.
+//! * `fchmod(2)` / `fsync(2)` — root-owned writes and durable directory entries.
+//! * `renameat(2)` / `linkat(2)` — install a temp file **relative to a held directory
+//!   descriptor**, so a concurrently swapped directory cannot redirect the install.
+//! * `unlink(2)` — temp cleanup on error paths.
 //! * `mkdir(2)` — create the credentials directory.
 //! * `lstat(2)` / `fstatat(2)` — symlink detection on every path component, including
 //!   relative to a held directory descriptor.
-//! * `unlinkat(2)` — remove a record relative to a held directory descriptor.
+//! * `unlinkat(2)` — remove a record (or a linked-in temp name) relative to a held
+//!   directory descriptor.
 
 #![allow(unsafe_code)]
 
@@ -146,7 +149,8 @@ pub(crate) fn unlinkat(dirfd: RawFd, name: &OsStr) -> io::Result<()> {
     Ok(())
 }
 
-/// Open a directory for `fsync`/`rename` bookkeeping with `O_DIRECTORY|O_NOFOLLOW`.
+/// Open a directory for `fsync`/descriptor-relative install bookkeeping with
+/// `O_DIRECTORY|O_NOFOLLOW`.
 pub(crate) fn open_dir(path: &Path) -> io::Result<Fd> {
     let c = cpath(path)?;
     let flags =
@@ -209,12 +213,19 @@ pub(crate) fn remove_file(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// `rename(2)` — atomic within a single filesystem.
-pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
-    let from_c = cpath(from)?;
-    let to_c = cpath(to)?;
-    // SAFETY: both are valid NUL-terminated paths; rename replaces the destination.
-    let rc = unsafe { libc::rename(from_c.as_ptr(), to_c.as_ptr()) };
+/// `renameat(dirfd, from, dirfd, to)` — atomically rename a single path component
+/// relative to a held directory descriptor.
+///
+/// Both names must be single components resolved against `dirfd`, so the rename cannot be
+/// redirected by swapping the directory at its absolute path.
+pub(crate) fn renameat(dirfd: RawFd, from: &OsStr, to: &OsStr) -> io::Result<()> {
+    let from_c = CString::new(from.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains NUL byte"))?;
+    let to_c = CString::new(to.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains NUL byte"))?;
+    // SAFETY: `dirfd` is an owned directory descriptor and both names are valid
+    // NUL-terminated single components; renameat retains neither pointer.
+    let rc = unsafe { libc::renameat(dirfd, from_c.as_ptr(), dirfd, to_c.as_ptr()) };
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -319,14 +330,20 @@ pub(crate) fn read_capped(fd: RawFd, cap: usize) -> io::Result<Option<Vec<u8>>> 
     }
 }
 
-/// `link(2)`: create `to` as a hard link to `from`, failing with `EEXIST` if `to` exists.
+/// `linkat(dirfd, from, dirfd, to, 0)`: create `to` as a hard link to `from`, relative to
+/// a held directory descriptor, failing with `EEXIST` if `to` exists.
 ///
 /// Used to install a file without ever clobbering an existing one (`replace == false`).
-pub(crate) fn link(from: &Path, to: &Path) -> io::Result<()> {
-    let from_c = cpath(from)?;
-    let to_c = cpath(to)?;
-    // SAFETY: both are valid NUL-terminated paths; link never follows a final symlink.
-    let rc = unsafe { libc::link(from_c.as_ptr(), to_c.as_ptr()) };
+/// Both names must be single components resolved against `dirfd`.
+pub(crate) fn linkat(dirfd: RawFd, from: &OsStr, to: &OsStr) -> io::Result<()> {
+    let from_c = CString::new(from.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains NUL byte"))?;
+    let to_c = CString::new(to.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains NUL byte"))?;
+    // SAFETY: `dirfd` is an owned directory descriptor and both names are valid
+    // NUL-terminated single components; flags 0 does not follow symlinks and linkat
+    // retains neither pointer.
+    let rc = unsafe { libc::linkat(dirfd, from_c.as_ptr(), dirfd, to_c.as_ptr(), 0) };
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }

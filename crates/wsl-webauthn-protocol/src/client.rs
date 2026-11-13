@@ -92,17 +92,8 @@ pub fn build_client_data(kind: ClientDataKind, challenge: &[u8]) -> Result<Vec<u
         challenge: b64u_encode(challenge),
         origin: ORIGIN,
     };
-    // Serializing this fixed, all-`String`/`&str` struct cannot fail; fall back to a
-    // hand-built object rather than panicking if serde_json ever surprises us.
-    Ok(serde_json::to_vec(&data).unwrap_or_else(|_| {
-        let mut out = Vec::new();
-        out.extend_from_slice(br#"{"type":""#);
-        out.extend_from_slice(kind.as_str().as_bytes());
-        out.extend_from_slice(br#"","challenge":""#);
-        out.extend_from_slice(b64u_encode(challenge).as_bytes());
-        out.extend_from_slice(br#"","origin":""#);
-        out.extend_from_slice(ORIGIN.as_bytes());
-        out.extend_from_slice(br#""}"#);
-        out
-    }))
+    // `ClientData` is three plain string fields with a derived `Serialize`: no map keys,
+    // floats or custom impls, so this cannot fail. Panicking here would be a bug in this
+    // function, not an input error.
+    Ok(serde_json::to_vec(&data).expect("ClientData serialization cannot fail"))
 }

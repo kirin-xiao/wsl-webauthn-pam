@@ -13,8 +13,12 @@ use std::time::Duration;
 use support::*;
 
 use pam_wsl_webauthn::ModuleArgs;
+use pam_wsl_webauthn::logger::{begin_capture, captured, install_panic_hook};
 use pam_wsl_webauthn::logic::{AuthOutcome, FAIL_DELAY_USEC, authenticate, run};
 use pam_wsl_webauthn::seam::SeamError;
+
+/// syslog `LOG_CRIT` (the priority of the module's panic record).
+const LOG_CRIT: i32 = 2;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -692,10 +696,56 @@ fn record_origin_mismatch_is_authinfo_unavail() {
 fn injected_panic_returns_pam_abort() {
     let (_f, mut seam, mut deps) = happy();
     deps.panic = true;
-    assert_eq!(run_basic(&mut seam, &deps, 0, &[]), PAM_ABORT);
+    install_capture();
+    begin_capture();
+    assert_eq!(run(&mut seam, &deps, 0, &[]), PAM_ABORT);
     assert!(
         seam.fail_delays.is_empty(),
         "a panic must not request a fail delay"
+    );
+
+    // `PAM_ABORT` alone would also hold if the panic hook were a silent no-op, so assert
+    // the audit record the hook must emit (a second LOG_CRIT line comes from `run`'s own
+    // catch handler).
+    let records = captured();
+    let hook_records: Vec<_> = records
+        .iter()
+        .filter(|(priority, msg)| {
+            *priority == LOG_CRIT && msg.contains("panic in pam_wsl_webauthn")
+        })
+        .collect();
+    assert_eq!(
+        hook_records.len(),
+        1,
+        "the panic hook must emit exactly one LOG_CRIT record, got {records:?}"
+    );
+    assert!(
+        hook_records[0]
+            .1
+            .contains("injected panic for PAM_ABORT coverage"),
+        "the record must carry the panic payload: {:?}",
+        hook_records[0].1
+    );
+}
+
+/// A panic raised outside the module's guarded scope belongs to the host and must be
+/// chained to the previous hook, not logged as a `pam_wsl_webauthn` panic in `authpriv`.
+///
+/// Under libtest the previous (default) hook reports through the harness's per-thread
+/// output capture rather than fd 2, so delegation is asserted on the module recorder —
+/// no record means the hook forwarded. The explicit delegation itself (an observable
+/// previous hook) is covered in `tests/panic_hook.rs`, its own process.
+#[test]
+fn foreign_panic_is_not_logged_as_a_module_panic() {
+    install_panic_hook();
+    begin_capture();
+
+    let result = std::panic::catch_unwind(|| panic!("foreign sentinel"));
+    assert!(result.is_err(), "the test panic must unwind");
+    assert!(
+        captured().is_empty(),
+        "a panic outside the guarded scope must not be attributed to the module: {:?}",
+        captured()
     );
 }
 

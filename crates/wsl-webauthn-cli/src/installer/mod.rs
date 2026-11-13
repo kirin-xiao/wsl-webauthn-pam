@@ -256,6 +256,17 @@ fn helper_command(program: &str, args: &[&str], non_interactive: bool) -> std::p
     command
 }
 
+/// Kill `child` and reap it, best effort.
+///
+/// Dropping a [`std::process::Child`] does not reap it: an error path that returns without
+/// waiting leaves a zombie (and may leave the helper running). Kill and wait are both best
+/// effort — the caller's own error is the one worth reporting, so their failures are not
+/// allowed to mask it.
+fn abort_child(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 impl CommandRunner for RealCommands {
     fn run(
         &self,
@@ -277,8 +288,7 @@ impl CommandRunner for RealCommands {
                 }
                 Ok(None) => {
                     if Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        abort_child(&mut child);
                         return Err(format!(
                             "{program} did not finish within {}s and was killed; run it by \
                              hand once the terminal is interactive",
@@ -287,7 +297,10 @@ impl CommandRunner for RealCommands {
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                Err(e) => return Err(format!("could not wait for {program}: {e}")),
+                Err(e) => {
+                    abort_child(&mut child);
+                    return Err(format!("could not wait for {program}: {e}"));
+                }
             }
         }
     }
@@ -1256,42 +1269,100 @@ impl Legacy {
 }
 
 /// Detect the legacy module in every candidate security directory.
-pub(crate) fn detect_legacy(paths: &InstallPaths) -> Legacy {
+///
+/// Only a genuinely absent path ([`std::io::ErrorKind::NotFound`]) means "no legacy
+/// install"; every other filesystem error is propagated. Treating `EACCES`/`EIO`/`ELOOP`
+/// as absence could skip a migration and leave a stale `/etc/pam.d` reference behind after
+/// the old `.so` is removed — a lockout.
+pub(crate) fn detect_legacy(paths: &InstallPaths) -> anyhow::Result<Legacy> {
     let mut modules = Vec::new();
-    let mut push = |dir: &Path| {
-        let candidate = dir.join(LEGACY_MODULE_NAME);
-        if fsutil::lstat_opt(&candidate).ok().flatten().is_some() {
-            modules.push(candidate);
-        }
-    };
     for root in &paths.module_search_roots {
-        push(&root.join("security"));
-        if let Ok(entries) = std::fs::read_dir(root) {
-            let mut subdirs: Vec<PathBuf> = entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.is_dir())
-                .collect();
-            subdirs.sort();
-            for subdir in subdirs {
-                push(&subdir.join("security"));
-            }
+        push_if_present(
+            &mut modules,
+            &root.join("security").join(LEGACY_MODULE_NAME),
+        )?;
+        for subdir in read_subdirs(root)? {
+            push_if_present(
+                &mut modules,
+                &subdir.join("security").join(LEGACY_MODULE_NAME),
+            )?;
         }
     }
     modules.sort();
     modules.dedup();
 
-    Legacy {
+    Ok(Legacy {
         modules,
-        config_dir: fsutil::lstat_opt(&paths.legacy_config_dir)
-            .ok()
-            .flatten()
-            .map(|_| paths.legacy_config_dir.clone()),
-        profile: fsutil::lstat_opt(&paths.legacy_profile_path())
-            .ok()
-            .flatten()
-            .map(|_| paths.legacy_profile_path()),
+        config_dir: existing_path(&paths.legacy_config_dir)?,
+        profile: existing_path(&paths.legacy_profile_path())?,
+    })
+}
+
+/// Push `candidate` onto `found` when it exists (`lstat`, never following a final symlink).
+fn push_if_present(found: &mut Vec<PathBuf>, candidate: &Path) -> anyhow::Result<()> {
+    if fsutil::lstat_opt(candidate)
+        .with_context(|| format!("checking {}", candidate.display()))?
+        .is_some()
+    {
+        found.push(candidate.to_path_buf());
     }
+    Ok(())
+}
+
+/// `Some(path)` when `path` exists, `None` when it is absent; any other error propagates.
+fn existing_path(path: &Path) -> anyhow::Result<Option<PathBuf>> {
+    Ok(fsutil::lstat_opt(path)
+        .with_context(|| format!("checking {}", path.display()))?
+        .map(|_| path.to_path_buf()))
+}
+
+/// The immediate subdirectories of `root`, sorted.
+///
+/// An absent root is normal (`/usr/lib64` need not exist on a merged-`/usr` system), so
+/// `NotFound` yields an empty list; every other error (notably `EACCES`) is propagated
+/// rather than hidden, or an unreadable directory could conceal an installed module.
+fn read_subdirs(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!("reading {}", root.display())));
+        }
+    };
+    let mut subdirs = Vec::new();
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("reading {}", root.display()))?
+            .path();
+        if path.is_dir() {
+            subdirs.push(path);
+        }
+    }
+    subdirs.sort();
+    Ok(subdirs)
+}
+
+/// The `/etc/pam.d` directory to scan, or `None` when it is absent or not a directory.
+///
+/// A symlinked `pam.d` is refused, exactly as [`ensure_bin_dir`] and
+/// [`resolve_module_dir`] refuse a symlinked directory: scanning through a link planted at
+/// `/etc/pam.d` would redirect the rewrite/restore into an arbitrary directory.
+fn pam_d_dir(paths: &InstallPaths) -> anyhow::Result<Option<&Path>> {
+    let Some(md) = fsutil::lstat_opt(&paths.pam_d)
+        .with_context(|| format!("checking {}", paths.pam_d.display()))?
+    else {
+        return Ok(None);
+    };
+    if md.file_type().is_symlink() {
+        bail!(
+            "refusing to use a symlinked pam.d directory: {}",
+            paths.pam_d.display()
+        );
+    }
+    if !md.is_dir() {
+        return Ok(None);
+    }
+    Ok(Some(paths.pam_d.as_path()))
 }
 
 /// Rewrite `/etc/pam.d/*` references from `pam_wsl_hello` to `pam_wsl_webauthn.so`.
@@ -1313,12 +1384,19 @@ fn migrate_rewrite_pam_d(
     prompter: &dyn Prompter,
     ui: &Ui,
 ) -> anyhow::Result<usize> {
-    if !paths.pam_d.is_dir() {
+    let Some(pam_d) = pam_d_dir(paths)? else {
         return Ok(0);
+    };
+    let entries =
+        std::fs::read_dir(pam_d).with_context(|| format!("reading {}", pam_d.display()))?;
+    let mut files: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        files.push(
+            entry
+                .with_context(|| format!("reading {}", pam_d.display()))?
+                .path(),
+        );
     }
-    let entries = std::fs::read_dir(&paths.pam_d)
-        .with_context(|| format!("reading {}", paths.pam_d.display()))?;
-    let mut files: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
     files.sort();
 
     let mut rewritten = 0usize;
@@ -1667,7 +1745,11 @@ pub(crate) fn enable_after_enroll(
 }
 
 /// Print the planned mutations for `--dry-run` without touching the system.
-fn print_dry_run(paths: &InstallPaths, module_dir: &Path, pam_auth_update: bool) {
+fn print_dry_run(
+    paths: &InstallPaths,
+    module_dir: &Path,
+    pam_auth_update: bool,
+) -> anyhow::Result<()> {
     println!("Dry run: resolved everything; nothing will be written.");
     println!(
         "  bridge:      %LOCALAPPDATA%\\Programs\\wsl-webauthn-pam\\{BRIDGE_EXE} (would copy)"
@@ -1683,7 +1765,7 @@ fn print_dry_run(paths: &InstallPaths, module_dir: &Path, pam_auth_update: bool)
     );
     println!("  profile:     {} (0644)", paths.profile_path().display());
 
-    let legacy = detect_legacy(paths);
+    let legacy = detect_legacy(paths)?;
     if legacy.is_present() {
         println!("  legacy cleanup would be offered (old credentials are never imported):");
         for module in &legacy.modules {
@@ -1713,6 +1795,7 @@ fn print_dry_run(paths: &InstallPaths, module_dir: &Path, pam_auth_update: bool)
     }
     // Name the installed CLI so a `--dry-run` shows the real post-install command.
     println!("  cli:         {}", paths.bin_dir.join(CLI_NAME).display());
+    Ok(())
 }
 
 /// The lines of post-install guidance (pure, so the text is testable).
@@ -1795,7 +1878,7 @@ pub(crate) fn install_with(
     let pam_auth_update = commands.available("pam-auth-update");
 
     if opts.dry_run {
-        print_dry_run(paths, &module_dir, pam_auth_update);
+        print_dry_run(paths, &module_dir, pam_auth_update)?;
         return Ok(EXIT_OK);
     }
 
@@ -1839,7 +1922,7 @@ pub(crate) fn install_with(
     let enroll_cmd = cli_dest.display().to_string();
 
     // 6. Legacy migration, only after our module/profile are verified.
-    let legacy = detect_legacy(paths);
+    let legacy = detect_legacy(paths)?;
     if legacy.is_present() {
         detail!(ui, "");
         detail!(ui, "Legacy WSL-Hello-sudo installation detected:");
@@ -2017,34 +2100,27 @@ pub(crate) fn uninstall_user(
 }
 
 /// Find installed copies of our module under the module search roots.
-fn find_installed_modules(paths: &InstallPaths, explicit: Option<&Path>) -> Vec<PathBuf> {
+///
+/// As in [`detect_legacy`], `NotFound` means "not installed" while every other error is
+/// propagated: uninstall must not report success after silently failing to see a module
+/// that is still on disk.
+fn find_installed_modules(
+    paths: &InstallPaths,
+    explicit: Option<&Path>,
+) -> anyhow::Result<Vec<PathBuf>> {
     let mut found = Vec::new();
-    let mut probe = |dir: &Path| {
-        let candidate = dir.join(MODULE_NAME);
-        if fsutil::lstat_opt(&candidate).ok().flatten().is_some() {
-            found.push(candidate);
-        }
-    };
     if let Some(dir) = explicit {
-        probe(dir);
+        push_if_present(&mut found, &dir.join(MODULE_NAME))?;
     }
     for root in &paths.module_search_roots {
-        probe(&root.join("security"));
-        if let Ok(entries) = std::fs::read_dir(root) {
-            let mut subdirs: Vec<PathBuf> = entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.is_dir())
-                .collect();
-            subdirs.sort();
-            for subdir in subdirs {
-                probe(&subdir.join("security"));
-            }
+        push_if_present(&mut found, &root.join("security").join(MODULE_NAME))?;
+        for subdir in read_subdirs(root)? {
+            push_if_present(&mut found, &subdir.join("security").join(MODULE_NAME))?;
         }
     }
     found.sort();
     found.dedup();
-    found
+    Ok(found)
 }
 
 /// Resolve the Windows bridge directory (`%LOCALAPPDATA%\Programs\wsl-webauthn-pam`).
@@ -2077,20 +2153,24 @@ fn original_from_backup(backup: &Path) -> Option<PathBuf> {
 ///
 /// Returns the number of files restored.
 fn restore_pam_d_backups(paths: &InstallPaths, prompter: &dyn Prompter) -> anyhow::Result<usize> {
-    if !paths.pam_d.is_dir() {
+    let Some(pam_d) = pam_d_dir(paths)? else {
         return Ok(0);
+    };
+    let entries =
+        std::fs::read_dir(pam_d).with_context(|| format!("reading {}", pam_d.display()))?;
+    let mut backups: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("reading {}", pam_d.display()))?
+            .path();
+        if path
+            .file_name()
+            .map(|n| n.to_string_lossy().contains(fsutil::BACKUP_MARKER))
+            .unwrap_or(false)
+        {
+            backups.push(path);
+        }
     }
-    let entries = std::fs::read_dir(&paths.pam_d)
-        .with_context(|| format!("reading {}", paths.pam_d.display()))?;
-    let mut backups: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .map(|n| n.to_string_lossy().contains(fsutil::BACKUP_MARKER))
-                .unwrap_or(false)
-        })
-        .collect();
     backups.sort();
 
     let mut restored = 0usize;
@@ -2155,17 +2235,18 @@ fn restore_pam_d_backups(paths: &InstallPaths, prompter: &dyn Prompter) -> anyho
 }
 
 /// Warn (never edit) if `/etc/pam.d` still references our module.
-fn warn_pam_d_references(paths: &InstallPaths) {
-    if !paths.pam_d.is_dir() {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(&paths.pam_d) else {
-        return;
+fn warn_pam_d_references(paths: &InstallPaths) -> anyhow::Result<()> {
+    let Some(pam_d) = pam_d_dir(paths)? else {
+        return Ok(());
     };
+    let entries =
+        std::fs::read_dir(pam_d).with_context(|| format!("reading {}", pam_d.display()))?;
     let mut hits: Vec<PathBuf> = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(md) = fsutil::lstat_opt(&path).ok().flatten() else {
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("reading {}", pam_d.display()))?
+            .path();
+        let Some(md) = fsutil::lstat_opt(&path)? else {
             continue;
         };
         if !md.is_file() || md.file_type().is_symlink() {
@@ -2178,9 +2259,9 @@ fn warn_pam_d_references(paths: &InstallPaths) {
         if name.contains(fsutil::BACKUP_MARKER) || name.contains(fsutil::TEMP_MARKER) {
             continue;
         }
-        if let Ok(bytes) = fsutil::read_nofollow(&path)
-            && bytes.windows(MODULE_STEM.len()).any(|w| w == MODULE_STEM)
-        {
+        let bytes =
+            fsutil::read_nofollow(&path).with_context(|| format!("reading {}", path.display()))?;
+        if bytes.windows(MODULE_STEM.len()).any(|w| w == MODULE_STEM) {
             hits.push(path);
         }
     }
@@ -2192,6 +2273,7 @@ fn warn_pam_d_references(paths: &InstallPaths) {
         }
         eprintln!("Fix these by hand (or run `pam-auth-update`) before relying on sudo/su.");
     }
+    Ok(())
 }
 
 /// Execute a full uninstall against `paths`.
@@ -2249,7 +2331,7 @@ pub(crate) fn uninstall_all(
     }
 
     // 3. Module(s).
-    for module in find_installed_modules(paths, opts.module_dir.as_deref()) {
+    for module in find_installed_modules(paths, opts.module_dir.as_deref())? {
         if prompter.confirm(&format!("Remove {}?", module.display()), true)? {
             fsutil::remove_file(&module)?;
             println!("  removed {}", module.display());
@@ -2313,7 +2395,7 @@ pub(crate) fn uninstall_all(
 
     // 7. Fallback: migrations may not have left a backup (or the file was edited by
     // hand). Never blind-edit /etc/pam.d on uninstall; warn about leftover references.
-    warn_pam_d_references(paths);
+    warn_pam_d_references(paths)?;
 
     // 8. The legacy /etc/pam_wsl_hello is NEVER removed (it is not ours).
     println!();

@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use wsl_webauthn_protocol::{
     BridgeError, ClientDataKind, ORIGIN, RP_ID, b64u_decode, b64u_encode, build_client_data,
+    hex32_decode,
 };
 use wsl_webauthn_runner::{AssertParams, RunnerError, RunnerResponse};
 use wsl_webauthn_store::{Config, CredentialRecord, FileIdentity, StoreError};
@@ -133,11 +134,15 @@ pub trait Deps {
     ) -> Result<RunnerResponse, RunnerError> {
         self.authenticate(bridge, win_mnt, expected_sha256, params, deadline)
     }
-    /// Test-only panic injection point.
+    /// Deliberate, documented panic-injection seam (see `SECURITY.md`).
     ///
-    /// The default is a no-op and no production `Deps` implementation overrides it, so no
-    /// shipped artifact can panic here. The test double overrides it to drive the
-    /// `PAM_ABORT`-on-panic contract.
+    /// The test double in `tests/support/mod.rs` overrides this to panic inside the
+    /// guarded region; `tests/pam.rs::injected_panic_returns_pam_abort` uses it to prove
+    /// that a panic in module code maps to `PAM_ABORT` (fail closed) rather than
+    /// unwinding across the C ABI. The default is a no-op and no production `Deps`
+    /// implementation overrides it, so no shipped artifact can panic here. It lives on
+    /// the production trait because the seam and its test double sit on opposite sides of
+    /// the crate boundary.
     fn panic_probe(&self) {}
 }
 
@@ -363,8 +368,9 @@ fn fail(code: i32, reason: impl Into<String>) -> AuthOutcome {
     AuthOutcome::Failure { code, reason }
 }
 
-/// Run the authentication state machine. May panic only through the test-only
-/// [`Deps::panic_probe`]; production never panics.
+/// Run the authentication state machine. May panic only through the documented
+/// panic-injection seam [`Deps::panic_probe`] (see `SECURITY.md`); production never
+/// panics.
 pub fn authenticate<S: PamSeam, D: Deps>(
     seam: &mut S,
     deps: &D,
@@ -372,8 +378,8 @@ pub fn authenticate<S: PamSeam, D: Deps>(
     args: &ModuleArgs,
 ) -> AuthOutcome {
     let silent = (flags & PAM_SILENT) != 0;
-    // Test-only injection point just inside the guarded region; only the test double
-    // overrides `panic_probe`.
+    // Deliberate, documented panic-injection seam (see `SECURITY.md`): only the test
+    // double overrides `panic_probe`, driving `tests/pam.rs::injected_panic_returns_pam_abort`.
     deps.panic_probe();
 
     // --- 1. Username -----------------------------------------------------
@@ -460,7 +466,7 @@ pub fn authenticate<S: PamSeam, D: Deps>(
             format!("bridge executable path is not trusted: {e}"),
         );
     }
-    let expected = match decode_hex32(&record.bridge_sha256) {
+    let expected = match hex32_decode(&record.bridge_sha256) {
         Some(v) => v,
         None => {
             return fail(
@@ -669,6 +675,11 @@ pub fn run<S: PamSeam, D: Deps>(seam: &mut S, deps: &D, flags: i32, raw_args: &[
     // Install the syslog-only panic hook before enclosing `authenticate` in
     // `catch_unwind`; this also covers direct callers that skip `guarded`.
     logger::install_panic_hook();
+    // Enter the module scope around the `catch_unwind` so a panic raised anywhere in
+    // `authenticate` (including the std code and workspace crates it calls) is attributed
+    // to this module by the hook. The depth counter keeps this correct when `guarded`
+    // has already entered the scope.
+    let _scope = logger::enter_module_scope();
     let args = crate::args::parse(raw_args);
     logger::set_debug(args.debug);
     logger::debug(&format!(
@@ -696,35 +707,6 @@ pub fn run<S: PamSeam, D: Deps>(seam: &mut S, deps: &D, flags: i32, raw_args: &[
         }
     }
 }
-
-/// Decode a lowercase hex 32-byte digest.
-fn decode_hex32(s: &str) -> Option<[u8; 32]> {
-    let bytes = s.as_bytes();
-    if bytes.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        let hi = hex_nibble(bytes[2 * i])?;
-        let lo = hex_nibble(bytes[2 * i + 1])?;
-        *byte = (hi << 4) | lo;
-    }
-    Some(out)
-}
-
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-// Keep `SeamError` referenced from the trait contract documentation without importing
-// it into the value namespace.
-#[allow(unused_imports)]
-use crate::seam::SeamError as _SeamError;
 
 #[cfg(test)]
 mod tests {
@@ -853,14 +835,20 @@ mod tests {
         }
     }
 
+    /// The record's pin must be canonical lowercase hex: the protocol decoder is the
+    /// single authority, and every producer in the workspace writes lowercase.
     #[test]
-    fn hex_decode_round_trip() {
+    fn hex_decode_is_lowercase_only() {
         let digest = [0xabu8; 32];
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(decode_hex32(&hex), Some(digest));
-        assert_eq!(decode_hex32(&hex.to_uppercase()), Some(digest));
-        assert_eq!(decode_hex32("short"), None);
-        assert_eq!(decode_hex32(&"z".repeat(64)), None);
+        assert_eq!(hex32_decode(&hex), Some(digest));
+        assert_eq!(
+            hex32_decode(&hex.to_uppercase()),
+            None,
+            "uppercase hex must be rejected, matching the writer"
+        );
+        assert_eq!(hex32_decode("short"), None);
+        assert_eq!(hex32_decode(&"z".repeat(64)), None);
     }
 
     /// `pam_code_name` must name the codes the module returns and stay honest for the

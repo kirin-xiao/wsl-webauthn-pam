@@ -1387,8 +1387,8 @@ fn stderr_tail(bytes: &[u8], cap: usize) -> Option<String> {
 /// Feeds new bytes as they arrive and invokes the sink once per complete line, so the
 /// Linux side can report `prompt_open` *while* the child is still blocked inside the
 /// WebAuthn call. Partial/oversized/non-matching lines are dropped.
-struct ProgressScanner<'a> {
-    sink: Option<&'a ProgressSink<'a>>,
+struct ProgressScanner<'a, 'sink> {
+    sink: Option<&'a ProgressSink<'sink>>,
     /// Bytes of the current, not-yet-terminated line.
     line: Vec<u8>,
     /// Set after a line exceeds [`MAX_PROGRESS_LINE_BYTES`]; the rest is discarded until
@@ -1400,8 +1400,8 @@ struct ProgressScanner<'a> {
 /// few bytes; this only bounds a hostile/flooding bridge.
 const MAX_PROGRESS_LINE_BYTES: usize = 256;
 
-impl<'a> ProgressScanner<'a> {
-    fn new(sink: Option<&'a ProgressSink<'a>>) -> ProgressScanner<'a> {
+impl<'a, 'sink> ProgressScanner<'a, 'sink> {
+    fn new(sink: Option<&'a ProgressSink<'sink>>) -> ProgressScanner<'a, 'sink> {
         ProgressScanner {
             sink,
             line: Vec::new(),

@@ -71,6 +71,49 @@ thread_local! {
     /// `Some(records)` while this thread records its audit output in-process instead of
     /// calling `syslog(3)`.
     static CAPTURED: RefCell<Option<Vec<(i32, String)>>> = const { RefCell::new(None) };
+    /// Nesting depth of [`enter_module_scope`] on this thread.
+    ///
+    /// A counter rather than a flag because `guarded` wraps `run`, which has its own
+    /// `catch_unwind`: both enter the scope, so the inner guard must not clear the
+    /// outer one. A thread that never entered a guard reads `0`.
+    static MODULE_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// RAII marker for "this thread is inside one of the module's guarded calls".
+///
+/// Dropped on both the normal and the unwind path, so the depth returns to its previous
+/// value even when the guarded body panics. See [`install_panic_hook`] for why the panic
+/// hook needs this scope.
+pub(crate) struct ModuleScope(());
+
+impl Drop for ModuleScope {
+    fn drop(&mut self) {
+        // `try_with`, not `with`: this guard may be dropped during TLS teardown, where
+        // accessing the thread-local would panic.
+        let _ = MODULE_DEPTH.try_with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+/// Enter the module's guarded region on this thread, returning a guard that leaves it on
+/// drop.
+///
+/// Called immediately around each `catch_unwind` in the exported path (`guarded` in
+/// `lib.rs` and `run` in `logic.rs`). Every panic raised between [`enter_module_scope`]
+/// and the guard's drop is attributed to this module by [`install_panic_hook`].
+pub(crate) fn enter_module_scope() -> ModuleScope {
+    MODULE_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    ModuleScope(())
+}
+
+/// Whether this thread is currently inside one of the module's guarded calls.
+///
+/// Panic-safe: during TLS destruction (or if the local was already destroyed)
+/// `try_with` fails and this reports `false`, so such a panic is chained to the previous
+/// hook instead of re-entering [`auth`] and its `CAPTURED` thread-local.
+fn in_module_scope() -> bool {
+    MODULE_DEPTH
+        .try_with(|depth| depth.get() > 0)
+        .unwrap_or(false)
 }
 
 /// Configure whether [`debug`] emits messages for the current authentication thread.
@@ -178,16 +221,84 @@ fn describe_panic(info: &std::panic::PanicHookInfo<'_>) -> String {
     }
 }
 
-/// Install the syslog-only panic hook exactly once, before the first `catch_unwind`.
+/// Install the module's syslog-only panic hook, chained in front of the host's hook,
+/// exactly once.
 ///
-/// Without this the *default* hook prints the panic payload and an absolute source
+/// Without a hook the *default* hook prints the panic payload and an absolute source
 /// path to stderr — for a PAM module that is the invoking user's terminal — before
-/// `catch_unwind` maps the panic to `PAM_ABORT`. Replacing the process-wide hook is a
-/// one-time, idempotent operation ([`OnceLock`]); it changes only *where* diagnostics
-/// go, never the PAM return code that `catch_unwind` produces.
+/// `catch_unwind` maps the panic to `PAM_ABORT`.
+///
+/// # Chaining, not clobbering
+///
+/// A `cdylib` is loaded into a host (sshd, sudo, a display manager) that may have its
+/// own panic hook for its own diagnostics. On first install this takes the current hook
+/// with [`std::panic::take_hook`] and installs a hook that:
+///
+/// * for a panic **belonging to this module**, logs at `LOG_CRIT` and deliberately does
+///   **not** call the previous hook, so the payload never reaches the invoking user's
+///   terminal (the security property this hook exists for); and
+/// * for **every other panic**, calls the previous hook with the original
+///   [`std::panic::PanicHookInfo`], so the host keeps its diagnostics and unrelated
+///   panics are no longer misattributed to `pam_wsl_webauthn` in `authpriv`.
+///
+/// The consequence of chaining is that a host hook does not see panics this module
+/// suppresses inside its own scope. That suppression is intentional.
+///
+/// # Ownership discrimination
+///
+/// Ownership is decided by a per-thread depth counter, [`enter_module_scope`], entered
+/// immediately around the `catch_unwind` in `guarded` (`lib.rs`) and in `run`
+/// (`logic.rs`). A panic raised by std code called from our logic (a slice index, an
+/// allocation failure in `raw_vec`, a `fmt` panic) has a std `location().file()` but is
+/// still ours, so a path-prefix test would misclassify it and forward our payload to the
+/// terminal. The same test would also misclassify panics from this workspace's
+/// `wsl-webauthn-{store,runner,verifier}` crates (module code, different file paths) as
+/// foreign. The scope, by contrast, is exactly the region whose panics we contain.
+///
+/// A panic on another thread while a guarded call is in flight reads depth `0` there and
+/// is chained to the previous hook: it is not contained by our `catch_unwind` and is
+/// therefore not ours to suppress. Panics raised on this thread outside the scope (a
+/// libtest assertion in a test binary, for instance) are likewise forwarded.
+///
+/// # Lifetime: the hook must never be unmapped
+///
+/// The installed closure's code lives in this `cdylib`. If libpam or the host
+/// `dlclose`s the module, the process-wide hook would still hold a pointer into unmapped
+/// text and a later panic would call a stale vtable (undefined behavior). `build.rs`
+/// therefore links the cdylib with `-Wl,-z,nodelete`, which sets `DF_1_NODELETE` and
+/// keeps the mapping resident for the life of the process. Without that flag this hook
+/// is unsound; see `build.rs`.
+///
+/// # Host hook installed later
+///
+/// Installation is latched by [`OnceLock`]: if the host calls
+/// [`std::panic::set_hook`] *after* the first authentication, the host's hook replaces
+/// this one and the terminal guarantee lapses for subsequent panics. There is no stable
+/// API to observe that a hook was replaced, and re-installing on every call would
+/// either clobber the host's hook or chain this module to itself. The module installs
+/// once, before its first guarded call; a host that takes over the hook owns that
+/// decision.
+///
+/// This changes only *where* diagnostics go, never the PAM return code that
+/// `catch_unwind` produces.
 pub fn install_panic_hook() {
     PANIC_HOOK.get_or_init(|| {
-        std::panic::set_hook(Box::new(|info| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(chained_hook(prev));
+    });
+}
+
+/// The previous process panic hook, as returned by [`std::panic::take_hook`].
+type PrevHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static>;
+
+/// Build the hook installed by [`install_panic_hook`]: log module-owned panics, delegate
+/// everything else to `prev`.
+///
+/// Split out from the [`OnceLock`] wrapper so the ownership predicate and the chaining
+/// can be reasoned about (and exercised) without needing to install a process-global hook.
+fn chained_hook(prev: PrevHook) -> PrevHook {
+    Box::new(move |info| {
+        if in_module_scope() {
             auth(
                 LOG_CRIT,
                 &format!(
@@ -195,8 +306,10 @@ pub fn install_panic_hook() {
                     describe_panic(info)
                 ),
             );
-        }));
-    });
+        } else {
+            prev(info);
+        }
+    })
 }
 
 fn ensure_openlog() {
@@ -352,6 +465,36 @@ mod tests {
             "a privilege transition must keep auditing"
         );
         assert!(!env_requests_capture(false, false), "no marker, no capture");
+    }
+
+    /// The panic-ownership scope is a counter, so `run` (which is itself inside
+    /// `guarded`) can enter it again without the inner guard clearing the outer one, and
+    /// it is per-thread so a concurrent authentication is not misattributed.
+    #[test]
+    fn module_scope_nests_and_is_thread_local() {
+        assert!(
+            !in_module_scope(),
+            "a fresh thread starts outside the scope"
+        );
+
+        let outer = enter_module_scope();
+        assert!(in_module_scope());
+
+        let inner = enter_module_scope();
+        drop(inner);
+        assert!(
+            in_module_scope(),
+            "dropping the inner guard must not clear the outer scope"
+        );
+
+        drop(outer);
+        assert!(!in_module_scope());
+
+        let other = std::thread::spawn(in_module_scope);
+        assert!(
+            !other.join().unwrap(),
+            "another thread's panics are not ours to suppress"
+        );
     }
 
     /// A thread that never called [`begin_capture`] has no thread-local buffer, so

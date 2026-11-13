@@ -103,7 +103,7 @@ impl PamSeam for RealPamSeam {
         }
         // SAFETY: libpam owns the returned string for the handle's lifetime.
         match unsafe { bindings::cstr_to_str(ptr) } {
-            Some(s) if !s.is_empty() => Ok(s.to_string()),
+            Some(s) if !s.is_empty() => Ok(s),
             _ => Err(SeamError::NullUser),
         }
     }
@@ -111,7 +111,7 @@ impl PamSeam for RealPamSeam {
     fn get_service(&mut self) -> Option<String> {
         let item = self.get_item_ptr(PAM_SERVICE)?;
         // SAFETY: PAM_SERVICE is a C string.
-        unsafe { bindings::cstr_to_str(item as *const std::ffi::c_char) }.map(str::to_string)
+        unsafe { bindings::cstr_to_str(item as *const std::ffi::c_char) }
     }
 
     fn conv_available(&mut self) -> bool {
