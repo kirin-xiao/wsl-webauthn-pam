@@ -16,7 +16,7 @@
 use ciborium::value::Value;
 use ecdsa::signature::hazmat::PrehashVerifier as _;
 use p256::ecdsa::VerifyingKey as P256VerifyingKey;
-use rsa::RsaPublicKey;
+use rsa::PublicKey;
 use rsa::pkcs1v15::VerifyingKey as RsaVerifyingKey;
 use rsa::signature::Verifier as _;
 use sha2::{Digest as _, Sha256};
@@ -131,8 +131,8 @@ impl ParsedCoseKey {
         let ParsedCoseKey::Es256(key) = self else {
             return false;
         };
-        use p256::elliptic_curve::sec1::ToEncodedPoint as _;
-        let point = key.as_affine().to_encoded_point(false);
+        use p256::elliptic_curve::sec1::ToSec1Point as _;
+        let point = key.as_affine().to_sec1_point(false);
         points_equal(point.x().map(|v| &v[..]), point.y().map(|v| &v[..]), x, y)
     }
 
@@ -145,14 +145,14 @@ impl ParsedCoseKey {
         let ParsedCoseKey::Rs256(key) = self else {
             return false;
         };
-        let public = AsRef::<rsa::RsaPublicKey>::as_ref(key.as_ref());
+        let public = AsRef::<rsa::PublicKey>::as_ref(key.as_ref());
         // Compare as integers, not byte strings. `TPMS_RSA_PARMS.exponent` is a
         // fixed-width big-endian `u32` (the standard 65537 is therefore
         // `00 01 00 01`), whereas `BigUint::to_bytes_be` yields the minimal form
         // (`01 00 01`); a TPM modulus may likewise carry leading zero bytes.
         // Byte-length equality would reject *every* RSA credential.
-        rsa::BigUint::from_bytes_be(n) == *public.n()
-            && rsa::BigUint::from_bytes_be(e) == *public.e()
+        rsa::BoxedUint::from_be_slice_vartime(n) == **public.n()
+            && rsa::BoxedUint::from_be_slice_vartime(e) == *public.e()
     }
 }
 
@@ -259,12 +259,8 @@ fn parse_es256(map: &[(Value, Value)]) -> Result<ParsedCoseKey, VerifyError> {
     sec1[0] = 0x04;
     sec1[1..33].copy_from_slice(x);
     sec1[33..65].copy_from_slice(y);
-    let point =
-        p256::EncodedPoint::from_bytes(sec1).map_err(|_| VerifyError::MalformedCoseKey {
-            reason: "EC point encoding invalid",
-        })?;
-    let key = P256VerifyingKey::from_encoded_point(&point).map_err(|_| {
-        // `from_encoded_point` rejects the identity and any off-curve point.
+    let key = P256VerifyingKey::from_sec1_bytes(&sec1).map_err(|_| {
+        // `from_sec1_bytes` rejects a wrong prefix, the identity, and any off-curve point.
         VerifyError::CosePointNotOnCurve
     })?;
     Ok(ParsedCoseKey::Es256(key))
@@ -295,13 +291,8 @@ fn parse_rs256(map: &[(Value, Value)]) -> Result<ParsedCoseKey, VerifyError> {
         });
     }
 
-    let modulus = rsa::BigUint::from_bytes_be(n);
-    let bits: u64 = modulus
-        .bits()
-        .try_into()
-        .map_err(|_| VerifyError::MalformedCoseKey {
-            reason: "RSA modulus size overflow",
-        })?;
+    let modulus = rsa::BoxedUint::from_be_slice_vartime(n);
+    let bits = u64::from(modulus.bit_width());
     if !(RSA_MIN_BITS..=RSA_MAX_BITS).contains(&bits) {
         return Err(VerifyError::CoseKeyModulusSize { bits });
     }
@@ -310,14 +301,14 @@ fn parse_rs256(map: &[(Value, Value)]) -> Result<ParsedCoseKey, VerifyError> {
     // `e = 65537`) are accepted. This rejects `e = 1`/`e = 2`/oversized exponents that
     // `RsaPublicKey::new` would otherwise admit, which would let a trivially weak or
     // degenerate key through the allow-list.
-    let exponent = rsa::BigUint::from_bytes_be(e);
-    if exponent != rsa::BigUint::from(3u32) && exponent != rsa::BigUint::from(65537u32) {
+    let exponent = rsa::BoxedUint::from_be_slice_vartime(e);
+    if exponent != rsa::BoxedUint::from(3u32) && exponent != rsa::BoxedUint::from(65537u32) {
         return Err(VerifyError::CoseKeyExponentNotAllowed);
     }
 
     // `RsaPublicKey::new` applies the `rsa` crate's own minimum key-size policy,
     // which agrees with our 2048-bit floor.
-    let key = RsaPublicKey::new(modulus, exponent).map_err(|_| VerifyError::MalformedCoseKey {
+    let key = PublicKey::new(modulus, exponent).map_err(|_| VerifyError::MalformedCoseKey {
         reason: "RSA public key rejected by the backend",
     })?;
     Ok(ParsedCoseKey::Rs256(Box::new(RsaVerifyingKey::new(key))))
@@ -374,8 +365,11 @@ mod tests {
 
     /// Build a canonical ES256 COSE key from a fresh signing key.
     fn es256_key() -> (p256::ecdsa::SigningKey, Vec<u8>) {
-        let sk = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
-        let point = sk.verifying_key().to_encoded_point(false);
+        use p256::elliptic_curve::Generate as _;
+        let sk = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rand_core::UnwrapErr(
+            rand::rngs::SysRng,
+        ));
+        let point = sk.verifying_key().to_sec1_point(false);
         let x = point.x().unwrap().to_vec();
         let y = point.y().unwrap().to_vec();
         let map = vec![

@@ -67,6 +67,64 @@ fn positive() -> Fixture {
     fixture_with(es256(), ChainOptions::default(), -7, None)
 }
 
+/// Every synthesized certificate must parse with `x509-cert 0.3` and re-encode to
+/// identical bytes.
+///
+/// The harness hand-encodes `TBSCertificate` because 0.3 removed the 0.2 builder and
+/// made the certificate fields read-only; a wrong context-specific tag would otherwise
+/// surface as a confusing verifier verdict. `build_cert_full` asserts this on every
+/// certificate it produces; this test exercises the representative shapes explicitly.
+#[test]
+fn synthesized_certificates_roundtrip() {
+    let variants = [
+        ChainOptions::default(),
+        ChainOptions {
+            leaf_version_v1: true,
+            ..Default::default()
+        },
+        ChainOptions {
+            leaf_basic_constraints_empty: true,
+            ..Default::default()
+        },
+        ChainOptions {
+            omit_leaf_basic_constraints: true,
+            ..Default::default()
+        },
+        ChainOptions {
+            malformed_aaguid_ext: true,
+            ..Default::default()
+        },
+        ChainOptions {
+            leaf_sig_oid: Some(der::asn1::ObjectIdentifier::new_unwrap(
+                "1.2.840.113549.1.1.4",
+            )),
+            ..Default::default()
+        },
+        ChainOptions {
+            leaf_is_ca: true,
+            ..Default::default()
+        },
+        ChainOptions {
+            extra_intermediate: true,
+            ..Default::default()
+        },
+    ];
+    for opts in &variants {
+        for der in build_chain(opts).x5c {
+            assert_cert_roundtrip(&der);
+        }
+    }
+
+    let leaf = chain_leaf(&ChainOptions::default());
+    assert_cert_roundtrip(&leaf.der);
+
+    let aik = rsa_aik();
+    let chain = build_tpm_chain(&rsa_test_key(&aik), &ChainOptions::default());
+    for der in chain.x5c {
+        assert_cert_roundtrip(&der);
+    }
+}
+
 fn check<'a>(f: &'a Fixture, _policy: &'a AttestationPolicy) -> EnrollCheck<'a> {
     EnrollCheck {
         expected_challenge: &f.challenge,
@@ -1123,7 +1181,7 @@ struct TpmFixture {
     root_fingerprint: [u8; 32],
     credential: TestKey,
     /// The AIK private key, retained so negative tests can re-sign a mutated certInfo.
-    aik: rsa::RsaPrivateKey,
+    aik: rsa::PrivateKey,
     /// The signature/hash scheme the fixture signed with.
     sig_scheme: TpmSig,
     /// The `nameAlg` the fixture's pubArea declares.
@@ -1159,7 +1217,7 @@ fn tpm_fixture_with_opts(
 }
 
 /// Wrap an RSA private key as a `TestKey` for certificate generation.
-fn rsa_test_key(key: &rsa::RsaPrivateKey) -> TestKey {
+fn rsa_test_key(key: &rsa::PrivateKey) -> TestKey {
     TestKey {
         cose: Vec::new(),
         alg: -257,

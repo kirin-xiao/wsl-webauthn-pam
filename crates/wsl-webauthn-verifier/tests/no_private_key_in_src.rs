@@ -1,19 +1,27 @@
-//! Guard for the `RUSTSEC-2023-0071` ignore rationale in `deny.toml`.
+//! Guard: production code must not perform RSA private-key operations.
 //!
-//! The advisory (non-constant-time RSA private-key operations) is ignored on the
-//! grounds that the production code path is public-key verification only: RSA
-//! private keys exist solely in this crate's local test harness. This test scans
-//! every workspace crate's `src/` for RSA private-key constructs; if a real
-//! private-key path lands in `src/`, it fails and the advisory must be re-evaluated.
+//! Every shipped path is public-key verification only (WebAuthn assertion and
+//! attestation checks); RSA private keys exist solely in this crate's local test
+//! harness, which synthesizes vectors. This test scans every workspace crate's `src/`
+//! for RSA private-key constructs so a private-key path cannot land in a shipped
+//! binary unnoticed.
+//!
+//! It outlived the `RUSTSEC-2023-0071` ignore that originally motivated it: that
+//! advisory is gone from the graph with `rsa 0.10` (which uses `crypto-bigint`, not
+//! `num-bigint-dig`), but "no private-key operations in production" is a property
+//! worth pinning independently of any advisory.
 
 use std::path::{Path, PathBuf};
 
 /// Substrings that would indicate an RSA private-key operation in production code.
+///
+/// `PrivateKey` is `rsa 0.10`'s name for the private-key type (it was `RsaPrivateKey`
+/// in 0.9); the P-256 side calls its equivalent `SecretKey`, so this does not collide.
 const FORBIDDEN: &[&str] = &[
-    "RsaPrivateKey",
+    "PrivateKey",
     "rsa::pkcs1v15::SigningKey",
-    "rsa::pkcs8::EncodePrivateKey",
-    "rsa::Pkcs1v15Encrypt",
+    "EncodePrivateKey",
+    "Pkcs1v15Encrypt",
 ];
 
 fn crates_dir() -> Option<PathBuf> {
@@ -70,8 +78,8 @@ fn production_src_has_no_rsa_private_key_path() {
 
     assert!(
         hits.is_empty(),
-        "RSA private-key constructs found in production `src/`; the \
-         RUSTSEC-2023-0071 ignore in deny.toml is no longer justified:\n{}",
+        "RSA private-key constructs found in production `src/`; the shipped \
+         paths must stay public-key-verification only:\n{}",
         hits.join("\n")
     );
 }

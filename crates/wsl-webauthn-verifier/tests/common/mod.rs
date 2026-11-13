@@ -10,21 +10,21 @@ use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
 use ciborium::value::Value;
+use der::Encode;
 use der::asn1::BitString;
 use der::asn1::OctetString;
-use der::{Encode, Length, Writer};
 use p256::ecdsa::SigningKey as P256SigningKey;
-use p256::elliptic_curve::sec1::ToEncodedPoint as _;
-use rand::rngs::OsRng;
+use p256::elliptic_curve::sec1::ToSec1Point as _;
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
 use sha2::{Digest as _, Sha256};
 use x509_cert::Certificate;
-use x509_cert::builder::{Builder as _, CertificateBuilder, Profile};
 use x509_cert::certificate::Version;
+use x509_cert::ext::Extension;
 use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage, KeyUsages};
-use x509_cert::ext::{AsExtension, Extension};
 use x509_cert::name::Name;
 use x509_cert::serial_number::SerialNumber;
-use x509_cert::spki::SubjectPublicKeyInfoOwned;
+use x509_cert::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
 use x509_cert::time::Validity;
 
 use wsl_webauthn_protocol::{ClientDataKind, RP_ID, b64u_encode, build_client_data};
@@ -174,20 +174,31 @@ impl Signer {
         use rsa::signature::Keypair as _;
         match self {
             Signer::Es256(sk) => {
-                SubjectPublicKeyInfoOwned::from_key(*sk.verifying_key()).expect("spki")
+                SubjectPublicKeyInfoOwned::from_key(sk.verifying_key()).expect("spki")
             }
             Signer::Rs256(sk) => {
-                SubjectPublicKeyInfoOwned::from_key(sk.verifying_key()).expect("spki")
+                SubjectPublicKeyInfoOwned::from_key(&sk.verifying_key()).expect("spki")
             }
             Signer::Ed25519(sk) => {
-                SubjectPublicKeyInfoOwned::from_key(sk.verifying_key()).expect("spki")
+                // `ed25519-dalek` only implements `EncodePublicKey` with its `alloc`
+                // feature enabled, which this dev-dependency does not turn on. The
+                // Ed25519 SPKI is trivial: OID 1.3.101.112 with absent parameters and
+                // the raw 32-byte key as the BIT STRING.
+                SubjectPublicKeyInfoOwned {
+                    algorithm: AlgorithmIdentifierOwned {
+                        oid: ED25519,
+                        parameters: None,
+                    },
+                    subject_public_key: BitString::from_bytes(sk.verifying_key().as_bytes())
+                        .expect("ed25519 public key"),
+                }
             }
         }
     }
 }
 
 fn cose_es256(sk: &P256SigningKey) -> Vec<u8> {
-    let point = sk.verifying_key().to_encoded_point(false);
+    let point = sk.verifying_key().to_sec1_point(false);
     let map = vec![
         (Value::from(1i64), Value::from(2i64)),
         (Value::from(3i64), Value::from(-7i64)),
@@ -204,15 +215,36 @@ fn cose_es256(sk: &P256SigningKey) -> Vec<u8> {
     cbor(map)
 }
 
-fn cose_rs256(key: &rsa::RsaPublicKey) -> Vec<u8> {
+fn cose_rs256(key: &rsa::PublicKey) -> Vec<u8> {
+    use p256::elliptic_curve::bigint::Encoding as _;
     use rsa::traits::PublicKeyParts as _;
+    let n = key.n().to_be_bytes();
+    let e = key.e().to_be_bytes();
     let map = vec![
         (Value::from(1i64), Value::from(3i64)),
         (Value::from(3i64), Value::from(-257i64)),
-        (Value::from(-1i64), Value::Bytes(key.n().to_bytes_be())),
-        (Value::from(-2i64), Value::Bytes(key.e().to_bytes_be())),
+        (
+            Value::from(-1i64),
+            Value::Bytes(minimal_be_bytes(&n).to_vec()),
+        ),
+        (
+            Value::from(-2i64),
+            Value::Bytes(minimal_be_bytes(&e).to_vec()),
+        ),
     ];
     cbor(map)
+}
+
+/// Strip the fixed-width leading zero bytes from a big-endian `BoxedUint` encoding.
+///
+/// `crypto-bigint`'s `Encoding::to_be_bytes` returns the integer at its declared
+/// precision (for the RSA exponent that is four bytes, `00 01 00 01`), while both
+/// COSE and the verifier require the minimal big-endian form (`01 00 01`).
+fn minimal_be_bytes(bytes: &[u8]) -> &[u8] {
+    match bytes.iter().position(|&b| b != 0) {
+        Some(start) => &bytes[start..],
+        None => &bytes[bytes.len().saturating_sub(1)..],
+    }
 }
 
 fn cose_ed25519(key: &ed25519_dalek::VerifyingKey) -> Vec<u8> {
@@ -233,7 +265,8 @@ fn cbor(map: Vec<(Value, Value)>) -> Vec<u8> {
 
 /// Generate an ES256 (P-256) key.
 pub fn es256() -> TestKey {
-    let sk = P256SigningKey::random(&mut OsRng);
+    use p256::elliptic_curve::Generate as _;
+    let sk = P256SigningKey::generate_from_rng(&mut UnwrapErr(SysRng));
     let cose = cose_es256(&sk);
     TestKey {
         cose,
@@ -244,7 +277,7 @@ pub fn es256() -> TestKey {
 
 /// Generate an RS256 (RSA-2048) key.
 pub fn rs256() -> TestKey {
-    let key = rsa::RsaPrivateKey::new(&mut OsRng, 2048).expect("rsa keygen");
+    let key = rsa::PrivateKey::new(&mut UnwrapErr(SysRng), 2048).expect("rsa keygen");
     let cose = cose_rs256(&key.to_public_key());
     TestKey {
         cose,
@@ -255,7 +288,7 @@ pub fn rs256() -> TestKey {
 
 /// Generate an EdDSA (Ed25519) key.
 pub fn ed25519() -> TestKey {
-    let sk = ed25519_dalek::SigningKey::generate(&mut OsRng);
+    let sk = ed25519_dalek::SigningKey::generate(&mut UnwrapErr(SysRng));
     let cose = cose_ed25519(&sk.verifying_key());
     TestKey {
         cose,
@@ -287,32 +320,78 @@ pub fn packed_att_stmt(alg: i64, sig: &[u8], x5c: Option<&[Vec<u8>]>) -> Vec<(Va
 // X.509 test chain
 // ---------------------------------------------------------------------------
 
-/// A custom extension carrying a FIDO AAGUID (`id-fido-gen-ce-aaguid`).
+/// `ecdsa-with-SHA256` (1.2.840.10045.4.3.2), the signature algorithm every
+/// synthesized chain link uses.
+const ECDSA_WITH_SHA256: der::asn1::ObjectIdentifier =
+    der::asn1::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+
+/// `Ed25519` (1.3.101.112).
+const ED25519: der::asn1::ObjectIdentifier = der::asn1::ObjectIdentifier::new_unwrap("1.3.101.112");
+
+/// A locally mutable `TBSCertificate`.
+///
+/// `x509-cert 0.3` made `TbsCertificateInner`'s fields private (read-only accessors,
+/// no `*_mut`) and replaced `builder::Profile` with the `BuilderProfile` trait, so the
+/// old "build, then mutate and re-sign" harness cannot survive. Instead the harness
+/// encodes the structure itself. The field types and `#[asn1(...)]` tag attributes are
+/// copied verbatim from `x509-cert 0.3`'s `TbsCertificateInner`: the verifier parses
+/// this output with the same crate, and [`assert_cert_roundtrip`] pins the two
+/// encodings together.
+#[derive(Clone, Debug, der::Sequence)]
+struct TestTbs {
+    #[asn1(context_specific = "0", default = "Default::default")]
+    version: Version,
+    serial_number: SerialNumber,
+    signature: AlgorithmIdentifierOwned,
+    issuer: Name,
+    validity: Validity,
+    subject: Name,
+    subject_public_key_info: SubjectPublicKeyInfoOwned,
+
+    #[asn1(context_specific = "1", tag_mode = "IMPLICIT", optional = "true")]
+    issuer_unique_id: Option<BitString>,
+
+    #[asn1(context_specific = "2", tag_mode = "IMPLICIT", optional = "true")]
+    subject_unique_id: Option<BitString>,
+
+    #[asn1(context_specific = "3", tag_mode = "EXPLICIT", optional = "true")]
+    extensions: Option<Vec<Extension>>,
+}
+
+/// The outer `Certificate` over [`TestTbs`].
+#[derive(Clone, Debug, der::Sequence)]
+struct TestCert {
+    tbs: TestTbs,
+    signature_algorithm: AlgorithmIdentifierOwned,
+    signature: BitString,
+}
+
+/// The certificate shape the synthesized chain needs.
+///
+/// This is the `x509-cert 0.2` `builder::Profile` enum, retained locally now that the
+/// crate no longer ships it (0.3's `Profile` is a deprecated alias for the
+/// `BuilderProfile` trait, and the CABF profile types do not fit synthetic FIDO
+/// attestation certificates).
 #[derive(Clone)]
-pub struct AaguidExtension(pub [u8; 16]);
-
-impl const_oid::AssociatedOid for AaguidExtension {
-    const OID: der::asn1::ObjectIdentifier = ID_FIDO_GEN_CE_AAGUID;
-}
-
-impl der::Encode for AaguidExtension {
-    fn encoded_len(&self) -> der::Result<Length> {
-        OctetString::new(self.0.to_vec())
-            .expect("octet string")
-            .encoded_len()
-    }
-
-    fn encode(&self, writer: &mut impl Writer) -> der::Result<()> {
-        OctetString::new(self.0.to_vec())
-            .expect("octet string")
-            .encode(writer)
-    }
-}
-
-impl AsExtension for AaguidExtension {
-    fn critical(&self, _subject: &Name, _extensions: &[Extension]) -> bool {
-        false
-    }
+pub enum Profile {
+    /// A self-signed root CA.
+    Root,
+    /// An intermediate CA.
+    SubCA {
+        /// The issuer name.
+        issuer: Name,
+        /// `pathLenConstraint` to encode, if any.
+        path_len_constraint: Option<u8>,
+    },
+    /// An end-entity certificate.
+    Leaf {
+        /// The issuer name.
+        issuer: Name,
+        /// Set the `keyAgreement` KeyUsage bit.
+        enable_key_agreement: bool,
+        /// Set the `keyEncipherment` KeyUsage bit.
+        enable_key_encipherment: bool,
+    },
 }
 
 /// Options controlling the synthesized chain shape.
@@ -528,54 +607,29 @@ pub fn build_chain(opts: &ChainOptions) -> TestChain {
         opts,
     );
 
-    let root_der = root.to_der().expect("root der");
-    let mut x5c = vec![
-        leaf.to_der().expect("leaf der"),
-        intermediate.to_der().expect("int der"),
-    ];
-    if let Some(extra) = &extra {
-        x5c.push(extra.to_der().expect("extra der"));
+    let mut x5c = vec![leaf, intermediate];
+    if let Some(extra) = extra {
+        x5c.push(extra);
     }
     if !opts.omit_root {
-        x5c.push(root_der.clone());
+        x5c.push(root.clone());
     }
 
     TestChain {
         x5c,
-        root_fingerprint: sha256(&root_der),
+        root_fingerprint: sha256(&root),
         leaf_signer: leaf_key.signer,
     }
 }
 
-/// Build a cert where the issuer's signer and the certificate's own key differ.
-#[allow(clippy::too_many_arguments)]
-fn build_cert_with_signer(
-    signing_key: &TestKey,
-    subject_key: &TestKey,
-    profile: Profile,
-    serial: u32,
-    validity: Validity,
-    subject: Name,
-    aaguid: Option<[u8; 16]>,
-    eku: &[der::asn1::ObjectIdentifier],
-) -> Certificate {
-    build_cert_full(
-        signing_key,
-        subject_key,
-        profile,
-        serial,
-        validity,
-        subject,
-        aaguid,
-        eku,
-        &ChainOptions::default(),
-    )
-}
-
-/// Build a certificate, applying the [`ChainOptions`] leaf-shape knobs that are
-/// relevant to `profile` (issuer mismatch, version, BasicConstraints, signature OID,
-/// malformed AAGUID extension). Used by both the packed and tpm chain builders, and
-/// by [`chain_leaf`] for standalone leaf construction.
+/// Build a certificate, applying the [`ChainOptions`] leaf-shape knobs (issuer
+/// mismatch, version, BasicConstraints, KeyUsage, signature OID, malformed AAGUID
+/// extension). Used by both the packed and tpm chain builders, and by [`chain_leaf`]
+/// for standalone leaf construction.
+///
+/// Returns the certificate DER. Every knob is applied while the TBS is being built, so
+/// the signature always covers the final bytes; the old "mutate, then re-sign" step is
+/// gone with the `x509-cert 0.2` builder.
 #[allow(clippy::too_many_arguments)]
 fn build_cert_full(
     signing_key: &TestKey,
@@ -587,97 +641,163 @@ fn build_cert_full(
     aaguid: Option<[u8; 16]>,
     eku: &[der::asn1::ObjectIdentifier],
     opts: &ChainOptions,
-) -> Certificate {
-    let issuer_override = opts.issuer_name_override.clone();
-    let profile = match profile {
+) -> Vec<u8> {
+    if !matches!(signing_key.signer, Signer::Es256(_)) {
+        unimplemented!("test chains use P-256 signers");
+    }
+
+    let (issuer, basic_constraints, key_usage) = match profile {
+        Profile::Root => (
+            subject.clone(),
+            BasicConstraints {
+                ca: true,
+                path_len_constraint: None,
+            },
+            Some(KeyUsage(KeyUsages::KeyCertSign | KeyUsages::CRLSign)),
+        ),
+        Profile::SubCA {
+            issuer,
+            path_len_constraint,
+        } => (
+            issuer,
+            BasicConstraints {
+                ca: true,
+                path_len_constraint,
+            },
+            Some(KeyUsage(KeyUsages::KeyCertSign | KeyUsages::CRLSign)),
+        ),
         Profile::Leaf {
             issuer,
             enable_key_agreement,
             enable_key_encipherment,
-        } => Profile::Leaf {
-            issuer: issuer_override.unwrap_or(issuer),
-            enable_key_agreement,
-            enable_key_encipherment,
-        },
-        // `issuer_name_override` targets the leaf's issuer/subject link only.
-        other => other,
-    };
-    let spki = subject_key.signer.spki();
-    let serial = SerialNumber::from(serial);
-    match signing_key {
-        TestKey {
-            signer: Signer::Es256(sk),
-            ..
         } => {
-            let mut builder = CertificateBuilder::new(profile, serial, validity, subject, spki, sk)
-                .expect("builder");
-            if let Some(aaguid) = aaguid {
-                builder
-                    .add_extension(&AaguidExtension(aaguid))
-                    .expect("ext");
+            let mut usage = KeyUsages::DigitalSignature | KeyUsages::NonRepudiation;
+            if enable_key_encipherment {
+                usage |= KeyUsages::KeyEncipherment;
             }
-            if !eku.is_empty() {
-                builder
-                    .add_extension(&ExtendedKeyUsage(eku.to_vec()))
-                    .expect("eku ext");
+            if enable_key_agreement {
+                usage |= KeyUsages::KeyAgreement;
             }
-            let mut cert = builder
-                .build::<p256::ecdsa::DerSignature>()
-                .expect("build cert");
-            if opts.leaf_version_v1 {
-                cert.tbs_certificate.version = Version::V1;
-            }
-            if opts.omit_leaf_basic_constraints {
-                remove_extension(
-                    &mut cert,
-                    <BasicConstraints as const_oid::AssociatedOid>::OID,
-                );
-            }
-            if opts.leaf_basic_constraints_empty {
-                set_extension_raw(
-                    &mut cert,
-                    <BasicConstraints as const_oid::AssociatedOid>::OID,
-                    &[0x30, 0x00],
-                );
-            }
-            if opts.malformed_aaguid_ext {
-                set_extension_raw(&mut cert, ID_FIDO_GEN_CE_AAGUID, &[0x01, 0x02, 0x03]);
-            }
-            if let Some(oid) = opts.leaf_sig_oid {
-                cert.tbs_certificate.signature.oid = oid;
-                cert.signature_algorithm.oid = oid;
-            }
-            // Any TBS edit above invalidates the signature; re-sign with the issuer key.
-            re_sign(&mut cert, signer_ref(signing_key));
-            cert
+            let key_usage = if opts.aik_key_usage_forbids_signature {
+                // `digitalSignature` deliberately absent: the AIK must not be usable
+                // to sign `certInfo`.
+                Some(KeyUsage(KeyUsages::KeyAgreement.into()))
+            } else if opts.omit_aik_key_usage {
+                None
+            } else {
+                Some(KeyUsage(usage))
+            };
+            (
+                // `issuer_name_override` targets the leaf's issuer/subject link only.
+                opts.issuer_name_override.clone().unwrap_or(issuer),
+                BasicConstraints {
+                    ca: false,
+                    path_len_constraint: None,
+                },
+                key_usage,
+            )
         }
-        _ => unimplemented!("test chains use P-256 signers"),
+    };
+
+    let mut extensions = Vec::new();
+    if !opts.omit_leaf_basic_constraints {
+        let value = if opts.leaf_basic_constraints_empty {
+            // RFC 5280's `cA BOOLEAN DEFAULT FALSE`: the empty SEQUENCE is a valid
+            // *non-CA* constraints extension.
+            vec![0x30, 0x00]
+        } else {
+            basic_constraints.to_der().expect("basic constraints")
+        };
+        extensions.push(extension(
+            <BasicConstraints as const_oid::AssociatedOid>::OID,
+            true,
+            value,
+        ));
     }
+    if let Some(usage) = key_usage {
+        extensions.push(extension(
+            <KeyUsage as const_oid::AssociatedOid>::OID,
+            true,
+            usage.to_der().expect("key usage"),
+        ));
+    }
+    if let Some(aaguid) = aaguid {
+        extensions.push(extension(
+            ID_FIDO_GEN_CE_AAGUID,
+            false,
+            OctetString::new(aaguid.to_vec())
+                .expect("aaguid octet string")
+                .to_der()
+                .expect("aaguid extension value"),
+        ));
+    }
+    if opts.malformed_aaguid_ext {
+        set_extension_raw(&mut extensions, ID_FIDO_GEN_CE_AAGUID, &[0x01, 0x02, 0x03]);
+    }
+    if !eku.is_empty() {
+        extensions.push(extension(
+            <ExtendedKeyUsage as const_oid::AssociatedOid>::OID,
+            false,
+            ExtendedKeyUsage(eku.to_vec())
+                .to_der()
+                .expect("extended key usage"),
+        ));
+    }
+
+    let signature_algorithm = AlgorithmIdentifierOwned {
+        oid: opts.leaf_sig_oid.unwrap_or(ECDSA_WITH_SHA256),
+        parameters: None,
+    };
+
+    let tbs = TestTbs {
+        version: if opts.leaf_version_v1 {
+            Version::V1
+        } else {
+            Version::V3
+        },
+        serial_number: SerialNumber::from(serial),
+        signature: signature_algorithm.clone(),
+        issuer,
+        validity,
+        subject,
+        subject_public_key_info: subject_key.signer.spki(),
+        issuer_unique_id: None,
+        subject_unique_id: None,
+        extensions: (!extensions.is_empty()).then_some(extensions),
+    };
+
+    let tbs_der = tbs.to_der().expect("tbs der");
+    let signature = signing_key.signer.sign(&tbs_der);
+    let cert = TestCert {
+        tbs,
+        signature_algorithm,
+        signature: BitString::from_bytes(&signature).expect("signature bit string"),
+    };
+    let der = cert.to_der().expect("certificate der");
+    assert_cert_roundtrip(&der);
+    der
 }
 
-/// The [`Signer`] for a [`TestKey`].
-fn signer_ref(key: &TestKey) -> &Signer {
-    &key.signer
-}
-
-/// Remove an extension by OID, if present.
-fn remove_extension(cert: &mut Certificate, oid: der::asn1::ObjectIdentifier) {
-    if let Some(exts) = cert.tbs_certificate.extensions.as_mut() {
-        exts.retain(|e| e.extn_id != oid);
+/// Build an [`Extension`] whose `extnValue` is the DER encoding of `value`.
+fn extension(extn_id: der::asn1::ObjectIdentifier, critical: bool, value: Vec<u8>) -> Extension {
+    Extension {
+        extn_id,
+        critical,
+        extn_value: OctetString::new(value).expect("extension value is a valid octet string"),
     }
 }
 
 /// Replace (or insert) an extension's `extnValue` with raw bytes.
-fn set_extension_raw(cert: &mut Certificate, oid: der::asn1::ObjectIdentifier, value: &[u8]) {
-    let exts = cert
-        .tbs_certificate
-        .extensions
-        .get_or_insert_with(Default::default);
+fn set_extension_raw(
+    extensions: &mut Vec<Extension>,
+    oid: der::asn1::ObjectIdentifier,
+    value: &[u8],
+) {
     let octets = OctetString::new(value.to_vec()).expect("octet string");
-    if let Some(e) = exts.iter_mut().find(|e| e.extn_id == oid) {
+    if let Some(e) = extensions.iter_mut().find(|e| e.extn_id == oid) {
         e.extn_value = octets;
     } else {
-        exts.push(Extension {
+        extensions.push(Extension {
             extn_id: oid,
             critical: false,
             extn_value: octets,
@@ -685,10 +805,21 @@ fn set_extension_raw(cert: &mut Certificate, oid: der::asn1::ObjectIdentifier, v
     }
 }
 
-/// Re-sign a certificate's TBS with `issuer` so it remains a valid chain link.
-fn re_sign(cert: &mut Certificate, issuer: &Signer) {
-    let tbs_der = cert.tbs_certificate.to_der().expect("tbs der");
-    cert.signature = BitString::from_bytes(&issuer.sign(&tbs_der)).expect("signature bit string");
+/// Assert that a hand-encoded certificate parses with `x509-cert 0.3` and re-encodes
+/// to exactly the same bytes.
+///
+/// The verifier decodes the harness's output with the same crate, so a wrong
+/// context-specific tag, tag mode, or `DEFAULT` omission shows up here immediately
+/// instead of as a confusing verification verdict.
+pub fn assert_cert_roundtrip(der: &[u8]) {
+    use der::Decode as _;
+
+    let parsed = Certificate::from_der(der).expect("synthesized certificate parses");
+    let reencoded = parsed.to_der().expect("parsed certificate re-encodes");
+    assert_eq!(
+        reencoded, der,
+        "synthesized certificate does not round-trip through x509-cert"
+    );
 }
 
 /// Build a cert signed by `issuer_key` whose own subject key is `subject_key`.
@@ -700,7 +831,7 @@ fn build_cert(
     validity: Validity,
     subject: Name,
     aaguid: Option<[u8; 16]>,
-) -> Certificate {
+) -> Vec<u8> {
     build_cert_full(
         issuer_key,
         subject_key,
@@ -755,45 +886,8 @@ pub fn chain_leaf(opts: &ChainOptions) -> ChainLeaf {
         opts,
     );
     ChainLeaf {
-        der: leaf.to_der().expect("leaf der"),
+        der: leaf,
         signer: leaf_key.signer,
-    }
-}
-
-/// Set (or, with `None`, remove) a certificate's KeyUsage extension, re-signing the
-/// TBS with `issuer` so the certificate stays a valid chain link. `Profile::Leaf`
-/// hard-codes `digitalSignature | nonRepudiation`, so this is the only way to
-/// synthesize a leaf whose KeyUsage forbids signing, or one that omits it.
-fn set_key_usage(cert: Certificate, issuer: &Signer, usage: Option<KeyUsages>) -> Certificate {
-    use der::Encode as _;
-
-    let mut tbs = cert.tbs_certificate.clone();
-    let extensions = tbs
-        .extensions
-        .as_mut()
-        .expect("leaf certificate carries extensions");
-    let index = extensions
-        .iter()
-        .position(|e| e.extn_id == <KeyUsage as const_oid::AssociatedOid>::OID)
-        .expect("leaf carries a KeyUsage extension");
-    match usage {
-        Some(flags) => {
-            extensions[index] = KeyUsage(flags.into())
-                .to_extension(&cert.tbs_certificate.subject, &[])
-                .expect("keyusage extension");
-        }
-        None => {
-            extensions.remove(index);
-        }
-    }
-
-    let tbs_der = tbs.to_der().expect("tbs der");
-    let signature =
-        der::asn1::BitString::from_bytes(&issuer.sign(&tbs_der)).expect("signature bit string");
-    Certificate {
-        tbs_certificate: tbs,
-        signature_algorithm: cert.signature_algorithm,
-        signature,
     }
 }
 
@@ -855,7 +949,7 @@ pub fn build_tpm_chain(aik: &TestKey, opts: &ChainOptions) -> TestChain {
     } else {
         &[]
     };
-    let leaf = build_cert_with_signer(
+    let leaf = build_cert_full(
         &intermediate_key,
         aik,
         Profile::Leaf {
@@ -868,33 +962,17 @@ pub fn build_tpm_chain(aik: &TestKey, opts: &ChainOptions) -> TestChain {
         Name::default(),
         None,
         aik_eku,
+        opts,
     );
-    // Profile::Leaf always emits a KeyUsage containing `digitalSignature`; the
-    // KeyUsage tests replace it with one that forbids signing, or remove it.
-    let leaf = if opts.omit_aik_key_usage {
-        set_key_usage(leaf, &intermediate_key.signer, None)
-    } else if opts.aik_key_usage_forbids_signature {
-        set_key_usage(
-            leaf,
-            &intermediate_key.signer,
-            Some(KeyUsages::KeyAgreement),
-        )
-    } else {
-        leaf
-    };
 
-    let root_der = root.to_der().expect("root der");
-    let mut x5c = vec![
-        leaf.to_der().expect("leaf der"),
-        intermediate.to_der().expect("int der"),
-    ];
+    let mut x5c = vec![leaf, intermediate];
     if !opts.omit_root {
-        x5c.push(root_der.clone());
+        x5c.push(root.clone());
     }
 
     TestChain {
         x5c,
-        root_fingerprint: sha256(&root_der),
+        root_fingerprint: sha256(&root),
         leaf_signer: intermediate_key.signer,
     }
 }
@@ -908,10 +986,10 @@ pub fn sha256(bytes: &[u8]) -> [u8; 32] {
 
 /// Build a `Validity` with explicit bounds relative to `now`.
 pub fn validity_from(not_before: SystemTime, not_after: SystemTime) -> Validity {
-    Validity {
-        not_before: not_before.try_into().expect("not_before"),
-        not_after: not_after.try_into().expect("not_after"),
-    }
+    Validity::new(
+        not_before.try_into().expect("not_before"),
+        not_after.try_into().expect("not_after"),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1030,7 +1108,7 @@ impl TpmSig {
         }
     }
 
-    pub fn sign(self, key: &rsa::RsaPrivateKey, msg: &[u8]) -> Vec<u8> {
+    pub fn sign(self, key: &rsa::PrivateKey, msg: &[u8]) -> Vec<u8> {
         use rsa::signature::SignatureEncoding as _;
         match self {
             TpmSig::Rs1 => {
@@ -1178,7 +1256,7 @@ pub fn tpm_att_stmt(
 /// signature uses `sig_scheme`.
 pub fn tpm_enrollment(
     credential: &TestKey,
-    aik_key: &rsa::RsaPrivateKey,
+    aik_key: &rsa::PrivateKey,
     chain: &TestChain,
     sig_scheme: TpmSig,
     name_alg: u16,
@@ -1260,6 +1338,6 @@ pub fn p256_xy_from_cose(cose: &[u8]) -> (Vec<u8>, Vec<u8>) {
 }
 
 /// Generate an RSA AIK key for TPM vectors.
-pub fn rsa_aik() -> rsa::RsaPrivateKey {
-    rsa::RsaPrivateKey::new(&mut OsRng, 2048).expect("rsa aik")
+pub fn rsa_aik() -> rsa::PrivateKey {
+    rsa::PrivateKey::new(&mut UnwrapErr(SysRng), 2048).expect("rsa aik")
 }

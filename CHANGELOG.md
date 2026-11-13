@@ -46,6 +46,12 @@ paths they close already required root to abuse).
 
 ### Changed
 
+- Dependencies moved to the current RustCrypto generation: `p256 0.14`, `ecdsa 0.17`,
+  `rsa 0.10`, `x509-cert 0.3`, `der 0.8`, `const-oid 0.10`, `sha2 0.11`, plus
+  `ed25519-dalek 3`, `rand 0.10`, `base64 0.23`, and the current minor releases of the
+  rest. `crypto-bigint` is now `0.7.11`, above the RUSTSEC-2026-0387 patch floor, and
+  `rsa 0.10` no longer pulls `num-bigint-dig`, which clears RUSTSEC-2023-0071; the
+  `deny.toml` advisory ignore list is now empty. No MSRV change (still 1.88).
 - `protocol::OkFlag` is public with a private field, so `Response`'s variants are nameable
   and the crate-wide `#![allow(private_interfaces)]` is gone, while a contradictory `ok`
   still cannot be constructed outside the crate.

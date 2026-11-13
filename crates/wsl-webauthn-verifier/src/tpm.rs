@@ -401,7 +401,7 @@ pub(crate) fn verify(check: &TpmCheck<'_>) -> Result<(), VerifyError> {
         },
         TPM_ALG_RSA => match pub_area.rsa_modulus {
             Some(n) => {
-                let actual_bits: u64 = rsa::BigUint::from_bytes_be(n).bits() as u64;
+                let actual_bits = u64::from(rsa::BoxedUint::from_be_slice_vartime(n).bit_width());
                 if actual_bits != u64::from(pub_area.key_bits) {
                     return Err(VerifyError::TpmPubAreaKeyBitsMismatch {
                         declared: pub_area.key_bits,
@@ -479,7 +479,7 @@ fn verify_rsa(
     use rsa::pkcs1v15::{Signature as RsaSignature, VerifyingKey as RsaVerifyingKey};
     use rsa::signature::Verifier as _;
 
-    let key = rsa::RsaPublicKey::try_from(spki).map_err(|_| VerifyError::MalformedCertificate {
+    let key = rsa::PublicKey::try_from(spki).map_err(|_| VerifyError::MalformedCertificate {
         reason: "AIK key is not an RSA public key",
     })?;
     let sig = RsaSignature::try_from(sig).map_err(|_| VerifyError::MalformedSignature {

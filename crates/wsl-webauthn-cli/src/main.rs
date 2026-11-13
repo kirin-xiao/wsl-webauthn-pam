@@ -2132,7 +2132,7 @@ const STRICT_AAGUID_SELF_TEST: [u8; 16] = STRICT_AAGUIDS[1];
 
 /// Build an uncompressed CoseKey (ES256/P-256) CBOR map for a signing key.
 fn p256_cose_key(signing_key: &p256::ecdsa::SigningKey) -> anyhow::Result<Vec<u8>> {
-    let point = signing_key.verifying_key().to_encoded_point(false);
+    let point = signing_key.verifying_key().to_sec1_point(false);
     let x = point
         .x()
         .ok_or_else(|| anyhow!("P-256 point has no x coordinate"))?
@@ -2283,13 +2283,14 @@ fn parse_windows_sid(stdout: &[u8]) -> Option<String> {
 
 /// Fill a `Vec<u8>` with OS entropy.
 ///
-/// Fallible on purpose: `rand_core` 0.6's `fill_bytes` panics when the OS entropy source
-/// fails, and a CLI panic unwinds instead of using the documented exit codes. The PAM
-/// module maps the same failure to `PAM_AUTHINFO_UNAVAIL`; here it is an ordinary error.
+/// Fallible on purpose: `SysRng`, the OS entropy backend, is fallible, and a CLI panic
+/// would unwind instead of using the documented exit codes. `try_fill_bytes` surfaces
+/// the `getrandom` error as an ordinary error; the PAM module maps the same failure to
+/// `PAM_AUTHINFO_UNAVAIL`.
 fn random_bytes(len: usize) -> anyhow::Result<Vec<u8>> {
-    use rand::RngCore as _;
+    use rand::TryRng as _;
     let mut buf = vec![0u8; len];
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut buf)
         .map_err(|e| anyhow!("could not obtain {len} bytes of OS entropy: {e}"))?;
     Ok(buf)
@@ -2397,6 +2398,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p256::elliptic_curve::Generate as _;
     use std::time::UNIX_EPOCH;
 
     fn args(items: &[&str]) -> Vec<String> {
@@ -3017,7 +3019,9 @@ mod tests {
         fn none_attestation() -> ScriptedCeremony {
             ScriptedCeremony {
                 calls: std::cell::Cell::new(0),
-                key: p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng),
+                key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rand_core::UnwrapErr(
+                    rand::rngs::SysRng,
+                )),
                 transport_error: false,
             }
         }
@@ -3209,7 +3213,9 @@ mod tests {
     fn double_enroll_second_transport_error_surfaces_without_third_attempt() {
         let ceremony = FailSecondCeremony {
             calls: std::cell::Cell::new(0),
-            key: p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng),
+            key: p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rand_core::UnwrapErr(
+                rand::rngs::SysRng,
+            )),
         };
         let error = enroll_with_double_enroll(
             &ceremony,
@@ -3569,7 +3575,9 @@ mod tests {
 
     /// Build a valid ES256 COSE key byte string for record-builder tests.
     fn es256_cose_bytes() -> Vec<u8> {
-        let signing_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let signing_key = p256::ecdsa::SigningKey::generate_from_rng(
+            &mut rand::rand_core::UnwrapErr(rand::rngs::SysRng),
+        );
         p256_cose_key(&signing_key).unwrap()
     }
 
