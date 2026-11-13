@@ -29,11 +29,6 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
-// `Response`'s variant fields are necessarily public (Rust gives enum-variant fields the
-// enum's visibility), so the opaque `OkFlag` used to pin `ok` trips the
-// `private_interfaces` lint. The field is intentionally reachable-but-not-constructible:
-// callers can read it by `..`-pattern/shadow-matching but cannot `use` its type or build it.
-#![allow(private_interfaces)]
 
 use std::io::Read;
 
@@ -132,10 +127,17 @@ impl From<std::io::Error> for FrameError {
 ///
 /// No length cap is enforced here; callers are responsible for choosing a payload that
 /// fits the relevant [`MAX_REQUEST_BYTES`] / [`MAX_RESPONSE_BYTES`] budget.
+///
+/// # Panics
+///
+/// Panics if `payload` exceeds `u32::MAX` bytes rather than silently truncating the
+/// length prefix. That is unreachable for this protocol (the caps are 8 KiB / 64 KiB), and
+/// a wrapped length would corrupt the stream instead of failing where it is produced.
 #[must_use]
 pub fn encode_frame(payload: &[u8]) -> Vec<u8> {
+    let len = u32::try_from(payload.len()).expect("frame payload exceeds the 4 GiB length prefix");
     let mut out = Vec::with_capacity(4 + payload.len());
-    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(payload);
     out
 }
@@ -198,6 +200,47 @@ pub fn b64u_decode(s: &str) -> Result<Vec<u8>, FrameError> {
     URL_SAFE_NO_PAD
         .decode(s.as_bytes())
         .map_err(|_| FrameError::Base64)
+}
+
+/// Encode 32 bytes as 64 **lowercase** hex characters.
+#[must_use]
+pub fn hex32_encode(bytes: &[u8; 32]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push(DIGITS[usize::from(byte >> 4)] as char);
+        out.push(DIGITS[usize::from(byte & 0x0f)] as char);
+    }
+    out
+}
+
+/// Decode a 32-byte digest from exactly 64 **lowercase** hex characters.
+///
+/// Uppercase is rejected: every producer in this workspace writes lowercase hex, so
+/// accepting both cases would admit input no writer can produce. A wrong length or a
+/// non-hex character yields `None`.
+#[must_use]
+pub fn hex32_decode(s: &str) -> Option<[u8; 32]> {
+    let bytes = s.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let hi = hex_nibble(bytes[2 * i])?;
+        let lo = hex_nibble(bytes[2 * i + 1])?;
+        *byte = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+/// One lowercase hex digit, or `None` for anything else (including `A`-`F`).
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -280,14 +323,23 @@ pub enum BridgeError {
 /// The `ok` discriminant of a [`Response`].
 ///
 /// A variant's `ok` is **fixed by the variant**: `true` for the three success replies,
-/// `false` for [`Response::Error`]. It is opaque and crate-private so a caller in another
-/// crate cannot construct a well-formed frame with a contradictory `ok`
-/// (e.g. `Response::Probe { ok: false, .. }`), which the peer would reject as a transport
-/// failure. Serde serializes it as the plain boolean on the wire, byte-identically, and
-/// deserialization is validated by [`expect_true`]/[`expect_false`].
+/// `false` for [`Response::Error`]. The type is public so it can be named in the
+/// [`Response`] variants, but its single field is private, so a caller in another crate
+/// still cannot construct a well-formed frame with a contradictory `ok`
+/// (e.g. `Response::Probe { ok: OkFlag(true), .. }`), which the peer would reject as a
+/// transport failure. Serde serializes it as the plain boolean on the wire,
+/// byte-identically, and deserialization is validated by [`expect_true`]/[`expect_false`].
+///
+/// The type can be *named* (so [`Response`]'s variants are ordinary public API), but its
+/// field is private:
+///
+/// ```compile_fail
+/// // Not constructible outside the crate, so `ok` cannot contradict its variant.
+/// let _ = wsl_webauthn_protocol::OkFlag(true);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
-struct OkFlag(bool);
+pub struct OkFlag(bool);
 
 /// A response from the Windows bridge to the Linux side.
 ///
@@ -666,6 +718,23 @@ mod tests {
     }
 
     #[test]
+    fn hex32_round_trips_and_is_lowercase_only() {
+        let digest = [0x00u8, 0x0f, 0xa5, 0xff].repeat(8).try_into().unwrap();
+        let text = hex32_encode(&digest);
+        assert_eq!(text.len(), 64);
+        assert_eq!(text, format!("000fa5ff{}", "000fa5ff".repeat(7)));
+        assert_eq!(hex32_decode(&text), Some(digest));
+
+        // Uppercase is rejected: the writer never produces it, so accepting it would
+        // admit a record the canonical encoder cannot create.
+        assert_eq!(hex32_decode(&text.to_uppercase()), None);
+        // Wrong length and non-hex are rejected.
+        assert_eq!(hex32_decode(&text[1..]), None);
+        assert_eq!(hex32_decode(&format!("g{}", &text[1..])), None);
+        assert_eq!(hex32_decode(""), None);
+    }
+
+    #[test]
     fn response_ok_flag_is_validated() {
         // Success variant with ok:false is a parse error.
         assert!(
@@ -680,9 +749,9 @@ mod tests {
         );
     }
 
-    /// `ok` is pinned by the variant (the opaque [`OkFlag`] type cannot be named or
-    /// constructed outside this crate), and the wire bytes for every valid case are
-    /// unchanged — a deserialize→serialize round trip is byte-identical.
+    /// `ok` is pinned by the variant (the [`OkFlag`] type has a private field, so it
+    /// cannot be constructed outside this crate), and the wire bytes for every valid case
+    /// are unchanged — a deserialize→serialize round trip is byte-identical.
     #[test]
     fn response_ok_flag_wire_bytes_are_pinned() {
         let cases: [(Response, bool); 4] = [

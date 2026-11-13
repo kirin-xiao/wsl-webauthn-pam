@@ -73,13 +73,16 @@ impl AuthDataPrefix {
 
 /// Parse the fixed prefix and validate `rpIdHash` and both user flags.
 ///
-/// Used by both the assertion and enrollment paths. `rpIdHash` is compared against
-/// `SHA-256(RP_ID)` in constant time for the length-32 digest.
+/// Used by both the assertion and enrollment paths. `rpIdHash` is a public value
+/// (`SHA-256(RP_ID)`), so it is compared with plain equality: a timing signal on it
+/// reveals nothing an attacker does not already know. The verifier holds no secret, and
+/// the signature check (the only secret-bearing comparison) is inside the constant-time
+/// EC/RSA primitives.
 pub(crate) fn parse_and_validate_prefix(auth_data: &[u8]) -> Result<AuthDataPrefix, VerifyError> {
     let prefix = parse_prefix(auth_data)?;
 
     let expected = Sha256::digest(RP_ID.as_bytes());
-    if !constant_time_eq(&prefix.rp_id_hash, &expected) {
+    if prefix.rp_id_hash[..] != expected[..] {
         return Err(VerifyError::RpIdHashMismatch);
     }
     if !prefix.user_present() {
@@ -206,21 +209,6 @@ pub(crate) fn parse_attested_credential_data(
     })
 }
 
-/// Constant-time equality for equal-length byte slices.
-///
-/// Compares every byte regardless of early mismatches. Unequal lengths compare
-/// unequal without reading out of bounds.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,10 +264,17 @@ mod tests {
     }
 
     #[test]
-    fn constant_time_eq_basic() {
-        assert!(constant_time_eq(&[1, 2, 3], &[1, 2, 3]));
-        assert!(!constant_time_eq(&[1, 2, 3], &[1, 2, 4]));
-        assert!(!constant_time_eq(&[1, 2], &[1, 2, 3]));
+    fn rp_id_hash_mismatch_is_compared_over_the_full_digest() {
+        // The digest comparison is plain equality now; keep a regression test that a
+        // single-byte difference in the last position is still rejected.
+        let mut expected = Sha256::digest(RP_ID.as_bytes());
+        expected[31] ^= 0x01;
+        let mut ad = expected.to_vec();
+        ad.extend_from_slice(&[FLAG_UP | FLAG_UV, 0, 0, 0, 1]);
+        assert_eq!(
+            parse_and_validate_prefix(&ad),
+            Err(VerifyError::RpIdHashMismatch)
+        );
     }
 
     /// A canonical 5-entry ES256 COSE_Key map (contents irrelevant to this parser,
