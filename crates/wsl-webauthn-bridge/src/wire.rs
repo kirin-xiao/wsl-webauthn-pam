@@ -69,6 +69,30 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
     }
 }
 
+/// Run one dispatch, turning a Rust-side panic into an in-band `internal`
+/// error response.
+///
+/// The bridge's contract is that a ceremony failure is always reported as a
+/// framed `{"op":"*","ok":false,"error":"..."}`; without this guard a panic
+/// would unwind out of `main` (exit 101, stderr trace), which the Linux side
+/// can only read as a *transport* failure. `AssertUnwindSafe` is sound here
+/// because the panic path touches no state that survives it: the dispatch
+/// result is discarded and a fresh error response is built.
+///
+/// Honest limitation: this covers panics raised in Rust code on the dispatch
+/// path. A panic escaping an `extern "system"` callback aborts the process
+/// under both panic profiles (`abort` at the FFI boundary), so it cannot be
+/// caught here; the `panic = "unwind"` requirement still exists for the rest.
+pub fn dispatch_guarded<F>(dispatch: F) -> Response
+where
+    F: FnOnce() -> Response,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(dispatch)) {
+        Ok(resp) => resp,
+        Err(_) => Response::error(BridgeError::Internal),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +167,30 @@ mod tests {
             decode_request(br#"{"op":"probe","timeout_ms":1,"x":2}"#),
             Err(InputError::BadFrame)
         );
+    }
+
+    #[test]
+    fn dispatch_guarded_turns_a_panic_into_an_internal_frame() {
+        // The default panic hook still prints to stderr; the point of the test
+        // is that the *response* is a well-formed in-band error frame.
+        let resp = dispatch_guarded(|| panic!("simulated dispatch panic"));
+        let framed = encode_response(&resp);
+        let mut cur = Cursor::new(framed);
+        let payload = read_frame(&mut cur, MAX_RESPONSE_BYTES).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Response>(&payload).unwrap(),
+            Response::error(BridgeError::Internal)
+        );
+        assert_eq!(
+            std::str::from_utf8(&payload).unwrap(),
+            r#"{"op":"*","ok":false,"error":"internal"}"#
+        );
+    }
+
+    #[test]
+    fn dispatch_guarded_passes_a_normal_response_through() {
+        let resp = Response::probe(false, 3);
+        assert_eq!(dispatch_guarded(|| resp.clone()), resp);
     }
 
     #[test]

@@ -86,7 +86,12 @@ fn main() -> std::process::ExitCode {
         Err(e) => return write_response(&wsl_webauthn_protocol::Response::error(e)),
     };
 
-    let resp = ceremony::dispatch(&api, &req);
+    // Only the dispatch is guarded: a panic there must still yield the framed
+    // in-band `internal` error (exit 0, like every other ceremony failure)
+    // rather than unwinding out of `main` as a transport failure. This covers
+    // Rust-side panics in dispatch only — a panic escaping an `extern "system"`
+    // callback aborts under both panic profiles and cannot be caught here.
+    let resp = wire::dispatch_guarded(|| ceremony::dispatch(&api, &req));
     write_response(&resp)
 }
 

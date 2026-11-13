@@ -518,8 +518,13 @@ fn window_name() -> *const u16 {
 /// Read a NUL-terminated UTF-16 string with a bounded scan (never panics).
 ///
 /// # Safety
-/// `p` is either null or points to a NUL-terminated UTF-16 buffer (or at least
-/// the scan stops after [`WIDE_SCAN_LIMIT`] code units).
+/// `p` is either null or points to a valid NUL-terminated UTF-16 string that is
+/// readable through its terminator, with at most [`WIDE_SCAN_LIMIT`] code units
+/// before that terminator. The limit exists so a corrupted, non-terminated
+/// buffer cannot make the scan run forever; it is *not* a license to read past
+/// the end of the allocation. Short allocations are a caller bug: callers here
+/// rely on the Win32 contract that `WebAuthNGetErrorName` and
+/// `pwsz_format_type` return properly terminated strings.
 unsafe fn wide_ptr_to_string(p: *const u16) -> Option<String> {
     const WIDE_SCAN_LIMIT: usize = 4096;
     if p.is_null() {
