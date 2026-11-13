@@ -302,6 +302,26 @@ impl Harness {
 }
 
 // ---------------------------------------------------------------------------
+// Helper process reaping
+// ---------------------------------------------------------------------------
+
+#[test]
+fn abort_child_kills_and_reaps_a_long_running_helper() {
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn /bin/sleep");
+    abort_child(&mut child);
+    // `abort_child` waited, so the child is reaped and `try_wait` reports an exit status.
+    // Dropping a `Child` instead would leave a zombie (and a helper that is still running
+    // until it finishes on its own).
+    match child.try_wait() {
+        Ok(Some(_)) => {}
+        other => panic!("the helper was not killed and reaped: {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Profile fidelity
 // ---------------------------------------------------------------------------
 
@@ -1451,7 +1471,7 @@ fn pam_d_backups(h: &Harness) -> Vec<PathBuf> {
 fn detect_legacy_finds_fixtures() {
     let h = Harness::new();
     install_legacy_fixture(&h);
-    let legacy = detect_legacy(&h.paths);
+    let legacy = detect_legacy(&h.paths).unwrap();
     assert!(legacy.is_present());
     assert_eq!(legacy.modules, vec![h.module_dir.join(LEGACY_MODULE_NAME)]);
     assert_eq!(
@@ -1467,8 +1487,39 @@ fn detect_legacy_finds_fixtures() {
 #[test]
 fn detect_legacy_absent_is_empty() {
     let h = Harness::new();
-    let legacy = detect_legacy(&h.paths);
+    let legacy = detect_legacy(&h.paths).unwrap();
     assert!(!legacy.is_present());
+}
+
+#[test]
+fn detect_legacy_propagates_permission_errors() {
+    // Root bypasses directory DAC, so an EACCES scenario is only observable as a normal
+    // user (CI runs unprivileged).
+    if wsl_webauthn_store::current_euid() == 0 {
+        eprintln!("skipping: root bypasses directory permissions");
+        return;
+    }
+    let h = Harness::new();
+    // Searchable but not readable (`0111`): probing `<root>/security` still yields
+    // `NotFound`, but `read_dir` fails with EACCES. That must be reported, not treated as
+    // "no legacy install".
+    let locked = h._tmp.path().join("locked-root");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o111)).unwrap();
+    let mut paths = h.paths.clone();
+    paths.module_search_roots = vec![locked.clone()];
+
+    let result = detect_legacy(&paths);
+    // Restore permissions so the tempdir can be cleaned up.
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let err = result.unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("locked-root"), "{text}");
+    assert!(
+        text.contains("Permission denied"),
+        "expected EACCES to propagate: {text}"
+    );
 }
 
 #[test]
@@ -1523,7 +1574,7 @@ fn migration_rewrites_pam_d_with_backup_and_is_idempotent() {
     // Idempotent: a second install run finds no legacy refs and does not re-rewrite.
     let before = std::fs::read(&pam_file).unwrap();
     let commands2 = MockCommands::default();
-    let legacy2 = detect_legacy(&h.paths);
+    let legacy2 = detect_legacy(&h.paths).unwrap();
     assert!(!legacy2.is_present(), "legacy artifacts should be gone");
     h.run_install(
         &ScriptedPrompter::always(true),
@@ -1605,6 +1656,44 @@ fn migration_skips_symlinked_pam_d_file() {
             .iter()
             .all(|q| !q.contains("Rewrite pam_wsl_hello")),
         "a symlinked pam.d file must not even be offered"
+    );
+}
+
+#[test]
+fn migration_refuses_symlinked_pam_d_directory() {
+    let h = Harness::new();
+    install_legacy_fixture(&h);
+    // Replace the real pam.d with a symlink to a directory holding a legacy reference.
+    std::fs::remove_dir(&h.paths.pam_d).unwrap();
+    let target = h._tmp.path().join("real-pam.d");
+    let pam_file = target.join("common-auth");
+    write(&pam_file, b"auth sufficient pam_wsl_hello.so\n", 0o644);
+    symlink(&target, &h.paths.pam_d).unwrap();
+
+    let err = h
+        .run_install(
+            &ScriptedPrompter::always(true),
+            &MockEnroller::default(),
+            &MockCommands {
+                success: true,
+                ..MockCommands::default()
+            },
+            &h.opts(),
+        )
+        .unwrap_err();
+
+    let text = format!("{err:#}");
+    assert!(text.contains("symlink"), "{text}");
+    assert!(text.contains("pam.d"), "{text}");
+    // The rewrite must not have written through the link.
+    assert_eq!(
+        std::fs::read(&pam_file).unwrap(),
+        b"auth sufficient pam_wsl_hello.so\n"
+    );
+    assert_eq!(
+        std::fs::read_dir(&target).unwrap().count(),
+        1,
+        "no backup may be created through the link"
     );
 }
 
@@ -1879,6 +1968,95 @@ fn uninstall_all_aborts_when_declined() {
     assert!(h.paths.config_path().exists(), "nothing removed");
 }
 
+#[test]
+fn uninstall_refuses_symlinked_pam_d_directory() {
+    let h = Harness::new();
+    // Replace the real pam.d with a symlink to a directory holding a migration backup.
+    std::fs::remove_dir(&h.paths.pam_d).unwrap();
+    let target = h._tmp.path().join("real-pam.d");
+    let backup = target.join(format!("common-auth{}.123", fsutil::BACKUP_MARKER));
+    write(&backup, b"auth sufficient pam_wsl_hello.so\n", 0o644);
+    symlink(&target, &h.paths.pam_d).unwrap();
+
+    let err = uninstall_all(
+        &h.paths,
+        &h.interop(),
+        &MockCommands::default(),
+        &ScriptedPrompter::always(true),
+        &UninstallOptions {
+            win_mnt: Some(h.win_mnt.clone()),
+            module_dir: Some(h.module_dir.clone()),
+            non_interactive: false,
+        },
+    )
+    .unwrap_err();
+
+    let text = format!("{err:#}");
+    assert!(text.contains("symlink"), "{text}");
+    assert!(text.contains("pam.d"), "{text}");
+    // The restore must not have written through the link.
+    assert!(backup.exists(), "the backup must be left in place");
+    assert!(
+        !target.join("common-auth").exists(),
+        "nothing may be restored through the link"
+    );
+}
+
+#[test]
+fn find_installed_modules_propagates_permission_errors() {
+    // Root bypasses directory DAC, so an EACCES scenario is only observable as a normal
+    // user (CI runs unprivileged).
+    if wsl_webauthn_store::current_euid() == 0 {
+        eprintln!("skipping: root bypasses directory permissions");
+        return;
+    }
+    let h = Harness::new();
+    // Searchable but not readable (`0111`): the `<root>/security` probe is `NotFound`,
+    // but `read_dir` fails. Uninstall must not conclude "not installed" and still report
+    // success.
+    let locked = h._tmp.path().join("locked-root");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o111)).unwrap();
+    let mut paths = h.paths.clone();
+    paths.module_search_roots = vec![locked.clone()];
+
+    let result = find_installed_modules(&paths, None);
+    // Restore permissions so the tempdir can be cleaned up.
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let err = result.unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("locked-root"), "{text}");
+    assert!(
+        text.contains("Permission denied"),
+        "expected EACCES to propagate: {text}"
+    );
+}
+
+#[test]
+fn warn_pam_d_references_propagates_permission_errors() {
+    // Root bypasses directory DAC, so an EACCES scenario is only observable as a normal
+    // user (CI runs unprivileged).
+    if wsl_webauthn_store::current_euid() == 0 {
+        eprintln!("skipping: root bypasses directory permissions");
+        return;
+    }
+    let h = Harness::new();
+    std::fs::set_permissions(&h.paths.pam_d, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let result = warn_pam_d_references(&h.paths);
+    // Restore permissions so the tempdir can be cleaned up.
+    std::fs::set_permissions(&h.paths.pam_d, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let err = result.unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("pam.d"), "{text}");
+    assert!(
+        text.contains("Permission denied"),
+        "expected EACCES to propagate: {text}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -1901,7 +2079,7 @@ fn sample_record_json(user: &str, uid: u32) -> String {
             "enrolled_at": "2026-10-01T00:00:00Z",
             "sign_count": 0,
             "bridge_path": "/mnt/c/bridge.exe",
-            "bridge_sha256": "00"
+            "bridge_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
         }}"#
     )
 }
