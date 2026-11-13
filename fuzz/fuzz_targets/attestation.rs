@@ -104,7 +104,10 @@ fn stitched_attestation(data: &[u8]) {
     };
 
     let obj = Value::Map(vec![
-        (Value::from("fmt"), Value::from(if selector & 1 == 0 { "packed" } else { "tpm" })),
+        (
+            Value::from("fmt"),
+            Value::from(if selector & 1 == 0 { "packed" } else { "tpm" }),
+        ),
         (Value::from("attStmt"), att_stmt),
         (Value::from("authData"), Value::Bytes(auth_data)),
     ]);
@@ -169,7 +172,8 @@ fn independent_oracle() {
             now,
         };
         assert!(
-            verify_attestation_with_anchor(&check, &AttestationPolicy::Strict, &fingerprint).is_err(),
+            verify_attestation_with_anchor(&check, &AttestationPolicy::Strict, &fingerprint)
+                .is_err(),
             "independent vector mutation at offset {i} must be rejected"
         );
     }

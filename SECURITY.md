@@ -176,7 +176,7 @@ The RP ID is a **scoping/display** mechanism, not a browser-grade origin guarant
 
 - No OpenSSL. The verifier is hand-rolled pure Rust over `ciborium`, `p256`, `ecdsa`, `sha2`, `rsa`, `ed25519-dalek`, `x509-cert`, `der`, `const-oid`.
 - Builds use `--locked`; third-party CI actions are pinned to commit SHAs; `cargo-deny` checks advisories, licenses, and sources (`deny.toml`).
-- **RUSTSEC-2023-0071** (non-constant-time RSA private-key operations in `rsa`) is knowingly accepted: it reaches us only through public-key-only RS256 / attestation verification, no RSA private key exists in the project, and the PAM path is local and never network-reachable (rationale in `deny.toml`).
+- **No advisory ignores.** `rsa 0.10` uses `crypto-bigint` rather than `num-bigint-dig`, which clears RUSTSEC-2023-0071, and the resolved `crypto-bigint` (>= 0.7.8) is above the RUSTSEC-2026-0387 patch floor, so `deny.toml` carries an empty `ignore` list. A test (`crates/wsl-webauthn-verifier/tests/no_private_key_in_src.rs`) still pins that no RSA private-key operation appears in production `src/`.
 - Real-machine attestation vectors are **never committed** — they contain machine-linked key material and live only in the git-ignored `tests/vectors/local/`.
 
 ### Distribution integrity

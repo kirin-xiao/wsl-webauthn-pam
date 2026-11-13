@@ -286,7 +286,7 @@ static PACKED_BASE: LazyLock<common::EnrolledPacked> =
 /// `certInfo` values.
 struct TpmBase {
     enr: common::TpmEnrollment,
-    aik: rsa::RsaPrivateKey,
+    aik: rsa::PrivateKey,
     sig_scheme: common::TpmSig,
 }
 

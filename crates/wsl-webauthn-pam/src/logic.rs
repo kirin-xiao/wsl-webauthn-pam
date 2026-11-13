@@ -175,11 +175,11 @@ impl Deps for SystemDeps {
         bridge_path_is_trusted(path, win_mnt)
     }
     fn fill_random(&self, dest: &mut [u8]) -> Result<(), String> {
-        use rand::RngCore as _;
-        // `OsRng::fill_bytes` panics on entropy failure; `try_fill_bytes` propagates
-        // the underlying `getrandom` error instead, which the caller maps to
+        use rand::TryRng as _;
+        // `SysRng` is the fallible OS entropy backend: `try_fill_bytes` returns the
+        // underlying `getrandom` error, which the caller maps to
         // `PAM_AUTHINFO_UNAVAIL` (service unavailable) rather than `PAM_ABORT`.
-        rand::rngs::OsRng
+        rand::rngs::SysRng
             .try_fill_bytes(dest)
             .map_err(|e| format!("OS entropy unavailable: {e}"))
     }

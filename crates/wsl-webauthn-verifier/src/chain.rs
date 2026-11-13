@@ -190,20 +190,20 @@ pub(crate) fn verify_chain(
         let child = &parsed[i];
         let (issuer_subject, issuer_spki) = match parsed.get(i + 1) {
             Some(issuer) => (
-                &issuer.tbs_certificate.subject,
-                &issuer.tbs_certificate.subject_public_key_info,
+                &issuer.tbs_certificate().subject(),
+                &issuer.tbs_certificate().subject_public_key_info(),
             ),
             None => {
                 let root = external_root.as_ref().ok_or(VerifyError::Internal {
                     reason: "chain has no issuer for its top certificate",
                 })?;
                 (
-                    &root.tbs_certificate.subject,
-                    &root.tbs_certificate.subject_public_key_info,
+                    &root.tbs_certificate().subject(),
+                    &root.tbs_certificate().subject_public_key_info(),
                 )
             }
         };
-        if &child.tbs_certificate.issuer != issuer_subject {
+        if &child.tbs_certificate().issuer() != issuer_subject {
             return Err(VerifyError::CertificateChainIssuerMismatch);
         }
         verify_certificate_signature(child, issuer_spki)?;
@@ -212,7 +212,7 @@ pub(crate) fn verify_chain(
     let leaf = &parsed[0];
 
     // Leaf version 3.
-    if leaf.tbs_certificate.version != Version::V3 {
+    if leaf.tbs_certificate().version() != Version::V3 {
         return Err(VerifyError::CertificateVersionNotV3);
     }
 
@@ -248,7 +248,7 @@ pub(crate) fn verify_chain(
     // the TCG AIK Extended Key Usage, and (when KeyUsage is present) MUST permit
     // digital signatures, since the AIK signs `certInfo`.
     if profile == ChainProfile::Tpm {
-        if !leaf.tbs_certificate.subject.0.is_empty() {
+        if !leaf.tbs_certificate().subject().is_empty() {
             return Err(VerifyError::TpmAikSubjectNotEmpty);
         }
         require_aik_extended_key_usage(leaf)?;
@@ -282,7 +282,7 @@ pub(crate) fn verify_chain(
 
     Ok(ChainInfo {
         leaf_sha256: sha256(certs_der[0]),
-        leaf_spki: leaf.tbs_certificate.subject_public_key_info.clone(),
+        leaf_spki: leaf.tbs_certificate().subject_public_key_info().clone(),
     })
 }
 
@@ -304,7 +304,7 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 /// adding no security. The window is never widened beyond the certificate's own
 /// bounds.
 fn check_validity(cert: &Certificate, now: SystemTime) -> Result<(), VerifyError> {
-    let validity = &cert.tbs_certificate.validity;
+    let validity = &cert.tbs_certificate().validity();
     let not_before = validity.not_before.to_system_time();
     let not_after = validity.not_after.to_system_time();
     if now < not_before {
@@ -349,14 +349,14 @@ fn enforce_path_len(
 /// Whether a certificate is self-issued (subject equals issuer), which RFC 5280
 /// excludes from `pathLenConstraint` accounting.
 fn is_self_issued(cert: &Certificate) -> bool {
-    cert.tbs_certificate.subject == cert.tbs_certificate.issuer
+    cert.tbs_certificate().subject() == cert.tbs_certificate().issuer()
 }
 
 /// Extract and parse the BasicConstraints extension, which must be present.
 fn basic_constraints(cert: &Certificate) -> Result<BasicConstraints, VerifyError> {
-    let tbs = &cert.tbs_certificate;
+    let tbs = cert.tbs_certificate();
     let bc = tbs
-        .get::<BasicConstraints>()
+        .get_extension::<BasicConstraints>()
         .map_err(|_| VerifyError::MalformedCertificate {
             reason: "BasicConstraints extension failed to parse",
         })?
@@ -372,8 +372,8 @@ fn require_aik_extended_key_usage(cert: &Certificate) -> Result<(), VerifyError>
     use x509_cert::ext::pkix::ExtendedKeyUsage;
 
     let eku = cert
-        .tbs_certificate
-        .get::<ExtendedKeyUsage>()
+        .tbs_certificate()
+        .get_extension::<ExtendedKeyUsage>()
         .map_err(|_| VerifyError::MalformedCertificate {
             reason: "ExtendedKeyUsage extension failed to parse or is duplicated",
         })?
@@ -391,12 +391,12 @@ fn require_aik_extended_key_usage(cert: &Certificate) -> Result<(), VerifyError>
 fn require_digital_signature_usage(cert: &Certificate) -> Result<(), VerifyError> {
     use x509_cert::ext::pkix::KeyUsage;
 
-    let usage =
-        cert.tbs_certificate
-            .get::<KeyUsage>()
-            .map_err(|_| VerifyError::MalformedCertificate {
-                reason: "KeyUsage extension failed to parse or is duplicated",
-            })?;
+    let usage = cert
+        .tbs_certificate()
+        .get_extension::<KeyUsage>()
+        .map_err(|_| VerifyError::MalformedCertificate {
+            reason: "KeyUsage extension failed to parse or is duplicated",
+        })?;
     if let Some((_, usage)) = usage
         && !usage.digital_signature()
     {
@@ -410,14 +410,12 @@ fn subject_has_ou(cert: &Certificate, want: &str) -> bool {
     use der::Tag;
     use der::asn1::Utf8StringRef;
 
-    cert.tbs_certificate.subject.0.iter().any(|rdn| {
-        rdn.0.iter().any(|atv| {
-            atv.oid == const_oid::db::rfc4519::ORGANIZATIONAL_UNIT_NAME
-                && atv.value.tag() == Tag::Utf8String
-                && Utf8StringRef::try_from(&atv.value)
-                    .map(|s| s.as_str() == want)
-                    .unwrap_or(false)
-        })
+    cert.tbs_certificate().subject().iter().any(|atv| {
+        atv.oid == const_oid::db::rfc4519::ORGANIZATIONAL_UNIT_NAME
+            && atv.value.tag() == Tag::Utf8String
+            && Utf8StringRef::try_from(&atv.value)
+                .map(|s| s.as_str() == want)
+                .unwrap_or(false)
     })
 }
 
@@ -433,14 +431,11 @@ fn leaf_aaguid(cert: &Certificate) -> Result<[u8; 16], VerifyError> {
 
 /// Find the leaf's `id-fido-gen-ce-aaguid` extension, if any.
 fn find_aaguid_extension(cert: &Certificate) -> Option<&x509_cert::ext::Extension> {
-    cert.tbs_certificate
-        .extensions
-        .as_deref()
-        .and_then(|extensions| {
-            extensions
-                .iter()
-                .find(|e| e.extn_id == ID_FIDO_GEN_CE_AAGUID)
-        })
+    cert.tbs_certificate().extensions().and_then(|extensions| {
+        extensions
+            .iter()
+            .find(|e| e.extn_id == ID_FIDO_GEN_CE_AAGUID)
+    })
 }
 
 /// Decode an AAGUID, tolerating one or two layers of OCTET STRING wrapping.
@@ -471,19 +466,19 @@ fn verify_certificate_signature(
     issuer_spki: &SubjectPublicKeyInfoOwned,
 ) -> Result<(), VerifyError> {
     let tbs = child
-        .tbs_certificate
+        .tbs_certificate()
         .to_der()
         .map_err(|_| VerifyError::MalformedCertificate {
             reason: "TBS certificate failed to re-encode",
         })?;
     let signature = child
-        .signature
+        .signature()
         .as_bytes()
         .ok_or(VerifyError::MalformedCertificate {
             reason: "certificate signature is not octet-aligned",
         })?;
     let spki_ref = issuer_spki.owned_to_ref();
-    let alg = child.signature_algorithm.oid;
+    let alg = child.signature_algorithm().oid;
 
     if alg == ECDSA_WITH_SHA256 {
         use ecdsa::signature::hazmat::PrehashVerifier as _;
@@ -501,11 +496,10 @@ fn verify_certificate_signature(
             .map_err(|_| VerifyError::CertificateChainSignatureInvalid)
     } else if alg == SHA1_WITH_RSA {
         use rsa::pkcs1v15::{Signature as RsaSignature, VerifyingKey as RsaVerifyingKey};
-        let key = rsa::RsaPublicKey::try_from(spki_ref).map_err(|_| {
-            VerifyError::MalformedCertificate {
+        let key =
+            rsa::PublicKey::try_from(spki_ref).map_err(|_| VerifyError::MalformedCertificate {
                 reason: "issuer key is not an RSA public key",
-            }
-        })?;
+            })?;
         let sig =
             RsaSignature::try_from(signature).map_err(|_| VerifyError::MalformedCertificate {
                 reason: "certificate RSA signature is malformed",
@@ -515,11 +509,10 @@ fn verify_certificate_signature(
             .map_err(|_| VerifyError::CertificateChainSignatureInvalid)
     } else if matches!(alg, SHA256_WITH_RSA | SHA384_WITH_RSA | SHA512_WITH_RSA) {
         use rsa::pkcs1v15::{Signature as RsaSignature, VerifyingKey as RsaVerifyingKey};
-        let key = rsa::RsaPublicKey::try_from(spki_ref).map_err(|_| {
-            VerifyError::MalformedCertificate {
+        let key =
+            rsa::PublicKey::try_from(spki_ref).map_err(|_| VerifyError::MalformedCertificate {
                 reason: "issuer key is not an RSA public key",
-            }
-        })?;
+            })?;
         let sig =
             RsaSignature::try_from(signature).map_err(|_| VerifyError::MalformedCertificate {
                 reason: "certificate RSA signature is malformed",
@@ -593,11 +586,10 @@ pub(crate) fn cose_key_from_spki(
         })?;
         Ok(ParsedCoseKey::Es256(key))
     } else if oid == OID_RSA_ENCRYPTION {
-        let key = rsa::RsaPublicKey::try_from(spki_ref).map_err(|_| {
-            VerifyError::MalformedCertificate {
+        let key =
+            rsa::PublicKey::try_from(spki_ref).map_err(|_| VerifyError::MalformedCertificate {
                 reason: "leaf key is not an RSA public key",
-            }
-        })?;
+            })?;
         Ok(ParsedCoseKey::Rs256(Box::new(
             rsa::pkcs1v15::VerifyingKey::<Sha256>::new(key),
         )))

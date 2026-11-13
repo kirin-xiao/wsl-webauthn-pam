@@ -18,9 +18,9 @@ libfuzzer-sys = "0.4"
 # anchor-injection seam, so it must enable `test-anchor`.
 wsl-webauthn-verifier = { path = "../crates/wsl-webauthn-verifier", features = ["test-anchor"] }
 wsl-webauthn-protocol = { path = "../crates/wsl-webauthn-protocol" }
-p256 = { version = "0.13.2", features = ["ecdsa"] }
+p256 = { version = "0.14.0", features = ["ecdsa"] }
 ciborium = "0.2.2"
-sha2 = "0.10.9"
+sha2 = "0.11.1"
 
 [[bin]]
 name = "attestation_object"

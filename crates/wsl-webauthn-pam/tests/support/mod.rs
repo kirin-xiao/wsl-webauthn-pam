@@ -23,7 +23,9 @@ use std::time::Duration;
 
 use p256::ecdsa::SigningKey as P256SigningKey;
 use p256::ecdsa::signature::Signer as _;
-use rand::rngs::OsRng;
+use p256::elliptic_curve::Generate as _;
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
 use sha2::{Digest as _, Sha256};
 
 use wsl_webauthn_protocol::{ClientDataKind, Response, b64u_encode, build_client_data};
@@ -441,14 +443,14 @@ pub struct TestKey {
 
 /// Generate an ES256 test key.
 pub fn es256_key() -> TestKey {
-    let signing = P256SigningKey::random(&mut OsRng);
+    let signing = P256SigningKey::generate_from_rng(&mut UnwrapErr(SysRng));
     let cose = cose_es256(&signing);
     TestKey { signing, cose }
 }
 
 fn cose_es256(sk: &P256SigningKey) -> Vec<u8> {
     use ciborium::value::Value;
-    let point = sk.verifying_key().to_encoded_point(false);
+    let point = sk.verifying_key().to_sec1_point(false);
     let map = vec![
         (Value::from(1i64), Value::from(2i64)),
         (Value::from(3i64), Value::from(-7i64)),
