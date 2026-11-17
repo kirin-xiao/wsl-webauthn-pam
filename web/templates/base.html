@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+{% set here = current_path or "" %}
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0D0D0D">
+  <title>{% block title %}{{ config.title }}{% endblock %}</title>
+  <meta name="description" content="{% block description %}{{ config.description }}{% endblock %}">
+  <link rel="icon" href="{{ get_url(path='assets/favicon.svg') }}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{ get_url(path='main.css') }}">
+  <link rel="preload" href="{{ get_url(path='fonts/IBMPlexSans-Regular.woff2') }}" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="{{ get_url(path='fonts/IBMPlexMono-Regular.woff2') }}" as="font" type="font/woff2" crossorigin>
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="{{ config.title }}">
+  <meta property="og:title" content="{% block og_title %}{{ config.title }}{% endblock %}">
+  <meta property="og:description" content="{% block og_description %}{{ config.description }}{% endblock %}">
+  <meta property="og:url" content="{{ config.base_url }}{{ here or '/' }}">
+  <meta property="og:image" content="{{ config.base_url }}/assets/og.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  {% block head %}{% endblock %}
+</head>
+<body class="{% block body_class %}site{% endblock %}">
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header">
+    <div class="wrap site-header__inner">
+      <a class="brand" href="{{ get_url(path='@/_index.md') }}">wsl-webauthn-pam</a>
+      <nav class="site-nav" aria-label="Primary">
+        {% set docs = get_section(path="docs/_index.md") %}
+        <a href="{{ docs.permalink }}"{% if here == "/docs/" %} aria-current="page"{% elif here is starting_with(pat="/docs/") %} aria-current="true"{% endif %}>Docs</a>
+        <a href="{{ config.extra.releases_url }}">Releases</a>
+        <a href="{{ config.extra.repo_url }}">GitHub</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    {% block main %}{% endblock %}
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap site-footer__inner">
+      <p class="site-footer__meta">
+        <span class="site-version">v{{ get_env(name="SITE_VERSION", default="dev") }}</span>
+        <span aria-hidden="true">·</span>
+        <a href="{{ config.extra.license_url }}">MIT</a>
+        <span aria-hidden="true">·</span>
+        <a href="{{ config.extra.security_url }}">Security policy</a>
+      </p>
+      <nav class="site-footer__nav" aria-label="Footer">
+        <a href="{{ get_url(path='@/docs/install.md') }}">Install</a>
+        <a href="{{ get_url(path='@/docs/troubleshooting.md') }}">Troubleshooting</a>
+        <a href="{{ config.extra.repo_url }}">Source</a>
+      </nav>
+    </div>
+  </footer>
+
+  <p class="sr-only" id="copy-status" role="status" aria-live="polite"></p>
+
+  <script>
+    (function () {
+      "use strict";
+      var buttons = document.querySelectorAll("[data-copy]");
+      if (!buttons.length || !navigator.clipboard || !navigator.clipboard.writeText) {
+        return;
+      }
+      Array.prototype.forEach.call(buttons, function (button) {
+        var term = button.closest(".term");
+        var code = term ? term.querySelector("code") : null;
+        if (!code) {
+          return;
+        }
+        var idle = button.getAttribute("data-label") || "copy";
+        button.hidden = false;
+        button.addEventListener("click", function () {
+          navigator.clipboard.writeText(code.textContent.replace(/\s+$/, "")).then(function () {
+            button.textContent = "copied";
+            button.classList.add("is-copied");
+            window.setTimeout(function () {
+              button.textContent = idle;
+              button.classList.remove("is-copied");
+            }, 2000);
+          }, function () {
+            button.textContent = "select and copy";
+          });
+        });
+      });
+    })();
+  </script>
+  <script>
+    // Copy buttons for ordinary fenced code blocks (`.term` has its own). No
+    // scripting, no button: the page stays exactly as written.
+    (function () {
+      "use strict";
+      if (!(navigator.clipboard && navigator.clipboard.writeText) && !(document.queryCommandSupported && document.queryCommandSupported("copy"))) return;
+      var status = document.getElementById("copy-status");
+      function legacy(text) {
+        var area = document.createElement("textarea"), ok = false;
+        area.value = text; area.className = "sr-only"; document.body.appendChild(area); area.select();
+        try { ok = document.execCommand("copy"); } catch (error) { ok = false; }
+        document.body.removeChild(area);
+        return ok ? Promise.resolve() : Promise.reject(new Error("copy failed"));
+      }
+      function write(text) {
+        return navigator.clipboard && navigator.clipboard.writeText ? navigator.clipboard.writeText(text).catch(function () { return legacy(text); }) : legacy(text);
+      }
+      function announce(text) { if (status) status.textContent = text; }
+      Array.prototype.forEach.call(document.querySelectorAll(".prose pre"), function (pre) {
+        var code = pre.querySelector("code");
+        if (!code || pre.closest(".term")) return;
+        var box = document.createElement("div"), button = document.createElement("button");
+        box.className = "codeblock"; pre.parentNode.insertBefore(box, pre); box.appendChild(pre);
+        button.type = "button"; button.className = "codeblock__copy"; button.textContent = "copy";
+        button.setAttribute("aria-label", "Copy this code block"); button.hidden = true; box.appendChild(button);
+        button.addEventListener("click", function () {
+          write(code.textContent.replace(/\s+$/, "")).then(function () {
+            button.textContent = "copied"; button.classList.add("is-copied"); announce("copied to clipboard");
+            window.setTimeout(function () { button.textContent = "copy"; button.classList.remove("is-copied"); announce(""); }, 2000);
+          }, function () { button.textContent = "select and copy"; });
+        });
+        button.hidden = false;
+      });
+    })();
+  </script>
+</body>
+</html>

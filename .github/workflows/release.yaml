@@ -52,6 +52,12 @@ name: Release
 # That job needs the repository secrets APT_GPG_PRIVATE_KEY (and, for a protected
 # key, APT_GPG_PASSPHRASE) plus Pages set to deploy from GitHub Actions — see
 # CONTRIBUTING.md.
+#
+# The published Pages tree is assembled by `.github/scripts/publish-pages.sh`:
+# the docs site (`web/`, Zola) owns `/index.html`, `/docs/` and the assets, and
+# the signed repository owns `/dists/`, `/pool/` and the archive keyring. The
+# manual republish workflow (`pages.yaml`) calls the same script, so a
+# release-less republish and a release deploy cannot drift apart.
 
 on:
   push:
@@ -352,13 +358,16 @@ jobs:
           # Tags carrying a pre-release suffix (vX.Y.Z-rc1) publish as pre-releases.
           prerelease: ${{ contains(github.ref_name, '-') }}
 
-  # Publish a signed apt repository to GitHub Pages so Debian/Ubuntu users can
-  # `apt install wsl-webauthn-pam`. The job runs after `publish` in this workflow
-  # because a release created by GITHUB_TOKEN does not trigger `on: release`.
-  # The repository is rebuilt from every released stable .deb on every run, so it
-  # cannot drift from the release assets.
+  # Publish the GitHub Pages tree: a signed apt repository so Debian/Ubuntu
+  # users can `apt install wsl-webauthn-pam`, deployed alongside the docs site
+  # (`/` and `/docs/` from `web/`, the repository at `/dists/` and `/pool/`).
+  # Both trees are assembled by one script (`publish-pages.sh`).
+  # The job runs after `publish` in this workflow because a release created by
+  # GITHUB_TOKEN does not trigger `on: release`. The repository is rebuilt from
+  # every released stable .deb on every run, so it cannot drift from the release
+  # assets.
   apt-repo:
-    name: publish signed apt repo (GitHub Pages)
+    name: publish site + signed apt repo (GitHub Pages)
     needs: [publish]
     # The `stable` suite must only ever serve stable releases; pre-release tags
     # are published as GitHub pre-releases and never enter the apt repo.
@@ -372,6 +381,13 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
+    # The same group `pages.yaml` (manual republish) uses, so the two can never
+    # deploy at once: `cancel-in-progress: false` queues instead of cancelling,
+    # because a half-written Pages deployment would leave a pool whose signed
+    # index is missing a package.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -382,19 +398,17 @@ jobs:
       # Pre-releases are excluded: the `stable` suite must never serve an `~rc`
       # package (the tag-push `if:` on this job already skips pre-releases; the
       # filter also keeps any historical pre-release out of the pool). A tag
-      # predating .deb packaging simply has no matching asset and is skipped.
+      # predating .deb packaging simply has no matching asset and is skipped, but
+      # a release that advertises a .deb must deliver it: collect-debs.sh fails
+      # the job, naming the tag, instead of publishing a pool silently missing a
+      # version. `--clobber` keeps the pool rebuild idempotent.
       - name: collect every released .deb
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
           pool="site/apt/pool/main/w/wsl-webauthn-pam"
-          mkdir -p "$pool"
-          for tag in $(gh release list -R "$GITHUB_REPOSITORY" --limit 1000 \
-              --exclude-pre-releases --json tagName -q '.[].tagName'); do
-            gh release download "$tag" -R "$GITHUB_REPOSITORY" \
-              -p 'wsl-webauthn-pam_*.deb' -D "$pool" --clobber || true
-          done
+          sh .github/scripts/collect-debs.sh "$pool"
           ls -l "$pool"
           # The release that triggered this run must have landed in the pool, or
           # the published repo would silently be missing the new version.
@@ -422,22 +436,16 @@ jobs:
           printf '%s' "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
           fingerprint=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')
           [ -n "$fingerprint" ] || { echo "::error::no signing key imported"; exit 1; }
-          # build-apt-repo.sh reads GPG_KEY_ID.
+          # publish-pages.sh (via build-apt-repo.sh) reads GPG_KEY_ID.
           echo "GPG_KEY_ID=$fingerprint" >> "$GITHUB_ENV"
 
-      - name: build + sign the repository
+      # The landing page is the docs site's `/index.html`; the apt metadata is
+      # built in place under the same root. One assembly path for both trees, so
+      # this job and `pages.yaml` cannot drift.
+      - name: assemble + sign the published tree (site + apt repo)
         env:
           GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
-        run: |
-          set -eu
-          sh .github/scripts/build-apt-repo.sh site/apt main
-          cat > site/apt/index.html <<'EOF'
-          <!doctype html>
-          <title>wsl-webauthn-pam apt repository</title>
-          <p>Debian/Ubuntu package repository for
-          <a href="https://github.com/kirin-xiao/wsl-webauthn-pam">wsl-webauthn-pam</a>.
-          See the project README for the setup commands.</p>
-          EOF
+        run: sh .github/scripts/publish-pages.sh site/apt
 
       - name: upload the Pages artifact
         uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1

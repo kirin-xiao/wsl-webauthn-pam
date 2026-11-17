@@ -1,0 +1,38 @@
+# Zola configuration for the GitHub Pages site.
+#
+# The root of the published origin is shared with a signed apt repository
+# (dists/, pool/, wsl-webauthn-pam-archive-keyring.gpg), which is assembled by
+# .github/scripts/publish-pages.sh. Zola only owns the landing page, /docs/,
+# and the static assets below; never add static paths that shadow dists/,
+# pool/, or a .gpg file at the root.
+
+base_url = "https://kirin-xiao.github.io/wsl-webauthn-pam"
+title = "wsl-webauthn-pam"
+description = "Passwordless sudo and su inside WSL2, authenticated with the Windows Hello passkey you already use."
+
+default_language = "en"
+output_dir = "public"
+compile_sass = true
+# HTML minification is off on purpose. Zola 0.23's minifier (minify-html) is a
+# boolean switch with no keep-comments option, and it strips the
+# `<!-- INVARIANT: … -->` markers that must reach the published security page:
+# `.github/scripts/check-site-links.py` asserts all 17 of them in
+# web/public/docs/security/index.html, not just in the Markdown source. Turning
+# minification off is the only Zola-0.23 way to publish those comments; turn it
+# back on when the pinned Zola exposes keep_comments.
+minify_html = false
+build_search_index = false
+# The site owns /sitemap.xml and /robots.txt at the published origin. The apt
+# tree only ever writes dists/, pool/, the keyring, and .nojekyll, so neither
+# generated file can shadow an apt path (see check-site-links.py).
+generate_sitemap = true
+generate_robots_txt = true
+
+[markdown]
+github_alerts = true
+
+[extra]
+repo_url = "https://github.com/kirin-xiao/wsl-webauthn-pam"
+releases_url = "https://github.com/kirin-xiao/wsl-webauthn-pam/releases"
+security_url = "https://github.com/kirin-xiao/wsl-webauthn-pam/blob/main/SECURITY.md"
+license_url = "https://github.com/kirin-xiao/wsl-webauthn-pam/blob/main/LICENSE"

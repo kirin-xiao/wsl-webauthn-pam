@@ -25,6 +25,8 @@ name: CI
 #   bootstrap   shellcheck + hermetic bootstrap.sh tests
 #   pam-profile real pam-auth-update expansion guard
 #   doc-invariants  documented invariants map to tests
+#   site        docs site build (pinned Zola) + internal-link/docs-set guard;
+#                      builds only, never deploys and needs no GPG secrets
 #   fuzz-smoke  nightly cargo-fuzz smoke (pinned 0.13.2, locked, artifacts on failure)
 
 on:
@@ -489,6 +491,7 @@ jobs:
           shellcheck --version
           # `-s sh` matches the shebang; bootstrap.sh is POSIX sh.
           shellcheck -s sh bootstrap.sh
+          shellcheck -s sh scripts/get-zola.sh
           shellcheck -s sh scripts/test-bootstrap.sh
           shellcheck -s sh crates/wsl-webauthn-pam/tests/c_host/provision_and_drive.sh
           shellcheck -s bash spike/build_testrp.sh
@@ -498,6 +501,8 @@ jobs:
           shellcheck -s sh .github/scripts/build-deb.sh
           shellcheck -s sh .github/scripts/check-deb-layout.sh
           shellcheck -s sh .github/scripts/build-apt-repo.sh
+          shellcheck -s sh .github/scripts/collect-debs.sh
+          shellcheck -s sh .github/scripts/publish-pages.sh
           shellcheck -s sh .github/scripts/install-nfpm.sh
           shellcheck -s sh packaging/debian/postinst
           shellcheck -s sh packaging/debian/prerm
@@ -562,6 +567,41 @@ jobs:
       #    distinctly and do not fail the job.
       - name: check documented invariants
         run: python3 .github/scripts/check-doc-invariants.py
+
+  # The published origin is one tree with two owners: the docs site (landing
+  # page, `/docs/<slug>/`, assets) and the signed apt repository (`dists/`,
+  # `pool/`, the keyring at `/`). Zola builds all of it happily with a dead
+  # relative link, a `#fragment` that names no `id`, a renamed/deleted docs page,
+  # or a `web/static/` file that lands on `pool/` — every one of those is only
+  # visible to a user after a deploy. This job builds the site exactly the way
+  # the publish path does (`make site`, pinned Zola) and runs
+  # `.github/scripts/check-site-links.py` over the output. It deploys nothing and
+  # needs no GPG secrets; deployment is `release.yaml` (stable tags) and
+  # `pages.yaml` (manual republish), which reuse the same scripts.
+  site:
+    name: site build + internal-link check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # 1. Unit-test the checker against synthetic trees: a broken link, a
+      #    broken same-page and cross-page anchor, a missing and an extra docs
+      #    page, a `../` escape, apt-path shadowing (pool/dists/keyring), a
+      #    dropped marker, a duplicated marker id, and a missing source.
+      - name: checker self-test
+        run: python3 .github/scripts/check-site-links.py --self-test
+
+      # 2. Build with the pinned Zola (v0.23.6 via scripts/get-zola.sh). No Rust
+      #    here, so the job stays cheap.
+      - name: build the site (pinned Zola)
+        run: make site
+
+      # 3. The real gate: every internal href/src and `#fragment` resolves, all
+      #    seven docs pages exist at /docs/<slug>/, nothing generated shadows an
+      #    apt path, and the security page still carries its 17 invariant
+      #    markers.
+      - name: check internal links + docs set
+        run: python3 .github/scripts/check-site-links.py web/public
 
   fuzz-smoke:
     name: fuzz smoke (nightly)

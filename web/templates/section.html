@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+
+{% block title %}{{ section.title }} — wsl-webauthn-pam{% endblock %}
+{% block og_title %}{{ section.title }} — wsl-webauthn-pam{% endblock %}
+{% block description %}{{ section.description | default(value=config.description) }}{% endblock %}
+{% block og_description %}{{ section.description | default(value=config.description) }}{% endblock %}
+
+{% block main %}
+<div class="wrap docs-layout">
+  <aside class="docs-sidebar">
+    {% include "partials/docs-nav.html" %}
+  </aside>
+
+  <article class="prose docs-article">
+    <header class="docs-header">
+      <h1>{{ section.title }}</h1>
+      {% if section.description %}<p class="lede">{{ section.description }}</p>{% endif %}
+    </header>
+
+    {{ section.content | replace(from='<table>', to='<div class="table-scroll"><table>') | replace(from="</table>", to="</table></div>") | replace(from="<th>", to="<th scope=col>") | safe }}
+
+    <ol class="docs-index">
+      {% for doc in section.pages %}
+      <li>
+        <a href="{{ doc.permalink }}">{{ doc.title }}</a>
+        {% if doc.description %}<span>{{ doc.description }}</span>{% endif %}
+      </li>
+      {% endfor %}
+    </ol>
+  </article>
+</div>
+{% endblock %}

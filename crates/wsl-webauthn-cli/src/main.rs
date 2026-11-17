@@ -203,8 +203,8 @@ STABLE ERROR TOKENS:
       config-missing, config-invalid, not-found, already-exists, record-corrupt,
       invalid-username, symlink, not-regular-file, insecure-store, too-large,
       path-changed, record-changed, record-user-mismatch, encode, io,
-      bridge-missing, interop-unavailable, spawn, bridge-failed, transport, timeout,
-      verify-rejected, error
+      bridge-missing, interop-unavailable, spawn, bridge-failed, bridge-integrity,
+      transport, timeout, verify-rejected, error
 
 EXIT CODES:
     0   success
@@ -278,6 +278,55 @@ const EXIT_OK: i32 = 0;
 const EXIT_FAIL: i32 = 1;
 const EXIT_USAGE: i32 = 2;
 
+/// Declare the stable `error[...]` tokens in `--help` order.
+///
+/// One list produces both the individual constants used by the error mapping and
+/// [`STABLE_ERROR_TOKENS`], which [`error_code`] asserts against in debug builds and the
+/// usage test compares against [`USAGE`]. A token therefore cannot be rendered without
+/// also being listed in `--help`, and adding a token here automatically extends the test.
+macro_rules! stable_error_tokens {
+    ($($name:ident => $token:literal),+ $(,)?) => {
+        /// Stable `error[...]` tokens, named for the mapping that emits them.
+        mod tokens {
+            $(pub(crate) const $name: &str = $token;)+
+        }
+
+        /// Every stable `error[...]` token the CLI can emit, in `--help` order.
+        const STABLE_ERROR_TOKENS: &[&str] = &[$($token),+];
+    };
+}
+
+stable_error_tokens! {
+    // Store family.
+    CONFIG_MISSING => "config-missing",
+    CONFIG_INVALID => "config-invalid",
+    NOT_FOUND => "not-found",
+    ALREADY_EXISTS => "already-exists",
+    RECORD_CORRUPT => "record-corrupt",
+    INVALID_USERNAME => "invalid-username",
+    SYMLINK => "symlink",
+    NOT_REGULAR_FILE => "not-regular-file",
+    INSECURE_STORE => "insecure-store",
+    TOO_LARGE => "too-large",
+    PATH_CHANGED => "path-changed",
+    RECORD_CHANGED => "record-changed",
+    RECORD_USER_MISMATCH => "record-user-mismatch",
+    ENCODE => "encode",
+    IO => "io",
+    // Runner family.
+    BRIDGE_MISSING => "bridge-missing",
+    INTEROP_UNAVAILABLE => "interop-unavailable",
+    SPAWN => "spawn",
+    BRIDGE_FAILED => "bridge-failed",
+    BRIDGE_INTEGRITY => "bridge-integrity",
+    TRANSPORT => "transport",
+    TIMEOUT => "timeout",
+    // Verifier family.
+    VERIFY_REJECTED => "verify-rejected",
+    // CLI-originated errors (no typed source).
+    ERROR => "error",
+}
+
 /// A stable machine-readable token for an operational failure.
 ///
 /// Every `error!`-style `anyhow` error carries at least one source; the innermost store,
@@ -286,36 +335,49 @@ const EXIT_USAGE: i32 = 2;
 fn error_code(error: &anyhow::Error) -> &'static str {
     for cause in error.chain() {
         if let Some(store) = cause.downcast_ref::<StoreError>() {
-            return store_error_code(store);
+            return documented(store_error_code(store));
         }
         if let Some(runner) = cause.downcast_ref::<wsl_webauthn_runner::RunnerError>() {
-            return runner_error_code(runner);
+            return documented(runner_error_code(runner));
         }
         if let Some(verify) = cause.downcast_ref::<VerifyError>() {
-            return verify_error_code(verify);
+            return documented(verify_error_code(verify));
         }
     }
-    "error"
+    documented(tokens::ERROR)
+}
+
+/// Return `token`, asserting in debug builds that `--help` documents it.
+///
+/// The release build compiles the assertion out; the usage test covers the same
+/// invariant for every token, and reaching an undocumented one here means the mapping
+/// grew a token without extending [`STABLE_ERROR_TOKENS`].
+fn documented(token: &'static str) -> &'static str {
+    debug_assert!(
+        STABLE_ERROR_TOKENS.contains(&token),
+        "{token} must be listed in STABLE_ERROR_TOKENS"
+    );
+    token
 }
 
 /// Stable token for a [`StoreError`].
 fn store_error_code(error: &StoreError) -> &'static str {
     match error {
-        StoreError::InvalidUsername => "invalid-username",
-        StoreError::SymlinkedPath { .. } => "symlink",
-        StoreError::NotRegularFile { .. } => "not-regular-file",
-        StoreError::BadOwnership { .. } | StoreError::InsecureBase { .. } => "insecure-store",
-        StoreError::NotFound { .. } => "not-found",
-        StoreError::AlreadyExists { .. } => "already-exists",
-        StoreError::Corrupt { .. } => "record-corrupt",
-        StoreError::TooLarge { .. } => "too-large",
-        StoreError::PathChanged { .. } => "path-changed",
-        StoreError::RecordUserMismatch { .. } => "record-user-mismatch",
-        StoreError::RecordChanged { .. } => "record-changed",
-        StoreError::ConfigMissing { .. } => "config-missing",
-        StoreError::Config { .. } => "config-invalid",
-        StoreError::Encode { .. } => "encode",
-        StoreError::Io { .. } => "io",
+        StoreError::InvalidUsername => tokens::INVALID_USERNAME,
+        StoreError::SymlinkedPath { .. } => tokens::SYMLINK,
+        StoreError::NotRegularFile { .. } => tokens::NOT_REGULAR_FILE,
+        StoreError::BadOwnership { .. } | StoreError::InsecureBase { .. } => tokens::INSECURE_STORE,
+        StoreError::NotFound { .. } => tokens::NOT_FOUND,
+        StoreError::AlreadyExists { .. } => tokens::ALREADY_EXISTS,
+        StoreError::Corrupt { .. } => tokens::RECORD_CORRUPT,
+        StoreError::TooLarge { .. } => tokens::TOO_LARGE,
+        StoreError::PathChanged { .. } => tokens::PATH_CHANGED,
+        StoreError::RecordUserMismatch { .. } => tokens::RECORD_USER_MISMATCH,
+        StoreError::RecordChanged { .. } => tokens::RECORD_CHANGED,
+        StoreError::ConfigMissing { .. } => tokens::CONFIG_MISSING,
+        StoreError::Config { .. } => tokens::CONFIG_INVALID,
+        StoreError::Encode { .. } => tokens::ENCODE,
+        StoreError::Io { .. } => tokens::IO,
     }
 }
 
@@ -323,21 +385,21 @@ fn store_error_code(error: &StoreError) -> &'static str {
 fn runner_error_code(error: &wsl_webauthn_runner::RunnerError) -> &'static str {
     use wsl_webauthn_runner::RunnerError;
     match error {
-        RunnerError::BridgeMissing { .. } => "bridge-missing",
-        RunnerError::InteropUnavailable { .. } => "interop-unavailable",
-        RunnerError::BridgeIntegrity { .. } => "bridge-integrity",
-        RunnerError::RequestTooLarge { .. } => "too-large",
-        RunnerError::Spawn { .. } => "spawn",
-        RunnerError::BridgeFailed { .. } => "bridge-failed",
-        RunnerError::Transport { .. } => "transport",
-        RunnerError::Timeout { .. } => "timeout",
-        RunnerError::InteropHelperMissing { .. } => "interop-unavailable",
+        RunnerError::BridgeMissing { .. } => tokens::BRIDGE_MISSING,
+        RunnerError::InteropUnavailable { .. } => tokens::INTEROP_UNAVAILABLE,
+        RunnerError::BridgeIntegrity { .. } => tokens::BRIDGE_INTEGRITY,
+        RunnerError::RequestTooLarge { .. } => tokens::TOO_LARGE,
+        RunnerError::Spawn { .. } => tokens::SPAWN,
+        RunnerError::BridgeFailed { .. } => tokens::BRIDGE_FAILED,
+        RunnerError::Transport { .. } => tokens::TRANSPORT,
+        RunnerError::Timeout { .. } => tokens::TIMEOUT,
+        RunnerError::InteropHelperMissing { .. } => tokens::INTEROP_UNAVAILABLE,
     }
 }
 
 /// Stable token for a [`VerifyError`].
 fn verify_error_code(_error: &VerifyError) -> &'static str {
-    "verify-rejected"
+    tokens::VERIFY_REJECTED
 }
 
 // ---------------------------------------------------------------------------
@@ -3799,18 +3861,27 @@ mod tests {
     #[test]
     fn usage_documents_every_error_token() {
         assert!(USAGE.contains("STABLE ERROR TOKENS"));
-        // Tokens scripts may rely on: a representative sample from each family.
-        for token in [
-            "config-missing",
-            "config-invalid",
-            "record-corrupt",
-            "already-exists",
-            "bridge-failed",
-            "timeout",
-            "verify-rejected",
-        ] {
-            assert!(USAGE.contains(token), "usage must document token {token}");
-        }
+        // The list is bounded by the prose before it and the exit-code section after it,
+        // so every comma-separated entry is a token rather than incidental prose.
+        let documented = USAGE
+            .split_once("Current tokens:")
+            .expect("usage must introduce the token list")
+            .1
+            .split_once("\n\nEXIT CODES:")
+            .expect("the token list must precede the exit codes")
+            .0;
+        let documented: Vec<&str> = documented
+            .split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .collect();
+        // Exact sequence, not just a subset: `STABLE_ERROR_TOKENS` is the single source
+        // of truth shared with the error mapping, so a token cannot be emitted without
+        // appearing here, and the help text cannot drift out of order.
+        assert_eq!(
+            documented, STABLE_ERROR_TOKENS,
+            "usage must document every stable error token, in the rendering order"
+        );
     }
 
     /// Every flag the parser recognizes must be named in `--help`, so a flag cannot be

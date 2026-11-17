@@ -1,0 +1,16 @@
+{# The "On this page" list body, shared by the wide nav and the narrow
+   <details>. Expects `toc_items` (a page.toc array) in the context. #}
+<ol>
+  {% for h in toc_items %}
+  <li>
+    <a href="#{{ h.id }}">{{ h.title }}</a>
+    {% if h.children %}
+    <ol>
+      {% for child in h.children %}
+      <li><a href="#{{ child.id }}">{{ child.title }}</a></li>
+      {% endfor %}
+    </ol>
+    {% endif %}
+  </li>
+  {% endfor %}
+</ol>

@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+
+{% block title %}{{ page.title }} — wsl-webauthn-pam{% endblock %}
+{% block og_title %}{{ page.title }} — wsl-webauthn-pam{% endblock %}
+{% block description %}{{ page.description | default(value=config.description) }}{% endblock %}
+{% block og_description %}{{ page.description | default(value=config.description) }}{% endblock %}
+
+{# One "On this page" list rendered from `page.toc`, used twice: a plain nav on
+   wide screens, and a closed <details> on narrow ones so the long pages do not
+   spend their first screen on navigation. No JS either way. #}
+{% block main %}
+<div class="wrap docs-layout">
+  <aside class="docs-sidebar">
+    {% include "partials/docs-nav.html" %}
+  </aside>
+
+  <article class="prose docs-article">
+    <header class="docs-header">
+      <h1>{{ page.title }}</h1>
+      {% if page.description %}<p class="lede">{{ page.description }}</p>{% endif %}
+    </header>
+
+    {% if page.toc | length >= 4 %}
+    {% set toc_items = page.toc %}
+    <nav class="toc toc--wide" aria-label="On this page">
+      <p class="toc__title">On this page</p>
+      {% include "partials/toc-items.html" %}
+    </nav>
+    <details class="toc toc--compact">
+      <summary class="toc__title">On this page</summary>
+      {% include "partials/toc-items.html" %}
+    </details>
+    {% endif %}
+
+    {{ page.content | replace(from='<table>', to='<div class="table-scroll"><table>') | replace(from="</table>", to="</table></div>") | replace(from="<th>", to="<th scope=col>") | safe }}
+
+    <nav class="pager" aria-label="Documentation pages">
+      {% if page.lower %}
+      <a class="pager__prev" href="{{ page.lower.permalink }}">
+        <span>Previous</span>
+        {{ page.lower.title }}
+      </a>
+      {% endif %}
+      {% if page.higher %}
+      <a class="pager__next" href="{{ page.higher.permalink }}">
+        <span>Next</span>
+        {{ page.higher.title }}
+      </a>
+      {% endif %}
+    </nav>
+
+    <p class="docs-edit">
+      <a href="{{ config.extra.repo_url }}/edit/main/web/content/{{ page.relative_path }}">Edit this page on GitHub</a>
+    </p>
+  </article>
+</div>
+{% endblock %}

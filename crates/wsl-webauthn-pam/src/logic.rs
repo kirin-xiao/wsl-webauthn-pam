@@ -134,7 +134,8 @@ pub trait Deps {
     ) -> Result<RunnerResponse, RunnerError> {
         self.authenticate(bridge, win_mnt, expected_sha256, params, deadline)
     }
-    /// Deliberate, documented panic-injection seam (see `SECURITY.md`).
+    /// Deliberate, documented panic-injection seam (see the security page,
+    /// `web/content/docs/security.md`).
     ///
     /// The test double in `tests/support/mod.rs` overrides this to panic inside the
     /// guarded region; `tests/pam.rs::injected_panic_returns_pam_abort` uses it to prove
@@ -369,8 +370,8 @@ fn fail(code: i32, reason: impl Into<String>) -> AuthOutcome {
 }
 
 /// Run the authentication state machine. May panic only through the documented
-/// panic-injection seam [`Deps::panic_probe`] (see `SECURITY.md`); production never
-/// panics.
+/// panic-injection seam [`Deps::panic_probe`] (see the security page,
+/// `web/content/docs/security.md`); production never panics.
 pub fn authenticate<S: PamSeam, D: Deps>(
     seam: &mut S,
     deps: &D,
@@ -378,7 +379,8 @@ pub fn authenticate<S: PamSeam, D: Deps>(
     args: &ModuleArgs,
 ) -> AuthOutcome {
     let silent = (flags & PAM_SILENT) != 0;
-    // Deliberate, documented panic-injection seam (see `SECURITY.md`): only the test
+    // Deliberate, documented panic-injection seam (see the security page,
+    // `web/content/docs/security.md`): only the test
     // double overrides `panic_probe`, driving `tests/pam.rs::injected_panic_returns_pam_abort`.
     deps.panic_probe();
 
