@@ -250,11 +250,16 @@ site:
 	zola=$$(sh scripts/get-zola.sh) || exit 1; \
 	SITE_VERSION="$$version" "$$zola" --root web build
 
-# Local preview on a non-default port (Zola's default is 1111).
+# Local preview on a non-default port (Zola's default is 1111). Override
+# `SITE_PORT` to run a second preview beside the default one.
+SITE_PORT ?= 8899
 site-serve:
 	@version=$$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -1); \
+	if [ -z "$$version" ]; then \
+		echo ">> could not read [workspace.package] version from Cargo.toml" >&2; exit 1; \
+	fi; \
 	zola=$$(sh scripts/get-zola.sh) || exit 1; \
-	SITE_VERSION="$$version" "$$zola" --root web serve --interface 127.0.0.1 --port 8899
+	SITE_VERSION="$$version" "$$zola" --root web serve --interface 127.0.0.1 --port $(SITE_PORT)
 
 # Check the built tree: internal links, anchors, the seven docs pages, and the
 # apt-repository namespace collisions (.github/scripts/check-site-links.py).

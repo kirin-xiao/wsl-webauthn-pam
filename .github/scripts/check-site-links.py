@@ -12,7 +12,8 @@ Zola happily builds a site with a dead relative link, a `#fragment` that names
 no `id`, a page that was renamed out of the docs set, or a `static/` file at
 `pool/` that would land on top of the signed package index.  None of those fail
 the build, and each one is only visible to a user *after* a deploy.  This
-checker makes them fail in CI instead, against the built tree:
+checker makes them fail in CI instead, against the built tree (and, for the last
+item, the sources that feed it):
 
   (a) every internal `href`/`src` resolves to a file in the tree.  "Internal"
       covers relative references, site-absolute ones (`/docs/install/`) and
@@ -32,7 +33,15 @@ checker makes them fail in CI instead, against the built tree:
       invariant -> test mapping); and the **built** `docs/security/index.html`
       carries the same markers with the same ids, so an HTML minifier or a
       template cannot strip them from what users can actually read in
-      "view source".
+      "view source"; and
+  (f) every release version spelled out in the prose — a `v<semver>` token
+      (release URLs, `--version v…` pins) and a
+      `wsl-webauthn-pam_<version>_<arch>.deb` file name — in `web/content/**`
+      and `README.md` equals the `[workspace.package] version` in `Cargo.toml`.
+      A release bump updates the footer automatically (the template reads
+      `SITE_VERSION`), but a copied install command keeps the old tag and
+      silently 404s after the next release; this check fails it in CI with the
+      file and the offending string.
 
 References into `/dists/`, `/pool/` and the archive keyring at the root are
 "apt-provided": `build-apt-repo.sh` produces them when the tree is assembled
@@ -102,6 +111,14 @@ EXPECTED_INVARIANT_MARKERS = 17
 # counts as a marker.  Ids may be comma/space separated within one comment.
 MARKER_RE = re.compile(r"<!--\s*INVARIANT:\s*(?P<ids>[A-Za-z0-9_,.\s\-]+?)\s*-->")
 ID_SPLIT_RE = re.compile(r"[\s,]+")
+
+# The repository this script ships in.  Version drift is checked against its
+# sources, not against whichever built tree is being inspected, so `check-site-
+# links.py DIR` over a copied tree still guards the current release strings.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_CARGO_TOML = REPO_ROOT / "Cargo.toml"
+DEFAULT_CONTENT_DIR = REPO_ROOT / "web" / "content"
+DEFAULT_README = REPO_ROOT / "README.md"
 
 DEFAULT_SITE = "web/public"
 DEFAULT_SECURITY_SOURCE = "web/content/docs/security.md"
@@ -528,6 +545,118 @@ def check_published_invariants(
     return (errors, count)
 
 
+# ---------------------------------------------------------------------------
+# Release-version drift
+# ---------------------------------------------------------------------------
+
+# `[workspace.package]` is the single source of truth for the release version
+# (the release workflow refuses a tag that disagrees with it).  Every `v<semver>`
+# token in the prose must name that release: it covers both a
+# `releases/download/v<tag>/…` URL and a pinned install command such as
+# `--version v1.2.3`.  A `v` token needs three numeric components, so prose about
+# other version schemes (`PKCS#1 v1.5`, `leaf v3`), the glibc floor, Windows
+# builds and dependency versions without a `v` prefix are not matched, and
+# neither is a placeholder like `wsl-webauthn-pam_<version>_amd64.deb`.
+CARGO_WORKSPACE_RE = re.compile(r"^\[workspace\.package\]\s*$", re.MULTILINE)
+CARGO_SECTION_RE = re.compile(r"^\[", re.MULTILINE)
+CARGO_VERSION_RE = re.compile(r'^\s*version\s*=\s*"([^"]+)"', re.MULTILINE)
+
+VERSION_TOKEN_RE = re.compile(
+    r"(?<![\w.])v(?P<version>\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.~-]+)?)(?!\w|\.\d)"
+)
+DEB_NAME_RE = re.compile(
+    r"wsl-webauthn-pam_(?P<version>\d[A-Za-z0-9.+~-]*)_[a-z0-9]+\.deb"
+)
+
+
+def read_workspace_version(cargo_toml: Path) -> str | None:
+    """The `version` in `[workspace.package]`, or None if the file/section is absent."""
+    try:
+        text = cargo_toml.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    section = CARGO_WORKSPACE_RE.search(text)
+    if section is None:
+        return None
+    rest = text[section.end():]
+    following = CARGO_SECTION_RE.search(rest)
+    body = rest[: following.start()] if following else rest
+    match = CARGO_VERSION_RE.search(body)
+    return match.group(1) if match else None
+
+
+def _line_of(text: str, offset: int) -> int:
+    return text.count("\n", 0, offset) + 1
+
+
+def check_version_drift(
+    cargo_toml: Path, content_dir: Path, readme: Path
+) -> tuple[list[str], int]:
+    """Release versions in the docs prose match the workspace version.
+
+    Every `v<semver>` token and every `wsl-webauthn-pam_<version>_<arch>.deb`
+    file name must agree.  Returns ``(errors, checked)``; ``checked`` counts the
+    version-bearing strings that were found, so a summary can say the check was
+    not vacuous.
+    """
+    version = read_workspace_version(cargo_toml)
+    if version is None:
+        return (
+            [
+                f"{cargo_toml}: no `[workspace.package] version`; release "
+                f"versions in web/content and README.md cannot be checked"
+            ],
+            0,
+        )
+
+    # Debian versions may not contain `-`; the release workflow maps a
+    # pre-release tag's base version to `~` (`0.2.0-rc1` -> `0.2.0~rc1`).
+    deb_version = version.replace("-", "~")
+
+    sources: list[Path] = []
+    if content_dir.is_dir():
+        sources.extend(sorted(p for p in content_dir.rglob("*") if p.is_file()))
+    if readme.is_file():
+        sources.append(readme)
+
+    errors: list[str] = []
+    checked = 0
+    for source in sources:
+        try:
+            text = source.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            # Binary asset or unreadable file: no prose to check.
+            continue
+        try:
+            shown = source.relative_to(REPO_ROOT).as_posix()
+        except ValueError:
+            shown = str(source)
+
+        for match in VERSION_TOKEN_RE.finditer(text):
+            checked += 1
+            found = match.group("version")
+            if found != version:
+                errors.append(
+                    f"{shown}:{_line_of(text, match.start())}: version token "
+                    f"{match.group(0)!r} does not match [workspace.package] "
+                    f"version {version!r} ({cargo_toml}); add a `v{version}` "
+                    f"token or bump Cargo.toml"
+                )
+
+        for match in DEB_NAME_RE.finditer(text):
+            checked += 1
+            found = match.group("version")
+            if found != deb_version:
+                errors.append(
+                    f"{shown}:{_line_of(text, match.start())}: .deb file name "
+                    f"{match.group(0)!r} carries version {found!r}, expected "
+                    f"{deb_version!r} ([workspace.package] version {version!r} in "
+                    f"{cargo_toml})"
+                )
+
+    return (errors, checked)
+
+
 def check_site(
     site: Path, security_source: Path, base: SiteBase | None = None
 ) -> tuple[list[str], dict[str, int]]:
@@ -612,6 +741,194 @@ def _base_tree() -> dict[str, str]:
 
 def _markers(count: int) -> str:
     return "".join(f"<!-- INVARIANT: INV-{i:02d} -->\n" for i in range(count))
+
+
+def _version_cases(tmp: Path) -> tuple[int, int]:
+    """Fixtures for the release-version drift check; returns (failed, total).
+
+    Every fixture gets its own synthetic repository: a `Cargo.toml` with a
+    `[workspace.package]` section (and a decoy `version` in another section),
+    a `web/content/docs/` page, and a `README.md`.
+    """
+
+    def workspace(version: str) -> str:
+        return (
+            "[workspace]\n"
+            'resolver = "2"\n'
+            'members = ["crates/a"]\n'
+            "\n"
+            "[workspace.package]\n"
+            f'version = "{version}"\n'
+            'edition = "2024"\n'
+            'rust-version = "1.88"\n'
+            "\n"
+            "[profile.release]\n"
+            'lto = "thin"\n'
+            # A `version` outside [workspace.package] must never be picked up.
+            'version = "9.9.9"\n'
+        )
+
+    install = (
+        "## The `.deb` from the release page\n"
+        "\n"
+        "```sh\n"
+        "curl -fsSLO https://github.com/o/r/releases/download/v1.2.3/"
+        "wsl-webauthn-pam_1.2.3_amd64.deb\n"
+        "gh attestation verify wsl-webauthn-pam_1.2.3_amd64.deb -R o/r\n"
+        "```\n"
+    )
+    readme = (
+        "# project\n"
+        "\n"
+        "Download the [.deb](https://github.com/o/r/releases/download/v1.2.3/"
+        "wsl-webauthn-pam_1.2.3_amd64.deb) or read [the docs](docs/).\n"
+    )
+    prose = (
+        "The module is built against glibc 2.31 and needs Windows 10 1903+.\n"
+        "Signatures are PKCS#1 v1.5 or ES256; attestation chains end at leaf v3.\n"
+        "The verifier uses der 0.8 and p256 0.14, none of them v-prefixed.\n"
+        "Verify with `gh attestation verify wsl-webauthn-pam_<version>_amd64.deb`.\n"
+        "Version 1.2.2 of something unrelated is not a release token.\n"
+        "Upgrade from 0.1.x before 1.2.3 ships.\n"
+    )
+
+    cases: list[tuple[str, str | None, dict[str, str], bool, str | None, int]] = [
+        (
+            "good",
+            "1.2.3",
+            {"docs/install.md": install, "README.md": readme},
+            True,
+            None,
+            5,
+        ),
+        (
+            "stale-release-url",
+            "1.2.3",
+            {
+                "docs/install.md": install.replace(
+                    "download/v1.2.3/", "download/v1.2.2/"
+                )
+            },
+            False,
+            "v1.2.2",
+            1,
+        ),
+        (
+            "stale-deb-name",
+            "1.2.3",
+            {
+                "docs/install.md": install.replace(
+                    "wsl-webauthn-pam_1.2.3_amd64.deb",
+                    "wsl-webauthn-pam_1.2.2_amd64.deb",
+                )
+            },
+            False,
+            "wsl-webauthn-pam_1.2.2_amd64.deb",
+            1,
+        ),
+        (
+            "stale-readme-url",
+            "1.2.3",
+            {"README.md": readme.replace("download/v1.2.3/", "download/v1.2.2/")},
+            False,
+            "v1.2.2",
+            1,
+        ),
+        (
+            "stale-bootstrap-pin",
+            "1.2.3",
+            {
+                "docs/install.md": (
+                    "curl -fsSL https://github.com/o/r/releases/latest/download/"
+                    "bootstrap.sh | sudo bash -s -- --version v1.2.2\n"
+                )
+            },
+            False,
+            "v1.2.2",
+            1,
+        ),
+        (
+            "stale-prose-version",
+            "1.2.3",
+            # A sentence-final period must not hide the token from the check.
+            {"docs/security.md": "This is the release shipped as v1.2.2.\n"},
+            False,
+            "v1.2.2",
+            1,
+        ),
+        (
+            "prose-versions-and-placeholders-ignored",
+            "1.2.3",
+            {"docs/security.md": prose},
+            True,
+            None,
+            0,
+        ),
+        (
+            "prerelease-mapping",
+            "1.3.0-rc1",
+            {
+                "docs/install.md": (
+                    "https://github.com/o/r/releases/download/v1.3.0-rc1/"
+                    "wsl-webauthn-pam_1.3.0~rc1_amd64.deb\n"
+                )
+            },
+            True,
+            None,
+            2,
+        ),
+        (
+            "prerelease-deb-hyphen",
+            "1.3.0-rc1",
+            {"docs/install.md": "wsl-webauthn-pam_1.3.0-rc1_amd64.deb\n"},
+            False,
+            "wsl-webauthn-pam_1.3.0-rc1_amd64.deb",
+            1,
+        ),
+        (
+            "missing-workspace-version",
+            None,
+            {"docs/install.md": install},
+            False,
+            "no `[workspace.package] version`",
+            0,
+        ),
+    ]
+
+    failed = 0
+    for name, version, files, expect_ok, needle, min_checked in cases:
+        root = tmp / "versions" / name
+        cargo = root / "Cargo.toml"
+        content = root / "web" / "content"
+        readme_path = root / "README.md"
+        content.mkdir(parents=True, exist_ok=True)
+        if version is not None:
+            cargo.write_text(workspace(version), encoding="utf-8")
+        for relpath, body in files.items():
+            target = readme_path if relpath == "README.md" else content / relpath
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(body, encoding="utf-8")
+
+        errors, checked = check_version_drift(cargo, content, readme_path)
+        problems = list(errors)
+        if needle is not None and not any(needle in error for error in errors):
+            problems.append(f"no error names {needle!r}")
+        if checked < min_checked:
+            problems.append(
+                f"only {checked} version string(s) checked, "
+                f"expected at least {min_checked}"
+            )
+        ok = not problems
+        verdict = "ok" if ok == expect_ok else "UNEXPECTED"
+        if ok != expect_ok:
+            failed += 1
+        print(f"[{verdict}] version-drift-{name}: checker={'PASS' if ok else 'FAIL'} "
+              f"expected={'PASS' if expect_ok else 'FAIL'}")
+        if ok != expect_ok:
+            for report in problems:
+                print(f"           - {report}")
+
+    return (failed, len(cases))
 
 
 def self_test() -> int:
@@ -803,11 +1120,15 @@ def self_test() -> int:
                 if problem is not None:
                     print(f"           - {problem}")
 
+        version_failed, version_total = _version_cases(tmp)
+        failed += version_failed
+        total = len(cases) + version_total
+
     print()
     if failed:
         print(f"self-test FAILED ({failed} unexpected result(s))")
         return 1
-    print(f"self-test passed ({len(cases)} fixtures)")
+    print(f"self-test passed ({total} fixtures)")
     return 0
 
 
@@ -839,6 +1160,10 @@ def main(argv: list[str]) -> int:
     site = Path(args.site)
     base, base_source = detect_base_url(site, args.base_url)
     errors, stats = check_site(site, Path(args.security_source), base)
+    version_errors, versions = check_version_drift(
+        DEFAULT_CARGO_TOML, DEFAULT_CONTENT_DIR, DEFAULT_README
+    )
+    errors += version_errors
 
     if base is None:
         origin = (
@@ -866,7 +1191,8 @@ def main(argv: list[str]) -> int:
         f"{stats['apt']} apt-provided), all {len(DOCS_PAGES)} docs pages present, "
         f"{stats['markers']} invariant markers intact in the source and "
         f"{stats['published_markers']} in the built security page, "
-        f"no apt-path shadowing in {site}"
+        f"{versions} release version string(s) match [workspace.package] "
+        f"version in Cargo.toml, no apt-path shadowing in {site}"
     )
     print(f"  {origin}")
     return 0

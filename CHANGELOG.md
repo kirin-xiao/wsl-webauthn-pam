@@ -20,9 +20,18 @@ paths they close already required root to abuse).
   `make site-serve`, and link-checked with `make site-check`. It also owns
   `/index.html` and `/docs/` alongside the signed apt repository, so the site and
   the repository cannot disagree about what a user can install.
+- The site's reader-facing pieces: the landing page and seven docs pages, a
+  generated "On this page" table of contents (a plain nav on wide screens, a
+  closed `<details>` on narrow ones), copy buttons for fenced code blocks and
+  terminal transcripts, a styled 404, `/sitemap.xml` and `/robots.txt`,
+  per-page "Edit this page" links, and keyboard access to wide tables (an
+  overflowing table becomes a named, focusable region; one that fits adds no
+  tab stop).
 - A `site` CI job that builds the site exactly as the publish path does and runs
-  `.github/scripts/check-site-links.py` on every pull request (internal links,
-  `#fragments`, the seven docs pages, apt-path collisions), and
+  `.github/scripts/check-site-links.py` on every pull request — internal links
+  and `#fragments`, the seven docs pages, apt-path collisions, the documented
+  security invariants in both the source and the built security page, and
+  release-version drift against `Cargo.toml` — plus
   `.github/workflows/pages.yaml`, a manual `workflow_dispatch` publish that
   redeploys the site and the repository from the selected ref through the
   `github-pages` environment without cutting a release. `release.yaml` deploys

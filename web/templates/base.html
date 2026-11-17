@@ -126,5 +126,70 @@
       });
     })();
   </script>
+  <script>
+    // Wide tables scroll inside `.table-scroll` wrappers. A scroll container is
+    // only reachable by keyboard if it is focusable, but a tab stop on a table
+    // that already fits is noise: focus (with an accessible name) is added only
+    // while the table actually overflows, and taken back when it stops. Without
+    // scripting the wrapper stays a plain <div>, exactly as written.
+    (function () {
+      "use strict";
+      var boxes = document.querySelectorAll(".table-scroll");
+      if (!boxes.length) return;
+      var headings = document.querySelectorAll("h1, h2, h3, h4, h5, h6");
+
+      function headingFor(box) {
+        var found = null;
+        for (var i = 0; i < headings.length; i++) {
+          if (headings[i].compareDocumentPosition(box) & Node.DOCUMENT_POSITION_FOLLOWING) {
+            found = headings[i];
+          } else {
+            break;
+          }
+        }
+        return found;
+      }
+
+      function name(box) {
+        var heading = headingFor(box);
+        var text = heading ? heading.textContent : "";
+        if (!text.replace(/\s+/g, "")) {
+          var cell = box.querySelector("th");
+          text = cell ? cell.textContent : "";
+        }
+        text = text.replace(/\s+/g, " ").trim();
+        return text ? "Scrollable table: " + text : "Scrollable table";
+      }
+
+      function sync() {
+        Array.prototype.forEach.call(boxes, function (box) {
+          if (box.scrollWidth > box.clientWidth + 1) {
+            box.setAttribute("tabindex", "0");
+            box.setAttribute("role", "region");
+            box.setAttribute("aria-label", name(box));
+          } else {
+            box.removeAttribute("tabindex");
+            box.removeAttribute("role");
+            box.removeAttribute("aria-label");
+          }
+        });
+      }
+
+      sync();
+      var queued = false;
+      window.addEventListener("resize", function () {
+        if (queued) return;
+        queued = true;
+        window.requestAnimationFrame(function () {
+          queued = false;
+          sync();
+        });
+      });
+      // Fonts finish loading after DOMContentLoaded and can change the table
+      // width without a resize event.
+      window.addEventListener("load", sync);
+      if (document.fonts && document.fonts.ready) document.fonts.ready.then(sync);
+    })();
+  </script>
 </body>
 </html>
