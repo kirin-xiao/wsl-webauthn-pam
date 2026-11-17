@@ -1166,10 +1166,15 @@ def main(argv: list[str]) -> int:
     errors += version_errors
 
     if base is None:
-        origin = (
-            f"base URL: unknown ({base_source}) — pass --base-url or restore base_url "
-            f"in {DEFAULT_CONFIG}; absolute URLs were counted as external"
+        # Without the origin every same-origin `get_url()` link is classified as
+        # external, so a deleted or renamed config would silently stop checking
+        # most of the tree. Fail closed instead: the origin is part of the site.
+        errors.append(
+            f"could not determine the site origin ({base_source}); pass --base-url or "
+            f"restore base_url in {DEFAULT_CONFIG}, otherwise absolute same-origin "
+            f"links cannot be checked"
         )
+        origin = f"base URL: unknown ({base_source})"
     else:
         origin = f"base URL: {base.url} (from {base_source})"
 

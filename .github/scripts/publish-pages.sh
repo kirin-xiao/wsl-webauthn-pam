@@ -77,7 +77,22 @@ python3 .github/scripts/check-site-links.py "$public"
 # Copy after the pool was populated: `index.html` is the one path both owners
 # care about, and the site's landing page is authoritative (it overwrites any
 # file left at that path by an earlier run).
+#
+# `cp -R` overwrites but never prunes, so remove each site-owned top-level entry
+# first: a page or directory that a later build no longer emits would otherwise
+# survive as a stale file in the published tree. The apt namespace is below and
+# is explicitly refused here, so a bug in the site build cannot delete a signed
+# index or the pool.
 mkdir -p "$site"
+for entry in "$public"/*; do
+    name=$(basename "$entry")
+    case "$name" in
+        dists | pool | wsl-webauthn-pam-archive-keyring.gpg)
+            die "the site build produced /$name, which the apt repository owns"
+            ;;
+    esac
+    rm -rf "${site:?}/$name"
+done
 cp -R "$public"/. "$site"/
 
 # --- build + sign the apt repository in place --------------------------------

@@ -12,7 +12,7 @@ walks the sequence and names what each participant is allowed to decide.
 ## The sequence
 
 <figure class="sequence" aria-labelledby="sequence-caption">
-<figcaption id="sequence-caption">One <code>sudo</code> call, from the Linux side across the WSL boundary to Windows Hello and back. Verification happens after the return trip.</figcaption>
+<figcaption class="sequence__caption" id="sequence-caption">One <code>sudo</code> call, from the Linux side across the WSL boundary to Windows Hello and back. Verification happens after the return trip.</figcaption>
 
 <div class="sequence__zone sequence__zone--host">
 <p class="sequence__zone-title">Linux side · root-owned</p>
