@@ -83,13 +83,28 @@ python3 .github/scripts/check-site-links.py "$public"
 # survive as a stale file in the published tree. The apt namespace is below and
 # is explicitly refused here, so a bug in the site build cannot delete a signed
 # index or the pool.
-mkdir -p "$site"
+# Refuse an apt-owned path from the site build before touching the tree.
 for entry in "$public"/*; do
     name=$(basename "$entry")
     case "$name" in
-        dists | pool | wsl-webauthn-pam-archive-keyring.gpg)
+        dists | pool | *.gpg)
             die "the site build produced /$name, which the apt repository owns"
             ;;
+    esac
+done
+
+# Remove everything an earlier publish left, except the apt-owned paths. `$site`
+# is a dedicated publish root, not the repository: the only things in it this
+# script did not write are the pool (pre-populated by the caller) and the
+# metadata, keyring and `.nojekyll` that build-apt-repo.sh emits. Pruning the
+# rest is what stops a renamed or deleted page — or a whole top-level directory
+# dropped from `web/static` — from surviving a local republish.
+mkdir -p "$site"
+for entry in "$site"/* "$site"/.nojekyll; do
+    [ -e "$entry" ] || continue
+    name=$(basename "$entry")
+    case "$name" in
+        dists | pool | wsl-webauthn-pam-archive-keyring.gpg | .nojekyll) continue ;;
     esac
     rm -rf "${site:?}/$name"
 done

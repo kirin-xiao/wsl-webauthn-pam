@@ -7,7 +7,16 @@
     {% if h.children %}
     <ol>
       {% for child in h.children %}
-      <li><a href="#{{ child.id }}">{{ child.title }}</a></li>
+      <li>
+        <a href="#{{ child.id }}">{{ child.title }}</a>
+        {% if child.children %}
+        <ol>
+          {% for grandchild in child.children %}
+          <li><a href="#{{ grandchild.id }}">{{ grandchild.title }}</a></li>
+          {% endfor %}
+        </ol>
+        {% endif %}
+      </li>
       {% endfor %}
     </ol>
     {% endif %}
