@@ -10,15 +10,15 @@ weight = 4
 
 ## Commands
 
-| Command | What it does | Root? | Key options |
-|---|---|---|---|
-| `install` | Provision the bridge, config, module, profile, and CLI | yes | `--skip-enroll`, `--allow-unattested`, `-v`, `--quiet` |
-| `enroll` | Enroll a user, then enable the profile | yes | `--user <NAME>`, `--replace`, `--allow-unattested`, `--no-enable`, `-v`, `--quiet` |
-| `unregister` | Remove one user's credential | yes | `--user <NAME>` |
-| `uninstall` | Remove a credential or everything | yes | `--user <NAME>`, `--all` |
-| `probe` | Report interop and Hello availability, check the bridge pin | root for the pin | — |
-| `status` | List users and the config summary | root for records | `--user <NAME>` |
-| `verify` | Self-test the crypto stack | no | — |
+| Command | What it does | Root? |
+|---|---|---|
+| `install` | Provision the bridge, config, module, profile, and CLI | yes |
+| `enroll` | Enroll a user, then enable the profile (`--user <NAME>`, `--replace`) | yes |
+| `unregister` | Remove one user's credential (`--user <NAME>`) | yes |
+| `uninstall` | Remove a credential or everything (`--all`) | yes |
+| `probe` | Report interop and Hello availability; check the bridge pin | root for the pin |
+| `status` | List users and the config summary | root for records |
+| `verify` | Self-test the crypto stack | no |
 
 The default target is `SUDO_USER`, falling back to the current user. `enroll
 --replace` overwrites an existing record and re-pins the bridge after an upgrade;

@@ -1039,11 +1039,10 @@ pre code {
 // The wrapper above is what keeps a wide table on-screen; this is the last
 // resort for a cell that is still narrower than one digest.
 .prose td code {
-  // Break a digest or an installed path only when the cell really cannot hold
-  // it; a hyphen break inside a flag (`--allow-` / `unattested`) is still
-  // allowed, which is why flags are kept short in the reference tables.
-  overflow-wrap: anywhere;
-  hyphens: none;
+  // Keep flags and paths whole. A table that outgrows the column scrolls in
+  // its wrapper rather than breaking `--replace` after the dashes.
+  overflow-wrap: normal;
+  white-space: nowrap;
 }
 
 // ---------------------------------------------------------------------------
