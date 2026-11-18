@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Make the documented security invariants executable.
 
-The verifier trust table (`crates/wsl-webauthn-verifier/src/lib.rs`) and
-`SECURITY.md` are treated as a specification, but nothing forced that
+The verifier trust table (`crates/wsl-webauthn-verifier/src/lib.rs`) and the
+published security page (`web/content/docs/security.md`, the canonical threat
+model — `SECURITY.md` is now only the reporting policy) are treated as a
+specification, but nothing forced that
 specification to match the code.  A documented invariant ("the AAGUID
 allow-list runs on every attestation path", "the tpm AIK carries an EKU") can
 survive a code change that stops enforcing it, because prose is not executable.
@@ -14,8 +16,8 @@ This guard keeps a *curated* mapping from each invariant to the negative
   (b) a mapped negative test no longer asserts the documented direction
       (e.g. an invariant "X must be rejected" whose test stopped asserting
       the rejection);
-  (c) a documented claim anchor disappears from `SECURITY.md` / the verifier
-      trust table while the mapping still references it;
+  (c) a documented claim anchor disappears from the security page / the
+      verifier trust table while the mapping still references it;
   (d) a `<!-- INVARIANT: ID -->` marker in a machine-checked doc names an id
       with no mapping entry (a new documented invariant with no test); or
   (e) a high-value invariant's marker is removed from the docs.
@@ -48,7 +50,7 @@ Add an entry to `INVARIANTS` with:
                 `compile_error!` guard) that must exist.
     marker      True if the id must appear as `<!-- INVARIANT: ID -->` in *every*
                 machine-checked file that the entry's `claims` reference (at
-                least `SECURITY.md`), not merely one of them.
+                least the security page), not merely one of them.
 
 This is deliberately a hand-maintained table, not NLP: a reworded test name is
 a one-line mapping update, and a genuinely new invariant is an explicit
@@ -79,7 +81,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 MARKER_FILES = (
-    "SECURITY.md",
+    "web/content/docs/security.md",
     "crates/wsl-webauthn-verifier/src/lib.rs",
 )
 
@@ -105,7 +107,7 @@ STORE = "crates/wsl-webauthn-store/tests/store.rs"
 RUNNER = "crates/wsl-webauthn-runner/tests/runner.rs"
 CLI = "crates/wsl-webauthn-cli/src/main.rs"
 VERIFIER_LIB = "crates/wsl-webauthn-verifier/src/lib.rs"
-COBR = "SECURITY.md"
+COBR = "web/content/docs/security.md"
 
 INVARIANTS = [
     # ------------------------------------------------------------------

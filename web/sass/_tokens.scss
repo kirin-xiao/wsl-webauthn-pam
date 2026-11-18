@@ -1,0 +1,33 @@
+// Design tokens. Keep the palette small: one canvas, two surfaces, three text
+// levels, one border weight, and amber reserved for pointers (focus rings,
+// active navigation, prompt glyphs, the copy button, warnings).
+//
+// Measured against #0D0D0D:
+//   #EDEDED body          16.6:1
+//   #B8B8B8 secondary      9.8:1
+//   #9A9A9A muted          6.9:1
+//   #666666 borders        3.4:1
+//   #FFB000 amber         10.6:1
+
+:root {
+  color-scheme: dark;
+
+  --canvas: #0d0d0d;
+  --surface: #131313;
+  --surface-raised: #181818;
+
+  --text: #ededed;
+  --text-secondary: #b8b8b8;
+  --text-muted: #9a9a9a;
+
+  --border: #666666;
+  --amber: #ffb000;
+  --amber-wash: rgba(255, 176, 0, 0.06);
+
+  --font-sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+
+  --measure: 68ch;
+  --wrap: 68rem;
+  --gutter: clamp(1.125rem, 4vw, 2.25rem);
+}

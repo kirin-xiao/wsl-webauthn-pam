@@ -19,3 +19,12 @@ tests/vectors/local/
 # Local working notes (README-rewrite culled content, future WIKI material)
 /.notes/
 /release/
+# Local Zola binary cache (scripts/get-zola.sh) and the generated site tree.
+/.cache/zola/
+/web/public/
+# Assembled GitHub Pages tree (`.github/scripts/publish-pages.sh`): the Zola
+# site copied onto the signed apt repository root (`dists/`, `pool/`, keyring)
+# plus the downloaded release .debs. A local publish run must never be
+# committed; `web/public` and the Zola cache are ignored where the site
+# scaffold defines them.
+/site/

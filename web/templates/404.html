@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+
+{% block title %}Page not found — wsl-webauthn-pam{% endblock %}
+{% block og_title %}Page not found — wsl-webauthn-pam{% endblock %}
+{% block description %}That URL does not exist on this site.{% endblock %}
+{% block og_description %}That URL does not exist on this site.{% endblock %}
+
+{% block main %}
+<div class="wrap error-page">
+  <p class="eyebrow">404</p>
+  <h1>No such page.</h1>
+  <p>The URL you followed is not part of this site. The install guide is probably what you want.</p>
+  <ul class="error-page__links">
+    <li><a href="{{ get_url(path='@/docs/install.md') }}">Install</a></li>
+    <li><a href="{{ get_url(path='@/docs/_index.md') }}">Documentation</a></li>
+    <li><a href="{{ config.extra.repo_url }}">Source on GitHub</a></li>
+  </ul>
+</div>
+{% endblock %}

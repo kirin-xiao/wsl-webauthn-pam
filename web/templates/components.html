@@ -1,0 +1,6 @@
+{% component term(label: string = "shell", copy: bool = false, glyph: string = ">", aria: string = "Terminal transcript", raw: bool = false) %}
+<div class="term">
+<div class="term__bar"><span class="term__label"><span class="term__glyph" aria-hidden="true">{{ glyph }}</span> <span>{{ label }}</span></span>{% if copy %}<button class="term__copy" type="button" data-copy data-label="copy" aria-label="Copy commands" aria-live="polite" hidden>copy</button>{% endif %}</div>
+<pre class="term__body" tabindex="0" aria-label="{{ aria }}"><code>{% if raw %}{{ body | trim | safe }}{% else %}{{ body | trim | escape_html }}{% endif %}</code></pre>
+</div>
+{% endcomponent term %}

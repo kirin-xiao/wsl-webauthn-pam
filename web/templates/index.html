@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+
+{% block title %}wsl-webauthn-pam — Windows Hello sudo for WSL2{% endblock %}
+{% block og_title %}wsl-webauthn-pam — Windows Hello sudo for WSL2{% endblock %}
+
+{% block main %}
+<div class="wrap">
+  <article class="landing">
+    {{ section.content | safe }}
+
+    {% set docs = get_section(path="docs/_index.md") %}
+    <section class="docs-cards" aria-labelledby="docs-cards-title">
+      <p class="eyebrow">Documentation</p>
+      <h2 id="docs-cards-title">Read the manual</h2>
+      <ul class="cards">
+        {% for doc in docs.pages %}
+        <li>
+          <a href="{{ doc.permalink }}">
+            <span class="card__title">{{ doc.title }}</span>
+            {% if doc.description %}<span class="card__desc">{{ doc.description }}</span>{% endif %}
+          </a>
+        </li>
+        {% endfor %}
+      </ul>
+    </section>
+  </article>
+</div>
+{% endblock %}

@@ -1,0 +1,127 @@
+name: Pages
+
+# Republish the published tree (docs site + signed apt repository) on demand.
+#
+# `release.yaml` deploys the same tree whenever a stable `v*` tag is pushed, but
+# that path requires cutting a release. A docs fix, a theme/CI-only change, or a
+# repository rebuild after a signing-key/keyring rotation needs to reach the
+# site *without* inventing a version. This workflow is the manual counterpart:
+# Actions → Pages → "Run workflow" republishes the tree from the selected ref.
+#
+# `workflow_dispatch` is deliberately not added to release.yaml: that would run
+# its `gate` and `publish` jobs on a branch ref with no tag and nothing to
+# publish. This workflow never creates a release, never touches a tag, and never
+# needs write access to repository contents.
+#
+# Run it from the default branch (the default selection) or from a `v*` tag:
+# GitHub Pages pins the `github-pages` environment to a deployment branch
+# policy, so any other ref is refused at deploy time unless it is allowed there
+# (CONTRIBUTING.md, "First-time repository setup").
+#
+# What a dispatch republishes, rebuilt from scratch:
+#   * the docs site (`make site`, pinned Zola v0.23.6 via scripts/get-zola.sh),
+#     checked by .github/scripts/check-site-links.py;
+#   * every released *stable* `.deb` ever published, re-downloaded into the pool
+#     (so the site and the repository can never disagree about what a user can
+#     install, and a dispatch cannot publish a suite missing a version);
+#   * the signed apt metadata (`dists/`, re-signed with APT_GPG_PRIVATE_KEY) and
+#     the exported archive keyring.
+# Everything is assembled by .github/scripts/publish-pages.sh — the same single
+# assembly path `release.yaml` uses, so the two cannot drift.
+#
+# Every `uses:` is pinned to a full 40-char commit SHA (see ci.yaml header).
+
+on:
+  workflow_dispatch:
+
+# Least privilege by default; the deploy job adds Pages + OIDC below.
+permissions:
+  contents: read
+
+concurrency:
+  # A deployment must never be cancelled mid-flight: a partial tree would serve
+  # a pool whose signed index is missing a package (or vice versa). This is the
+  # same group as `release.yaml`'s deploy job, so a dispatch and a release tag
+  # queue behind each other instead of racing to the same Pages environment.
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: publish site + apt repo (GitHub Pages)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Actions-based Pages deployment requires these two.
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install apt tooling
+        run: sudo apt-get update && sudo apt-get install -y apt-utils gnupg
+
+      # Every historical stable .deb, so older versions stay installable/pinnable
+      # — the same collection `release.yaml` performs, through the same script.
+      # Pre-releases are excluded: the `stable` suite must never serve an `~rc`
+      # package. A tag predating .deb packaging simply has no matching asset;
+      # collect-debs.sh names those tags in its summary and skips them, and it
+      # fails the job if a release that *does* advertise a .deb cannot deliver
+      # it, so this step can never publish a pool missing a historical version.
+      #
+      # A dispatch has no triggering tag to compare against, so the faithful
+      # assertion is that the pool is non-empty after the collection: publishing
+      # a repository with no packages would be a silent outage for every user
+      # with this suite in `sources.list`.
+      - name: collect every released .deb
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          pool="site/apt/pool/main/w/wsl-webauthn-pam"
+          sh .github/scripts/collect-debs.sh "$pool"
+          ls -l "$pool"
+          found=0
+          for candidate in "$pool"/*.deb; do
+            if [ -e "$candidate" ]; then
+              found=1
+            fi
+          done
+          if [ "$found" -ne 1 ]; then
+            echo "::error::no released .deb found in the pool; refusing to publish an empty stable suite"
+            exit 1
+          fi
+
+      - name: import the signing key
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          set -eu
+          [ -n "$APT_GPG_PRIVATE_KEY" ] || {
+            echo "::error::APT_GPG_PRIVATE_KEY is not set (see CONTRIBUTING.md)"
+            exit 1
+          }
+          printf '%s' "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
+          fingerprint=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')
+          [ -n "$fingerprint" ] || { echo "::error::no signing key imported"; exit 1; }
+          # publish-pages.sh (via build-apt-repo.sh) reads GPG_KEY_ID.
+          echo "GPG_KEY_ID=$fingerprint" >> "$GITHUB_ENV"
+
+      # One assembly path: build + link-check the site, copy it onto the apt
+      # root, re-index/sign the pool, and assert the resulting tree (index.html,
+      # dists/, pool/, keyring, all seven docs pages).
+      - name: assemble + sign the published tree
+        env:
+          GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: sh .github/scripts/publish-pages.sh site/apt
+
+      - name: upload the Pages artifact
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
+        with:
+          path: site/apt
+
+      - id: deploy
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5

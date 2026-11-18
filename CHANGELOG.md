@@ -13,8 +13,42 @@ invariants and their enforcement, and the PAM/store changes are defence in depth
 than responses to an exploitable flaw (the store and `pam.d` paths are root-owned, so the
 paths they close already required root to abuse).
 
+### Added
+
+- A documentation site at the GitHub Pages root, built from `web/` (Zola,
+  pinned by `scripts/get-zola.sh`) with `make site`, previewed with
+  `make site-serve`, and link-checked with `make site-check`. It also owns
+  `/index.html` and `/docs/` alongside the signed apt repository, so the site and
+  the repository cannot disagree about what a user can install.
+- The site's reader-facing pieces: the landing page and seven docs pages, a
+  generated "On this page" table of contents (a plain nav on wide screens, a
+  closed `<details>` on narrow ones), copy buttons for fenced code blocks and
+  terminal transcripts, a styled 404, `/sitemap.xml` and `/robots.txt`,
+  per-page "Edit this page" links, and keyboard access to wide tables (an
+  overflowing table becomes a named, focusable region; one that fits adds no
+  tab stop).
+- A `site` CI job that builds the site exactly as the publish path does and runs
+  `.github/scripts/check-site-links.py` on every pull request — internal links
+  and `#fragments`, the seven docs pages, apt-path collisions, the documented
+  security invariants in both the source and the built security page, and
+  release-version drift against `Cargo.toml` — plus
+  `.github/workflows/pages.yaml`, a manual `workflow_dispatch` publish that
+  redeploys the site and the repository from the selected ref through the
+  `github-pages` environment without cutting a release. `release.yaml` deploys
+  the same tree from the same script, so the two cannot drift.
+
 ### Fixed
 
+- `--help` lists `bridge-integrity`, which the CLI has always emitted when the
+  bridge no longer matches its enrollment-time pin. The usage test now compares
+  the documented list against the token constants the error mapping actually
+  uses (one list generates both), so a token cannot be emitted while staying
+  undocumented, and the rendering order is checked too.
+- The Pages/release collection step no longer swallows a failed
+  `gh release download`. `.github/scripts/collect-debs.sh` fails the job, naming
+  the tag, if a release that advertises a `.deb` cannot deliver it, so a
+  published pool cannot silently lose a historical version; releases that
+  predate packaging are reported and skipped.
 - `pam_wsl_webauthn.so` no longer replaces the host process's panic hook. It saves the
   host's hook, logs only panics raised inside its own guarded call to `LOG_AUTHPRIV`, and
   delegates everything else, so a panic elsewhere in sshd/sudo is no longer mislabelled as
@@ -46,6 +80,15 @@ paths they close already required root to abuse).
 
 ### Changed
 
+- The README is a short entry point — what the project is, the one-command
+  install, the two-dialog enrollment warning, and links — instead of restating
+  the install, usage, packaging, and troubleshooting material that now lives on
+  the site.
+- The threat model moved from `SECURITY.md` to the site's security page
+  (`web/content/docs/security.md`); `SECURITY.md` is now only the reporting
+  policy. `.github/scripts/check-doc-invariants.py` reads the page and its
+  `<!-- INVARIANT: … -->` markers instead of `SECURITY.md`, so the documented
+  invariants stay executable.
 - Dependencies moved to the current RustCrypto generation: `p256 0.14`, `ecdsa 0.17`,
   `rsa 0.10`, `x509-cert 0.3`, `der 0.8`, `const-oid 0.10`, `sha2 0.11`, plus
   `ed25519-dalek 3`, `rand 0.10`, `base64 0.23`, and the current minor releases of the

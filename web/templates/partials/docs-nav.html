@@ -1,0 +1,13 @@
+{% set docs = get_section(path="docs/_index.md") %}
+<nav class="docs-nav" aria-label="Documentation">
+  <p class="docs-nav__title">
+    <a href="{{ docs.permalink }}"{% if current_path == docs.path %} aria-current="page"{% endif %}>Documentation</a>
+  </p>
+  <ol>
+    {% for doc in docs.pages %}
+    <li>
+      <a href="{{ doc.permalink }}"{% if current_path == doc.path %} aria-current="page"{% endif %}>{{ doc.title }}</a>
+    </li>
+    {% endfor %}
+  </ol>
+</nav>

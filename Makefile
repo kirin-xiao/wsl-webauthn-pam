@@ -69,9 +69,9 @@ NFPM ?= $(shell command -v nfpm 2>/dev/null || echo "$(HOME)/.local/bin/nfpm")
 ACTIONLINT_VERSION ?= 1.7.12
 ACTIONLINT ?= $(HOME)/.local/bin/actionlint
 
-WORKFLOWS := .github/workflows/ci.yaml .github/workflows/release.yaml
+WORKFLOWS := .github/workflows/ci.yaml .github/workflows/release.yaml .github/workflows/pages.yaml
 
-.PHONY: all bridge test check fmt clippy deny machete pam-profile crlf lint-actions bootstrap shellcheck release deb clean
+.PHONY: all bridge test check fmt clippy deny machete pam-profile crlf lint-actions bootstrap shellcheck release deb clean site site-serve site-check
 
 # Default: Linux module + CLI (linked against libpam0g-dev) and the Windows exe.
 all:
@@ -130,13 +130,15 @@ pam-profile:
 # Lint every shell script.
 shellcheck:
 	@if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck -s sh bootstrap.sh scripts/test-bootstrap.sh \
+		shellcheck -s sh bootstrap.sh scripts/get-zola.sh scripts/test-bootstrap.sh \
 			crates/wsl-webauthn-pam/tests/c_host/provision_and_drive.sh \
 			.github/scripts/build-glibc-floor.sh \
 			.github/scripts/check-glibc-floor.sh \
 			.github/scripts/build-deb.sh \
 			.github/scripts/check-deb-layout.sh \
 			.github/scripts/build-apt-repo.sh \
+			.github/scripts/collect-debs.sh \
+			.github/scripts/publish-pages.sh \
 			.github/scripts/install-nfpm.sh \
 			packaging/debian/postinst \
 			packaging/debian/prerm \
@@ -236,3 +238,30 @@ $(NFPM):
 clean:
 	$(CARGO) clean
 	rm -rf build
+
+# GitHub Pages site (Zola, pinned by scripts/get-zola.sh). The version stamp is
+# read from [workspace.package] at build time and exposed to templates through
+# SITE_VERSION, so no template hard-codes a release number.
+site:
+	@version=$$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -1); \
+	if [ -z "$$version" ]; then \
+		echo ">> could not read [workspace.package] version from Cargo.toml" >&2; exit 1; \
+	fi; \
+	zola=$$(sh scripts/get-zola.sh) || exit 1; \
+	SITE_VERSION="$$version" "$$zola" --root web build
+
+# Local preview on a non-default port (Zola's default is 1111). Override
+# `SITE_PORT` to run a second preview beside the default one.
+SITE_PORT ?= 8899
+site-serve:
+	@version=$$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -1); \
+	if [ -z "$$version" ]; then \
+		echo ">> could not read [workspace.package] version from Cargo.toml" >&2; exit 1; \
+	fi; \
+	zola=$$(sh scripts/get-zola.sh) || exit 1; \
+	SITE_VERSION="$$version" "$$zola" --root web serve --interface 127.0.0.1 --port $(SITE_PORT)
+
+# Check the built tree: internal links, anchors, the seven docs pages, and the
+# apt-repository namespace collisions (.github/scripts/check-site-links.py).
+site-check:
+	python3 .github/scripts/check-site-links.py web/public
