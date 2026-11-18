@@ -2,6 +2,11 @@
 title = "FAQ"
 description = "Shared Windows accounts, multiple distros, machines without a TPM, and what happens when you upgrade."
 weight = 6
+
+[extra]
+# The questions are the navigation; a second list of all of them only pushes
+# the first answer off the screen.
+toc = false
 +++
 
 ## Several Linux users share one Windows account — does that work?

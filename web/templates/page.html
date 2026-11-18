@@ -20,7 +20,7 @@
       {% if page.description %}<p class="lede">{{ page.description }}</p>{% endif %}
     </header>
 
-    {% if page.toc | length >= 4 %}
+    {% if page.extra.toc | default(value=true) and page.toc | length >= 4 %}
     {% set toc_items = page.toc %}
     <nav class="toc toc--wide" aria-label="On this page">
       <p class="toc__title">On this page</p>
