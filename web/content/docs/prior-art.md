@@ -72,7 +72,7 @@ then remove the old module, profile, and `/etc/pam_wsl_hello` directory.
 Plan for a cutover, not an upgrade:
 
 1. Run `install` (or the bootstrap script). It provisions the new module and
-   bridge, then offers the legacy cleanup above.
+   bridge, then offers the legacy cleanup.
 2. Enroll, then confirm `sudo` works and that declining the prompt still falls
    back to the password.
 3. If you declined the cleanup, remove the legacy profile and module by hand

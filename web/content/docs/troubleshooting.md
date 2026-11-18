@@ -4,11 +4,8 @@ description = "When sudo asks for a password, the prompt hides behind the termin
 weight = 5
 +++
 
-Most reports are one of six cases. Each entry below is symptom, cause, fix.
-
-Before anything else: `sudo` falling back to your password is the designed
-behaviour, not a failure. The module adds no new way to lose password access
-under the shipped profile.
+`sudo` falling back to your password is the designed behaviour, not a failure:
+the module adds no new way to lose password access under the shipped profile.
 
 ## `sudo` just asks for a password — the module never seems to trigger
 

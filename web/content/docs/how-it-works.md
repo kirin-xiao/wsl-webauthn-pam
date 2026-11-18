@@ -6,8 +6,7 @@ weight = 2
 
 `sudo` does not change. It asks PAM to authenticate, PAM loads
 `pam_wsl_webauthn.so`, and the module either returns `PAM_SUCCESS` after a
-verified Windows Hello assertion or falls through to the next method. This page
-walks the sequence and names what each participant is allowed to decide.
+verified Windows Hello assertion or falls through to the next method.
 
 ## The sequence
 

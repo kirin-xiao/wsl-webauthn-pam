@@ -53,7 +53,7 @@ sudo wsl-webauthn-pam enroll
 
 </section>
 
-<p class="aside-note">The crypto stack self-test, unchanged from the CLI:</p>
+<p class="aside-note">The crypto stack self-test:</p>
 
 {% <term label="shell" glyph=">" aria="wsl-webauthn-pam verify output" raw={true}> %}
 <span class="prompt">$</span> wsl-webauthn-pam verify

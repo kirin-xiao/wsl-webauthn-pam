@@ -7,14 +7,11 @@ platform authenticator.
 **Canonical repository:** <https://github.com/kirin-xiao/wsl-webauthn-pam>
 
 **Full threat model:** <https://kirin-xiao.github.io/wsl-webauthn-pam/docs/security/>
-— design principle, attacker capabilities, trust anchors, the verified-invariant
-list, the fail-closed PAM mapping, accepted residual risk, and distribution
-integrity. This file is the reporting policy, not the threat model.
 
 ## Supported versions
 
-Security fixes land on the latest release. At the time of writing that is
-**0.2.0**; `wsl-webauthn-pam --version` prints what is installed.
+Security fixes land on the latest release (**0.2.0**);
+`wsl-webauthn-pam --version` prints what is installed.
 
 | Version | Supported |
 |---|---|
@@ -38,14 +35,13 @@ Please **do not** open a public issue for a suspected vulnerability. Use GitHub'
 We will acknowledge the report and coordinate a fix and disclosure. Please allow
 reasonable time before public disclosure. There is no bug-bounty program.
 
-- We confirm the report against a supported version, then coordinate a fix and
-  a disclosure.
+- We confirm the report against a supported version.
 - The fix ships in a release; the advisory names the affected versions and any
   workaround.
 - If the report is out of scope — a compromised Windows session, a compromised
   Linux root, a compromised TPM, or a stolen release/signing key — we say so and
   point at the relevant section of the threat model instead of treating it as a
-  vulnerability. Those cases are documented, not overlooked.
+  vulnerability.
 
 ## Release signing key
 

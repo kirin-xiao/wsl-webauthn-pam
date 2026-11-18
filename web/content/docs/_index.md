@@ -5,6 +5,6 @@ sort_by = "weight"
 template = "section.html"
 +++
 
-Start with **[Install](@/docs/install.md)** if you want the signed apt repository. The remaining pages cover how the module makes its decision, what the security model does and does not claim, and what to check when a Hello prompt does not appear.
+Start with **[Install](@/docs/install.md)** if you want the signed apt repository.
 
-The documentation targets Debian/Ubuntu WSL users who already know `sudo` and PAM. Every procedure assumes WSL2 with interop enabled and Windows Hello set up.
+WSL2 with interop enabled and Windows Hello set up are prerequisites.

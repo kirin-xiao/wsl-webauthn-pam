@@ -41,10 +41,7 @@ the fetched keyring against it before trusting it. Two Windows dialogs appear
 during enrollment: first a *save your passkey* confirmation, then your PIN or
 biometric — **type the PIN into the Windows dialog, never the terminal.**
 
-The [install page](https://kirin-xiao.github.io/wsl-webauthn-pam/docs/install/)
-covers the rest: the bootstrap one-liner, the `.deb`, building from source, the
-manual path, `--allow-unattested`, per-distro installs, uninstall, and the
-upgrade caveat (a new `.exe` changes the pin, so upgrades re-enroll).
+A new `.exe` changes the pin, so upgrading requires re-enrolling.
 
 > [!WARNING]
 > Keep a second WSL shell open while you test, and confirm `sudo` still falls

@@ -169,7 +169,7 @@ gh api --method POST /repos/OWNER/REPO/environments/github-pages/deployment-bran
     -f name='v*' -f type=tag
 
 # 4. Publish the fingerprint from step 1 in SECURITY.md and on the site's
-#    install page (web/content/docs/install.md) — the README no longer carries it.
+#    install page (web/content/docs/install.md).
 ```
 
 ## Pull requests

@@ -244,8 +244,6 @@ There is exactly one path to `PAM_SUCCESS`: a fully verified assertion. Every fa
 
 ## Accepted residual risk
 
-The user-facing wording is in [Install](@/docs/install.md) and [How it works](@/docs/how-it-works.md).
-
 - **Compromised Windows session.** This attacker already has Linux root via `wsl.exe -u root`, so the module is not a boundary against them. Ceremony initiation is possible (subject to user verification) and the bridge can be replaced, but attestation + UV + Linux-side verification mean an adversary that cannot reach WSL interop cannot forge an assertion or raise privilege without a verified ceremony; what remains is **consent phishing**.
 - **Compromised Linux root.** Out of scope by definition.
 - **Consent blinding is mitigated, not eliminated.** Neither WebAuthn nor a custom PAM notice can make the OS prove *which process* raised the ceremony.

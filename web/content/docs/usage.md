@@ -63,8 +63,7 @@ Windows Hello: available
 pin:     OK (matches the enrolled bridge)
 ```
 
-`probe` is read-only: it reports interop and Hello availability and checks the
-bridge pin. Reading the pin needs root.
+`probe` is read-only.
 
 ## PAM module arguments
 

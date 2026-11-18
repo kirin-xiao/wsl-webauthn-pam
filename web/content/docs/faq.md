@@ -4,10 +4,6 @@ description = "Shared Windows accounts, multiple distros, machines without a TPM
 weight = 6
 +++
 
-Short answers to the questions the install and troubleshooting pages raise.
-Anything about attacker capabilities belongs on the
-[security page](@/docs/security.md), not here.
-
 ## Several Linux users share one Windows account — does that work?
 
 Yes, and that is the normal WSL case. Windows Hello verifies the same Windows
@@ -95,8 +91,8 @@ This is by design; there is no flag that disables the pin.
 
 It works for anything that authenticates through PAM. The `pam-auth-update`
 profile is `Auth-Type: Primary`, so it lands in the common auth stack that
-`sudo` and `su` both use. `sudo` is the case the project tests and documents
-most, and `su` takes the same authentication path.
+`sudo` and `su` both use. `sudo` is the case this project tests and documents
+most.
 
 ## Does it need the network or a cloud account?
 

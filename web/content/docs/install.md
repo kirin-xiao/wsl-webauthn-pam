@@ -9,8 +9,8 @@ Windows side. Both halves are needed: the PAM module cannot reach Windows Hello
 without the bridge, and the bridge is useless without a credential enrolled from
 inside the distro.
 
-The signed apt repository is the primary path. Everything else on this page
-installs the same files.
+The signed apt repository is the primary path; the other paths install the same
+files.
 
 ## Requirements
 
@@ -80,8 +80,8 @@ enables the profile.
 
 ### The two Windows dialogs
 
-Two Windows dialogs appear during enrollment: first a *save your passkey*
-confirmation, then your PIN or biometric.
+During enrollment, first a *save your passkey* confirmation appears, then a PIN
+or biometric prompt.
 
 > [!WARNING]
 > The dialog can open behind the terminal. **Type your PIN into the Windows
@@ -109,7 +109,7 @@ that disables the pin.
 ## Don't lock yourself out
 
 > [!WARNING]
-> Keep a second WSL shell (or the Windows-side root shell below) open while you
+> Keep a second WSL shell (or the Windows-side root shell) open while you
 > test, and confirm `sudo` still falls back to your password before closing it.
 
 The shipped profile carries the `pam-auth-update` fail-through control
@@ -192,13 +192,8 @@ sudo wsl-webauthn-pam enroll                  # enroll; enables the profile on s
 `install` also supports `--dry-run`, `--yes`/`-y`, and `--non-interactive` for
 scripted provisioning, and `enroll --user <NAME>` for another user. A skipped,
 declined, or failed enrollment leaves the profile disabled and prints the exact
-recovery commands.
-
-`enroll` and `install` print only actionable status by default. Add `-v`/`--verbose`
-to see the resolved config and each provisioning step, or `--quiet`/`-q` to
-suppress all non-error status in scripts. The two are mutually exclusive and are
-accepted only by `enroll`/`install`; `probe`/`status`/`verify`/`unregister`/`uninstall`
-and `--dry-run` always print their full output.
+recovery commands. See [Output control](@/docs/usage.md#output-control) for
+per-step detail.
 
 ## From source
 
@@ -249,9 +244,9 @@ apt, so remove it with `sudo wsl-webauthn-pam uninstall --all`.
 ## Other distros
 
 The packaged `pam-auth-update` profile is Debian/Ubuntu-specific. On other
-distros the installer prints the exact manual `/etc/pam.d` instructions instead
-of running `pam-auth-update`, so step 6 above is the whole integration. The
-module binary is the same one that ships in the `.deb`.
+distros the installer prints the exact manual `/etc/pam.d` instructions instead,
+so the [manual installation](#manual-installation-no-installer) steps are the
+whole integration. The module binary is the same one that ships in the `.deb`.
 
 ## One install per distro
 
