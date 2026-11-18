@@ -13,13 +13,12 @@ description = "Passwordless sudo and su inside WSL2, authenticated with the Wind
 default_language = "en"
 output_dir = "public"
 compile_sass = true
-# HTML minification is off on purpose. Zola 0.23's minifier (minify-html) is a
-# boolean switch with no keep-comments option, and it strips the
-# `<!-- INVARIANT: … -->` markers that must reach the published security page:
-# `.github/scripts/check-site-links.py` asserts all 17 of them in
-# web/public/docs/security/index.html, not just in the Markdown source. Turning
-# minification off is the only Zola-0.23 way to publish those comments; turn it
-# back on when the pinned Zola exposes keep_comments.
+# HTML minification is off on purpose. The site's security page no longer
+# carries machine-checked comments — the `<!-- INVARIANT: … -->` markers live in
+# SECURITY.md — but minification stays off so the built tree that
+# `.github/scripts/check-site-links.py` inspects is the same HTML that is
+# deployed. Zola 0.23's minifier is a boolean switch with no keep-comments
+# option; revisit when the pinned Zola exposes one.
 minify_html = false
 build_search_index = false
 # The site owns /sitemap.xml and /robots.txt at the published origin. The apt

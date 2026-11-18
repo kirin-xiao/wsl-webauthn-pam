@@ -503,7 +503,7 @@ pre code {
   align-items: baseline;
   gap: 0.2rem 0.7rem;
   max-width: 62rem;
-  margin: 0 0 3.5rem;
+  margin: 0 0 1.1rem;
   font-size: 0.92rem;
   color: var(--text-muted);
 }
@@ -962,6 +962,42 @@ pre code {
   margin-bottom: 0;
 }
 
+// Collapsed optional paths (extra install methods, self-test output). The TOC
+// is also a <details> on narrow screens and keeps its own rules.
+.prose details:not(.toc) {
+  margin: 0 0 1.25rem;
+  padding: 0.7rem 0.95rem;
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.prose details:not(.toc) > summary {
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.prose details:not(.toc) > summary:hover {
+  color: var(--text);
+}
+
+.prose details:not(.toc) > summary::marker {
+  color: var(--amber);
+}
+
+.prose details:not(.toc)[open] > summary {
+  margin-bottom: 0.9rem;
+  padding-bottom: 0.6rem;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+}
+
+.prose details:not(.toc) > :last-child {
+  margin-bottom: 0;
+}
+
 .prose img {
   max-width: 100%;
   height: auto;
@@ -1003,11 +1039,10 @@ pre code {
 // The wrapper above is what keeps a wide table on-screen; this is the last
 // resort for a cell that is still narrower than one digest.
 .prose td code {
-  // Break a digest or an installed path only when the cell really cannot hold
-  // it; a hyphen break inside a flag (`--allow-` / `unattested`) is still
-  // allowed, which is why flags are kept short in the reference tables.
-  overflow-wrap: anywhere;
-  hyphens: none;
+  // Keep flags and paths whole. A table that outgrows the column scrolls in
+  // its wrapper rather than breaking `--replace` after the dashes.
+  overflow-wrap: normal;
+  white-space: nowrap;
 }
 
 // ---------------------------------------------------------------------------

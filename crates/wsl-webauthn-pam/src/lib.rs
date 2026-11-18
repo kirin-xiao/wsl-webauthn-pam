@@ -93,7 +93,7 @@
 //! fail-through: a failed or absent Hello attempt falls back to the next PAM
 //! method, normally the local password. Keep the account's password working, and
 //! test with a non-critical service first. See the installer's lockout warning and
-//! the security page (`web/content/docs/security.md`).
+//! `SECURITY.md`.
 //!
 //! # Wire facts that shape this module
 //!

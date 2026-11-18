@@ -55,7 +55,7 @@ The site is the manual: <https://kirin-xiao.github.io/wsl-webauthn-pam/>
 
 - [Install](https://kirin-xiao.github.io/wsl-webauthn-pam/docs/install/) — requirements, every install path, uninstall
 - [How it works](https://kirin-xiao.github.io/wsl-webauthn-pam/docs/how-it-works/) — the sudo → PAM → Hello sequence
-- [Security](https://kirin-xiao.github.io/wsl-webauthn-pam/docs/security/) — threat model, trust anchors, verified invariants
+- [Security](https://kirin-xiao.github.io/wsl-webauthn-pam/docs/security/) — what it protects, what it trusts, and where the formal model lives
 - [Usage](https://kirin-xiao.github.io/wsl-webauthn-pam/docs/usage/) — CLI, PAM arguments, config keys, error tokens
 - [Troubleshooting](https://kirin-xiao.github.io/wsl-webauthn-pam/docs/troubleshooting/) — symptom, cause, fix
 - [FAQ](https://kirin-xiao.github.io/wsl-webauthn-pam/docs/faq/) — shared accounts, multiple distros, no TPM

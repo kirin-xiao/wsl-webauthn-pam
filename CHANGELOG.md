@@ -29,8 +29,8 @@ paths they close already required root to abuse).
   tab stop).
 - A `site` CI job that builds the site exactly as the publish path does and runs
   `.github/scripts/check-site-links.py` on every pull request — internal links
-  and `#fragments`, the seven docs pages, apt-path collisions, the documented
-  security invariants in both the source and the built security page, and
+  and `#fragments`, the seven docs pages, apt-path collisions, the published
+  security page's link to `SECURITY.md`, and
   release-version drift against `Cargo.toml` — plus
   `.github/workflows/pages.yaml`, a manual `workflow_dispatch` publish that
   redeploys the site and the repository from the selected ref through the
@@ -84,11 +84,11 @@ paths they close already required root to abuse).
   install, the two-dialog enrollment warning, and links — instead of restating
   the install, usage, packaging, and troubleshooting material that now lives on
   the site.
-- The threat model moved from `SECURITY.md` to the site's security page
-  (`web/content/docs/security.md`); `SECURITY.md` is now only the reporting
-  policy. `.github/scripts/check-doc-invariants.py` reads the page and its
-  `<!-- INVARIANT: … -->` markers instead of `SECURITY.md`, so the documented
-  invariants stay executable.
+- The formal threat model lives in `SECURITY.md` at the repository root,
+  together with the reporting policy; the site's security page
+  (`web/content/docs/security.md`) is a short plain-language summary that links
+  to it. `.github/scripts/check-doc-invariants.py` reads `SECURITY.md` and its
+  `<!-- INVARIANT: … -->` markers, so the documented invariants stay executable.
 - Dependencies moved to the current RustCrypto generation: `p256 0.14`, `ecdsa 0.17`,
   `rsa 0.10`, `x509-cert 0.3`, `der 0.8`, `const-oid 0.10`, `sha2 0.11`, plus
   `ed25519-dalek 3`, `rand 0.10`, `base64 0.23`, and the current minor releases of the
