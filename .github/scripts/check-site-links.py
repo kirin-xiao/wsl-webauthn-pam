@@ -26,14 +26,11 @@ item, the sources that feed it):
   (c) exactly the seven docs pages exist, each at `/docs/<slug>/`;
   (d) no generated path shadows an apt path (`dists/`, `pool/`, `*.gpg` at the
       root): the site must never be able to replace a signed index;
-  (e) `web/content/docs/security.md` still carries `EXPECTED_INVARIANT_MARKERS`
-      `<!-- INVARIANT: … -->` markers with unique ids, so a content/theme
-      refactor cannot quietly drop a documented security invariant from the
-      page that mirrors `SECURITY.md` (`check-doc-invariants.py` guards the
-      invariant -> test mapping); and the **built** `docs/security/index.html`
-      carries the same markers with the same ids, so an HTML minifier or a
-      template cannot strip them from what users can actually read in
-      "view source"; and
+  (e) the **built** `docs/security/index.html` links to the repository's
+      `SECURITY.md`, which holds the formal threat model and the reporting
+      process; the site page is a plain-language summary
+      (`check-doc-invariants.py` guards `SECURITY.md`'s invariant markers and
+      the claim -> test mapping); and
   (f) every release version spelled out in the prose — a `v<semver>` token
       (release URLs, `--version v…` pins) and a
       `wsl-webauthn-pam_<version>_<arch>.deb` file name — in `web/content/**`
@@ -63,7 +60,6 @@ notices until after a deploy.
 Usage:
     check-site-links.py                    # check the built site (web/public)
     check-site-links.py DIR                # check another built site tree
-    check-site-links.py --security-source PATH
     check-site-links.py --base-url URL     # override the site's published origin
     check-site-links.py --self-test        # exercise the checker on fixtures
 
@@ -101,16 +97,14 @@ DOCS_PAGES = (
 APT_ROOT_NAMES = ("dists", "pool")
 ARCHIVE_KEYRING = "wsl-webauthn-pam-archive-keyring.gpg"
 
-# The security page mirrors SECURITY.md, which carries 17 `<!-- INVARIANT: … -->`
-# marker comments (holding 54 distinct ids).  The count is pinned so that a
-# reworded/refactored page cannot silently lose a marker: dropping one is an
-# explicit change to this constant, reviewed like any other doc invariant.
-EXPECTED_INVARIANT_MARKERS = 17
-
-# Same marker syntax `check-doc-invariants.py` uses, so the two agree on what
-# counts as a marker.  Ids may be comma/space separated within one comment.
-MARKER_RE = re.compile(r"<!--\s*INVARIANT:\s*(?P<ids>[A-Za-z0-9_,.\s\-]+?)\s*-->")
-ID_SPLIT_RE = re.compile(r"[\s,]+")
+# The site's security page is a plain-language summary; the formal threat model
+# and the reporting process live in the repository's SECURITY.md.  The published
+# page must link there so a reader can reach the model, and so a content
+# refactor cannot leave the summary pointing at nothing.  SECURITY.md's 17
+# `<!-- INVARIANT: … -->` marker blocks are guarded by check-doc-invariants.py.
+SECURITY_POLICY_URL = (
+    "https://github.com/kirin-xiao/wsl-webauthn-pam/blob/main/SECURITY.md"
+)
 
 # The repository this script ships in.  Version drift is checked against its
 # sources, not against whichever built tree is being inspected, so `check-site-
@@ -121,7 +115,6 @@ DEFAULT_CONTENT_DIR = REPO_ROOT / "web" / "content"
 DEFAULT_README = REPO_ROOT / "README.md"
 
 DEFAULT_SITE = "web/public"
-DEFAULT_SECURITY_SOURCE = "web/content/docs/security.md"
 # Zola's config; `base_url` is the single place the published origin is declared.
 DEFAULT_CONFIG = "web/config.toml"
 BASE_URL_RE = re.compile(r"""^\s*base_url\s*=\s*["']([^"']*)["']""", re.MULTILINE)
@@ -462,87 +455,34 @@ def check_apt_collisions(site: Path) -> list[str]:
     return errors
 
 
-def _marker_ids(text: str) -> tuple[list[str], int]:
-    """Every `<!-- INVARIANT: … -->` marker id in `text`, in document order."""
-    markers = list(MARKER_RE.finditer(text))
-    ids: list[str] = []
-    for marker in markers:
-        for ident in ID_SPLIT_RE.split(marker.group("ids").strip()):
-            if ident:
-                ids.append(ident)
-    return (ids, len(markers))
+def check_security_link(site: Path) -> tuple[list[str], int]:
+    """The *built* security page links to the repository's formal threat model.
 
-
-def check_invariants(security_source: Path) -> tuple[list[str], int, list[str]]:
-    """The security page source keeps every invariant marker, each id once."""
-    errors: list[str] = []
-    if not security_source.is_file():
-        return ([f"security page source not found: {security_source}"], 0, [])
-
-    text = security_source.read_text(encoding="utf-8", errors="replace")
-    ids, count = _marker_ids(text)
-
-    if count != EXPECTED_INVARIANT_MARKERS:
-        errors.append(
-            f"{security_source}: {count} `<!-- INVARIANT: … -->` marker(s), "
-            f"expected {EXPECTED_INVARIANT_MARKERS}; a content/theme refactor dropped "
-            f"a documented security invariant"
-        )
-    duplicates = sorted({ident for ident in ids if ids.count(ident) > 1})
-    if duplicates:
-        errors.append(
-            f"{security_source}: duplicate invariant id(s) {', '.join(duplicates)}; "
-            f"each documented invariant may be marked only once"
-        )
-    return (errors, count, ids)
-
-
-def check_published_invariants(
-    site: Path, source_ids: list[str], source_count: int
-) -> tuple[list[str], int]:
-    """The *built* security page still carries the source's markers and ids.
-
-    Zola minifies every generated page by default and `minify-html` drops HTML
-    comments, so a source-only check would pass while the published page lost
-    the markers.  This inspects the page a reader gets from "view source".
+    The page itself is a short, plain-language summary; `SECURITY.md` carries
+    the threat model and the vulnerability-reporting process.  Checking the
+    built page, not just the Markdown source, catches a template or renderer
+    that drops the link silently.
     """
     page = site / "docs" / "security" / "index.html"
     if not page.is_file():
         return ([f"built security page not found: {page}; build the site first"], 0)
 
-    text = page.read_text(encoding="utf-8", errors="replace")
-    ids, count = _marker_ids(text)
-    errors: list[str] = []
+    refs = [value.strip() for _attr, value, _line in parse_document(page).refs]
+    linked = any(
+        ref == SECURITY_POLICY_URL or ref.startswith(SECURITY_POLICY_URL + "#")
+        for ref in refs
+    )
+    if linked:
+        return ([], 1)
 
-    if count != source_count:
-        errors.append(
-            f"{page}: {count} `<!-- INVARIANT: … -->` marker(s) in the published page, "
-            f"expected {source_count} (the source has that many); the HTML minifier or "
-            f"a template dropped them"
-        )
-
-    duplicates = sorted({ident for ident in ids if ids.count(ident) > 1})
-    if duplicates:
-        errors.append(
-            f"{page}: duplicate invariant id(s) {', '.join(duplicates)} in the "
-            f"published page; each documented invariant may be published only once"
-        )
-
-    if ids != source_ids:
-        missing = [ident for ident in source_ids if ident not in ids]
-        extra = [ident for ident in ids if ident not in source_ids]
-        detail = []
-        if missing:
-            detail.append(f"missing {', '.join(missing)}")
-        if extra:
-            detail.append(f"unexpected {', '.join(extra)}")
-        if not detail:
-            detail.append("same ids in a different order")
-        errors.append(
-            f"{page}: published invariant markers differ from "
-            f"{DEFAULT_SECURITY_SOURCE}: {'; '.join(detail)}"
-        )
-    return (errors, count)
+    return (
+        [
+            f"{page}: the published security page must link to the repository's "
+            f"SECURITY.md ({SECURITY_POLICY_URL}); the page is a summary and the "
+            f"formal threat model is that file"
+        ],
+        0,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -658,7 +598,7 @@ def check_version_drift(
 
 
 def check_site(
-    site: Path, security_source: Path, base: SiteBase | None = None
+    site: Path, base: SiteBase | None = None
 ) -> tuple[list[str], dict[str, int]]:
     """Run every check; returns (errors, stats)."""
     stats = {
@@ -668,8 +608,7 @@ def check_site(
         "external": 0,
         "apt": 0,
         "broken": 0,
-        "markers": 0,
-        "published_markers": 0,
+        "security_link": 0,
     }
     if not site.is_dir():
         return ([f"{site} is not a directory; build the site first (`make site`)"], stats)
@@ -677,13 +616,8 @@ def check_site(
     errors = check_links(site, stats, base)
     errors += check_docs_pages(site)
     errors += check_apt_collisions(site)
-    marker_errors, stats["markers"], source_ids = check_invariants(security_source)
-    errors += marker_errors
-    if security_source.is_file():
-        published_errors, stats["published_markers"] = check_published_invariants(
-            site, source_ids, stats["markers"]
-        )
-        errors += published_errors
+    link_errors, stats["security_link"] = check_security_link(site)
+    errors += link_errors
     return (errors, stats)
 
 
@@ -726,6 +660,11 @@ def _base_tree() -> dict[str, str]:
     for slug in DOCS_PAGES:
         cross = "" if slug == "faq" else '<a href="/docs/faq/#faq-id">faq</a>'
         anchor = '<h2 id="faq-id">q</h2>' if slug == "faq" else ""
+        policy = (
+            f'<a href="{SECURITY_POLICY_URL}">security policy</a>'
+            if slug == "security"
+            else ""
+        )
         files[f"docs/{slug}/index.html"] = (
             '<!doctype html><html><body><h1 id="title">t</h1>'
             '<a href="/">home</a>'
@@ -733,14 +672,10 @@ def _base_tree() -> dict[str, str]:
             '<a href="../install/">install</a>'
             '<a href="/wsl-webauthn-pam-archive-keyring.gpg">keyring</a>'
             '<a href="/dists/stable/InRelease">dists</a>'
-            f"{anchor}{cross}"
+            f"{anchor}{policy}{cross}"
             "</body></html>"
         )
     return files
-
-
-def _markers(count: int) -> str:
-    return "".join(f"<!-- INVARIANT: INV-{i:02d} -->\n" for i in range(count))
 
 
 def _version_cases(tmp: Path) -> tuple[int, int]:
@@ -935,7 +870,6 @@ def self_test() -> int:
     tree = _base_tree()
     site_base = parse_base_url(SELF_TEST_BASE)
     assert site_base is not None
-    good_markers = _markers(EXPECTED_INVARIANT_MARKERS)
 
     def broken_link(files: dict[str, str]) -> None:
         files["docs/install/index.html"] += '<a href="/docs/nope/">x</a>'
@@ -964,19 +898,14 @@ def self_test() -> int:
         # would serve that path from somebody else's site, so it cannot pass.
         files["index.html"] += '<a href="https://example.test/elsewhere/">x</a>'
 
-    def dropped_published_marker(files: dict[str, str]) -> None:
-        # The source is intact but the minifier/template dropped one marker from
-        # the page a reader actually gets.
+    def wrong_security_link(files: dict[str, str]) -> None:
+        # The summary must point at the repository's SECURITY.md, not merely at
+        # some page: a different target is as useless as no link.
         page = files["docs/security/index.html"]
         files["docs/security/index.html"] = page.replace(
-            "<!-- INVARIANT: INV-00 -->", "", 1
-        )
-
-    def reworded_published_marker(files: dict[str, str]) -> None:
-        # Same number of markers, but one id changed: the count alone would pass.
-        page = files["docs/security/index.html"]
-        files["docs/security/index.html"] = page.replace(
-            "<!-- INVARIANT: INV-01 -->", "<!-- INVARIANT: INV-99 -->", 1
+            SECURITY_POLICY_URL,
+            "https://github.com/kirin-xiao/wsl-webauthn-pam/blob/main/README.md",
+            1,
         )
 
     def missing_docs_page(files: dict[str, str]) -> None:
@@ -1024,40 +953,24 @@ def self_test() -> int:
         return verify
 
     cases: list[
-        tuple[str, dict[str, str], str | None, bool, Callable[..., str | None] | None]
+        tuple[str, dict[str, str], bool, Callable[..., str | None] | None]
     ] = [
-        ("good-tree", tree, good_markers, True, counts_add_up),
-        ("absolute-same-origin-existing-page", tree, good_markers, True, counts_delta(internal=1)),
-        ("broken-internal-link", tree, good_markers, False, None),
-        ("broken-self-anchor", tree, good_markers, False, None),
-        ("broken-cross-page-anchor", tree, good_markers, False, None),
-        ("absolute-same-origin-missing-page", tree, good_markers, False, None),
-        ("absolute-same-origin-bad-fragment", tree, good_markers, False, None),
-        ("absolute-other-origin-ignored", tree, good_markers, True, counts_delta(external=1)),
-        ("absolute-outside-base-path", tree, good_markers, False, None),
-        ("escape-site-root", tree, good_markers, False, None),
-        ("missing-docs-page", tree, good_markers, False, None),
-        ("extra-docs-page", tree, good_markers, False, None),
-        ("shadow-pool", tree, good_markers, False, None),
-        ("shadow-dists", tree, good_markers, False, None),
-        ("shadow-root-keyring", tree, good_markers, False, None),
-        (
-            "too-few-markers",
-            tree,
-            _markers(EXPECTED_INVARIANT_MARKERS - 1),
-            False,
-            None,
-        ),
-        (
-            "duplicate-marker-id",
-            tree,
-            _markers(EXPECTED_INVARIANT_MARKERS - 1) + "<!-- INVARIANT: INV-00 -->\n",
-            False,
-            None,
-        ),
-        ("dropped-published-marker", tree, good_markers, False, None),
-        ("reworded-published-marker", tree, good_markers, False, None),
-        ("missing-security-source", tree, None, False, None),
+        ("good-tree", tree, True, counts_add_up),
+        ("absolute-same-origin-existing-page", tree, True, counts_delta(internal=1)),
+        ("broken-internal-link", tree, False, None),
+        ("broken-self-anchor", tree, False, None),
+        ("broken-cross-page-anchor", tree, False, None),
+        ("absolute-same-origin-missing-page", tree, False, None),
+        ("absolute-same-origin-bad-fragment", tree, False, None),
+        ("absolute-other-origin-ignored", tree, True, counts_delta(external=1)),
+        ("absolute-outside-base-path", tree, False, None),
+        ("escape-site-root", tree, False, None),
+        ("missing-docs-page", tree, False, None),
+        ("extra-docs-page", tree, False, None),
+        ("shadow-pool", tree, False, None),
+        ("shadow-dists", tree, False, None),
+        ("shadow-root-keyring", tree, False, None),
+        ("wrong-security-link", tree, False, None),
     ]
     edits = {
         "absolute-same-origin-existing-page": absolute_existing_page,
@@ -1074,23 +987,15 @@ def self_test() -> int:
         "shadow-pool": shadows_pool,
         "shadow-dists": shadows_dists,
         "shadow-root-keyring": shadows_keyring,
-        "dropped-published-marker": dropped_published_marker,
-        "reworded-published-marker": reworded_published_marker,
+        "wrong-security-link": wrong_security_link,
     }
 
     failed = 0
     seen_stats: dict[str, dict[str, int]] = {}
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        for name, origin, markers, expect_ok, verify in cases:
+        for name, origin, expect_ok, verify in cases:
             files = dict(origin)
-            if markers is not None:
-                # A real build copies the source markers into the published
-                # page; the fixtures do the same, so the published-page check
-                # is exercised by every case rather than only by the real tree.
-                files["docs/security/index.html"] = files[
-                    "docs/security/index.html"
-                ].replace("</body>", markers + "</body>")
             edit = edits.get(name)
             if edit is not None:
                 edit(files)
@@ -1101,11 +1006,7 @@ def self_test() -> int:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(body, encoding="utf-8")
 
-            security = tmp / name / "security.md"
-            if markers is not None:
-                security.write_text(markers, encoding="utf-8")
-
-            errors, stats = check_site(site, security, site_base)
+            errors, stats = check_site(site, site_base)
             seen_stats[name] = stats
             problem = verify(stats, errors) if verify is not None else None
             ok = not errors and problem is None
@@ -1143,9 +1044,6 @@ def main(argv: list[str]) -> int:
     )
     ap.add_argument("site", nargs="?", default=DEFAULT_SITE,
                     help=f"built site tree to check (default: {DEFAULT_SITE})")
-    ap.add_argument("--security-source", default=DEFAULT_SECURITY_SOURCE,
-                    help=f"security page source with the invariant markers "
-                         f"(default: {DEFAULT_SECURITY_SOURCE})")
     ap.add_argument("--base-url", default=None,
                     help="origin the tree is served from (default: base_url in the "
                          f"config.toml next to the tree, usually {DEFAULT_CONFIG}; "
@@ -1159,7 +1057,7 @@ def main(argv: list[str]) -> int:
 
     site = Path(args.site)
     base, base_source = detect_base_url(site, args.base_url)
-    errors, stats = check_site(site, Path(args.security_source), base)
+    errors, stats = check_site(site, base)
     version_errors, versions = check_version_drift(
         DEFAULT_CARGO_TOML, DEFAULT_CONTENT_DIR, DEFAULT_README
     )
@@ -1194,8 +1092,8 @@ def main(argv: list[str]) -> int:
         f"OK: {stats['refs']} reference(s) across {stats['pages']} page(s) checked "
         f"({stats['internal']} resolved inside the tree, {stats['external']} external, "
         f"{stats['apt']} apt-provided), all {len(DOCS_PAGES)} docs pages present, "
-        f"{stats['markers']} invariant markers intact in the source and "
-        f"{stats['published_markers']} in the built security page, "
+        f"the published security page links to SECURITY.md "
+        f"({stats['security_link']} link found), "
         f"{versions} release version string(s) match [workspace.package] "
         f"version in Cargo.toml, no apt-path shadowing in {site}"
     )

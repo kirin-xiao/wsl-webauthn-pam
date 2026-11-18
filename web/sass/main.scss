@@ -503,7 +503,7 @@ pre code {
   align-items: baseline;
   gap: 0.2rem 0.7rem;
   max-width: 62rem;
-  margin: 0 0 3.5rem;
+  margin: 0 0 1.1rem;
   font-size: 0.92rem;
   color: var(--text-muted);
 }
@@ -959,6 +959,42 @@ pre code {
 }
 
 .prose blockquote p:last-child {
+  margin-bottom: 0;
+}
+
+// Collapsed optional paths (extra install methods, self-test output). The TOC
+// is also a <details> on narrow screens and keeps its own rules.
+.prose details:not(.toc) {
+  margin: 0 0 1.25rem;
+  padding: 0.7rem 0.95rem;
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.prose details:not(.toc) > summary {
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.prose details:not(.toc) > summary:hover {
+  color: var(--text);
+}
+
+.prose details:not(.toc) > summary::marker {
+  color: var(--amber);
+}
+
+.prose details:not(.toc)[open] > summary {
+  margin-bottom: 0.9rem;
+  padding-bottom: 0.6rem;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+}
+
+.prose details:not(.toc) > :last-child {
   margin-bottom: 0;
 }
 

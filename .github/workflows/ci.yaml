@@ -586,8 +586,8 @@ jobs:
 
       # 1. Unit-test the checker against synthetic trees: a broken link, a
       #    broken same-page and cross-page anchor, a missing and an extra docs
-      #    page, a `../` escape, apt-path shadowing (pool/dists/keyring), a
-      #    dropped marker, a duplicated marker id, and a missing source.
+      #    page, a `../` escape, apt-path shadowing (pool/dists/keyring), and a
+      #    security page that links somewhere other than SECURITY.md.
       - name: checker self-test
         run: python3 .github/scripts/check-site-links.py --self-test
 
@@ -598,8 +598,8 @@ jobs:
 
       # 3. The real gate: every internal href/src and `#fragment` resolves, all
       #    seven docs pages exist at /docs/<slug>/, nothing generated shadows an
-      #    apt path, and the security page still carries its 17 invariant
-      #    markers.
+      #    apt path, and the published security page links to the formal threat
+      #    model in SECURITY.md.
       - name: check internal links + docs set
         run: python3 .github/scripts/check-site-links.py web/public
 

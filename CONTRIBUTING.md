@@ -82,8 +82,8 @@ repository, so changes there are user-facing.
   (`SITE_PORT=<port>` for a second preview) with the same stamp.
   `make site-check` runs `.github/scripts/check-site-links.py` over
   `web/public`: internal links and `#fragments`, the seven docs pages,
-  apt-path collisions, the `<!-- INVARIANT: … -->` markers in both the
-  source and the built security page, and drift between release versions in
+  apt-path collisions, the link from the published security page to
+  `SECURITY.md`, and drift between release versions in
   `web/content/**` + `README.md` and `[workspace.package] version`
   (`v<semver>` tokens and `.deb` file names).
 - **The apt repository owns part of the root.** `dists/`, `pool/`, and
@@ -179,7 +179,8 @@ gh api --method POST /repos/OWNER/REPO/environments/github-pages/deployment-bran
 - Keep changes focused and explain the *why* in the description; call out any
   change to the security model or the PAM mapping table.
 - Update documentation (`web/content/docs/`, `SECURITY.md`, `CHANGELOG.md`) when
-  user behavior or the threat model changes. The site's security page is the
-  canonical threat model; `SECURITY.md` is the reporting policy.
+  user behavior or the threat model changes. `SECURITY.md` is the canonical
+  formal threat model and reporting policy; the site's security page is a
+  plain-language summary that links to it.
 - By contributing you agree your contributions are licensed under the
   [MIT License](LICENSE).

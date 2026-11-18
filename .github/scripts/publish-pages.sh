@@ -68,7 +68,7 @@ for keyring in "$public"/*.gpg; do
 done
 
 # The same guard CI runs on every PR (internal links, #fragments, the seven docs
-# pages, apt-path shadowing, the invariant markers on the security page). Running
+# pages, apt-path shadowing, the security page's link to SECURITY.md). Running
 # it here too means a release or a manual republish cannot publish a tree that
 # CI would have rejected.
 python3 .github/scripts/check-site-links.py "$public"
